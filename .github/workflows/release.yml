@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: engram-mcp-linux-x64
+            use_zigbuild: true
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: engram-mcp-linux-arm64
+            use_zigbuild: true
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            artifact: engram-mcp-darwin-arm64
+            use_zigbuild: false
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            artifact: engram-mcp-darwin-x64
+            use_zigbuild: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild (Linux)
+        if: matrix.use_zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Add target (macOS)
+        if: ${{ !matrix.use_zigbuild }}
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (Linux, zigbuild)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build (macOS)
+        if: ${{ !matrix.use_zigbuild }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/engram-mcp ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  github-release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            engram-mcp-linux-x64
+            engram-mcp-linux-arm64
+            engram-mcp-darwin-arm64
+            engram-mcp-darwin-x64
+
+  npm-publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+
+          declare -A PLATFORMS=(
+            ["darwin-arm64"]="engram-mcp-darwin-arm64"
+            ["darwin-x64"]="engram-mcp-darwin-x64"
+            ["linux-arm64"]="engram-mcp-linux-arm64"
+            ["linux-x64"]="engram-mcp-linux-x64"
+          )
+
+          for platform in "${!PLATFORMS[@]}"; do
+            artifact="${PLATFORMS[$platform]}"
+            pkg_dir="npm/platforms/$platform"
+
+            # Set version
+            npm version "$VERSION" --no-git-tag-version --prefix "$pkg_dir"
+
+            # Copy binary and make executable
+            cp "$artifact" "$pkg_dir/engram-mcp"
+            chmod +x "$pkg_dir/engram-mcp"
+
+            npm publish "$pkg_dir" --access public
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          pkg_dir="npm/engram-mcp"
+
+          # Update version and optional dependency versions
+          npm version "$VERSION" --no-git-tag-version --prefix "$pkg_dir"
+
+          # Update optionalDependency versions to match
+          node -e "
+            const fs = require('fs');
+            const path = '$pkg_dir/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            for (const dep of Object.keys(pkg.optionalDependencies)) {
+              pkg.optionalDependencies[dep] = '$VERSION';
+            }
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+          npm publish "$pkg_dir" --access public

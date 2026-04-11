@@ -1,0 +1,26 @@
+{
+  "name": "engram-mcp",
+  "version": "0.0.0",
+  "description": "MCP server for the Engram spaced-repetition flashcard platform",
+  "keywords": ["mcp", "engram", "flashcard", "spaced-repetition", "claude", "cursor"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/volmyrdot/engram-mcp"
+  },
+  "bin": {
+    "engram-mcp": "bin/run.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@engram/mcp-darwin-arm64": "0.0.0",
+    "@engram/mcp-darwin-x64": "0.0.0",
+    "@engram/mcp-linux-arm64": "0.0.0",
+    "@engram/mcp-linux-x64": "0.0.0"
+  }
+}
