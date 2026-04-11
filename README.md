@@ -4,26 +4,35 @@
 
 # engram-mcp
 
-MCP server for the [Engram](https://engram.dev) spaced-repetition flashcard platform.
+MCP server for the [Engram](https://engram.volmyr.com) spaced-repetition flashcard platform.
 
 ## Prerequisites
 
 - An Engram account
-- An Engram API token — generate one at [engram.dev/settings/tokens](https://engram.dev/settings/tokens)
+- An Engram API token — generate one at [https://engram.volmyr.com](https://engram.volmyr.com)
 
-## Quick start
+## Installation
+
+Install the MCP server globally so it's available as a system command:
 
 ```bash
-ENGRAM_API_URL=https://api.engram.dev \
-ENGRAM_API_TOKEN=your-token \
-npx -y @engram-fc/mcp
+npm install -g @engram-fc/mcp
 ```
+
+Verify the installation:
+
+```bash
+engram-mcp --version
+```
+
+> Alternatively, skip installation entirely and use `npx -y @engram-fc/mcp` in your client config — npm will download the binary automatically on first use.
 
 ## Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
 `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
+**Using npx** (no prior installation needed):
 ```json
 {
   "mcpServers": {
@@ -31,7 +40,22 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
       "command": "npx",
       "args": ["-y", "@engram-fc/mcp"],
       "env": {
-        "ENGRAM_API_URL": "https://api.engram.dev",
+        "ENGRAM_API_URL": "https://api-engram.volmyr.com",
+        "ENGRAM_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+**Using a global install** (`npm install -g @engram-fc/mcp`):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engram-mcp",
+      "env": {
+        "ENGRAM_API_URL": "https://api-engram.volmyr.com",
         "ENGRAM_API_TOKEN": "your-token"
       }
     }
@@ -43,6 +67,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 Add to `~/.cursor/mcp.json`:
 
+**Using npx** (no prior installation needed):
 ```json
 {
   "mcpServers": {
@@ -50,7 +75,22 @@ Add to `~/.cursor/mcp.json`:
       "command": "npx",
       "args": ["-y", "@engram-fc/mcp"],
       "env": {
-        "ENGRAM_API_URL": "https://api.engram.dev",
+        "ENGRAM_API_URL": "https://api-engram.volmyr.com",
+        "ENGRAM_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+**Using a global install** (`npm install -g @engram-fc/mcp`):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engram-mcp",
+      "env": {
+        "ENGRAM_API_URL": "https://api-engram.volmyr.com",
         "ENGRAM_API_TOKEN": "your-token"
       }
     }
@@ -62,7 +102,7 @@ Add to `~/.cursor/mcp.json`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `ENGRAM_API_URL` | `https://api.engram.dev` | Base URL of the Engram API |
+| `ENGRAM_API_URL` | `https://api-engram.volmyr.com` | Base URL of the Engram API |
 | `ENGRAM_API_TOKEN` | *(required)* | Your Engram API token |
 
 ## Available tools
@@ -139,17 +179,6 @@ And **MCP Prompts** (guided workflows):
 | `create_flashcard` | Create a high-quality flashcard for a topic |
 | `explain_card` | Explain a flashcard in depth with examples |
 | `study_plan` | Build a structured study plan from your catalogs |
-
-## Building from source
-
-Requires [Rust](https://rustup.rs) (stable).
-
-```bash
-git clone https://github.com/volmyrdot/engram-mcp
-cd engram-mcp
-cargo build --release
-# binary: ./target/release/engram-mcp
-```
 
 ## Publishing to npm
 ```bash
