@@ -18,9 +18,9 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@engram/mcp-darwin-arm64": "0.0.0",
-    "@engram/mcp-darwin-x64": "0.0.0",
-    "@engram/mcp-linux-arm64": "0.0.0",
-    "@engram/mcp-linux-x64": "0.0.0"
+    "@engram-fc/mcp-darwin-arm64": "0.0.0",
+    "@engram-fc/mcp-darwin-x64": "0.0.0",
+    "@engram-fc/mcp-linux-arm64": "0.0.0",
+    "@engram-fc/mcp-linux-x64": "0.0.0"
   }
 }

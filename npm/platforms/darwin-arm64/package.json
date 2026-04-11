@@ -1,5 +1,5 @@
 {
-  "name": "@engram/mcp-darwin-arm64",
+  "name": "@engram-fc/mcp-darwin-arm64",
   "version": "0.0.0",
   "description": "macOS arm64 binary for engram-mcp",
   "license": "MIT",

@@ -1,5 +1,5 @@
 {
-  "name": "@engram/mcp-linux-x64",
+  "name": "@engram-fc/mcp-linux-x64",
   "version": "0.0.0",
   "description": "Linux x64 binary for engram-mcp",
   "license": "MIT",

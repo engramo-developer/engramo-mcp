@@ -8,10 +8,10 @@ const fs = require('fs');
 const { spawnSync } = require('child_process');
 
 const PLATFORM_PACKAGES = {
-  'darwin-arm64': '@engram/mcp-darwin-arm64',
-  'darwin-x64': '@engram/mcp-darwin-x64',
-  'linux-arm64': '@engram/mcp-linux-arm64',
-  'linux-x64': '@engram/mcp-linux-x64',
+  'darwin-arm64': '@engram-fc/mcp-darwin-arm64',
+  'darwin-x64': '@engram-fc/mcp-darwin-x64',
+  'linux-arm64': '@engram-fc/mcp-linux-arm64',
+  'linux-x64': '@engram-fc/mcp-linux-x64',
 };
 
 function getPlatformKey() {
