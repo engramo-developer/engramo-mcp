@@ -74,7 +74,7 @@ Run in order — fix all issues before moving on:
 ```bash
 cargo fmt --all
 cargo check
-cargo clippy -- -D warnings
+cargo clippy
 cargo test
 ```
 

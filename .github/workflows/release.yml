@@ -38,13 +38,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install zig + cargo-zigbuild (Linux)
+        if: matrix.use_zigbuild
+        uses: goto-bus-stop/setup-zig@v2
+
       - name: Install cargo-zigbuild (Linux)
         if: matrix.use_zigbuild
-        run: pip install cargo-zigbuild
-
-      - name: Add target (macOS)
-        if: ${{ !matrix.use_zigbuild }}
-        run: rustup target add ${{ matrix.target }}
+        run: cargo install cargo-zigbuild --locked
 
       - name: Build (Linux, zigbuild)
         if: matrix.use_zigbuild
