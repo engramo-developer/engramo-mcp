@@ -55,6 +55,7 @@ pub struct DeleteCardParams {
 #[derive(Clone)]
 pub struct CardTools {
     pub client: EngramClient,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 

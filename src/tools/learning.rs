@@ -33,6 +33,7 @@ pub struct AddCatalogToLearningParams {
 #[derive(Clone)]
 pub struct LearningTools {
     pub client: EngramClient,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 

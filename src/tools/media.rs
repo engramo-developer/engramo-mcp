@@ -21,6 +21,7 @@ pub struct ListMediaParams {
 #[derive(Clone)]
 pub struct MediaTools {
     pub client: EngramClient,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 

@@ -42,6 +42,7 @@ pub struct ActivateLearningPathParams {
 #[derive(Clone)]
 pub struct LearningPathTools {
     pub client: EngramClient,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 

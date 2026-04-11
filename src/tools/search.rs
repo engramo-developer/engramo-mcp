@@ -19,6 +19,7 @@ pub struct SearchParams {
 #[derive(Clone)]
 pub struct SearchTools {
     pub client: EngramClient,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
