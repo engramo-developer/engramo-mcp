@@ -116,7 +116,7 @@ jobs:
 
           for platform in "${!PLATFORMS[@]}"; do
             artifact="${PLATFORMS[$platform]}"
-            pkg_dir="npm/platforms/$platform"
+            pkg_dir="./npm/platforms/$platform"
 
             # Set version directly to avoid npm version git interactions
             node -e "
@@ -138,7 +138,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          pkg_dir="npm/engram-mcp"
+          pkg_dir="./npm/engram-mcp"
 
           # Update version and optionalDependency versions directly
           node -e "

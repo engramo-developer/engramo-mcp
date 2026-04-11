@@ -151,6 +151,12 @@ cargo build --release
 # binary: ./target/release/engram-mcp
 ```
 
+## Publishing to npm
+```bash
+git tag vx.y.z                                                                                                                                                                                                      
+git push origin vx.y.z
+```
+
 ## Contributing
 
 Bug reports and pull requests are welcome at
