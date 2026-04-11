@@ -118,8 +118,13 @@ jobs:
             artifact="${PLATFORMS[$platform]}"
             pkg_dir="npm/platforms/$platform"
 
-            # Set version
-            npm version "$VERSION" --no-git-tag-version --prefix "$pkg_dir"
+            # Set version directly to avoid npm version git interactions
+            node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync('$pkg_dir/package.json', 'utf8'));
+              pkg.version = '$VERSION';
+              fs.writeFileSync('$pkg_dir/package.json', JSON.stringify(pkg, null, 2) + '\n');
+            "
 
             # Copy binary and make executable
             cp "$artifact" "$pkg_dir/engram-mcp"
@@ -135,18 +140,15 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           pkg_dir="npm/engram-mcp"
 
-          # Update version and optional dependency versions
-          npm version "$VERSION" --no-git-tag-version --prefix "$pkg_dir"
-
-          # Update optionalDependency versions to match
+          # Update version and optionalDependency versions directly
           node -e "
             const fs = require('fs');
-            const path = '$pkg_dir/package.json';
-            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const pkg = JSON.parse(fs.readFileSync('$pkg_dir/package.json', 'utf8'));
+            pkg.version = '$VERSION';
             for (const dep of Object.keys(pkg.optionalDependencies)) {
               pkg.optionalDependencies[dep] = '$VERSION';
             }
-            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            fs.writeFileSync('$pkg_dir/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
           npm publish "$pkg_dir" --access public
