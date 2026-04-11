@@ -1,5 +1,5 @@
 {
-  "name": "engram-mcp",
+  "name": "@engram-fc/mcp",
   "version": "0.0.0",
   "description": "MCP server for the Engram spaced-repetition flashcard platform",
   "keywords": ["mcp", "engram", "flashcard", "spaced-repetition", "claude", "cursor"],

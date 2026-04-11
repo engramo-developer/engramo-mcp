@@ -1,4 +1,4 @@
-[![npm version](https://img.shields.io/npm/v/engram-mcp)](https://www.npmjs.com/package/engram-mcp)
+[![npm version](https://img.shields.io/npm/v/@engram-fc/mcp)](https://www.npmjs.com/package/@engram-fc/mcp)
 [![CI](https://github.com/volmyrdot/engram-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/volmyrdot/engram-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -16,7 +16,7 @@ MCP server for the [Engram](https://engram.dev) spaced-repetition flashcard plat
 ```bash
 ENGRAM_API_URL=https://api.engram.dev \
 ENGRAM_API_TOKEN=your-token \
-npx -y engram-mcp
+npx -y @engram-fc/mcp
 ```
 
 ## Claude Desktop
@@ -29,7 +29,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "engram": {
       "command": "npx",
-      "args": ["-y", "engram-mcp"],
+      "args": ["-y", "@engram-fc/mcp"],
       "env": {
         "ENGRAM_API_URL": "https://api.engram.dev",
         "ENGRAM_API_TOKEN": "your-token"
@@ -48,7 +48,7 @@ Add to `~/.cursor/mcp.json`:
   "mcpServers": {
     "engram": {
       "command": "npx",
-      "args": ["-y", "engram-mcp"],
+      "args": ["-y", "@engram-fc/mcp"],
       "env": {
         "ENGRAM_API_URL": "https://api.engram.dev",
         "ENGRAM_API_TOKEN": "your-token"
