@@ -63,6 +63,41 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 }
 ```
 
+## Gemini CLI
+
+Add to `~/.gemini/settings.json`:
+
+**Using npx** (no prior installation needed):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "npx",
+      "args": ["-y", "@engram-fc/mcp"],
+      "env": {
+        "ENGRAM_API_URL": "https://api-engram.volmyr.com",
+        "ENGRAM_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+**Using a global install** (`npm install -g @engram-fc/mcp`):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engram-mcp",
+      "env": {
+        "ENGRAM_API_URL": "https://api-engram.volmyr.com",
+        "ENGRAM_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
 ## Cursor
 
 Add to `~/.cursor/mcp.json`:
