@@ -99,7 +99,7 @@ mod tests {
     }
 
     fn make_server(base_url: &str) -> EngramMcpServer {
-        EngramMcpServer::new(EngramClient::new(base_url, "engram_test"))
+        EngramMcpServer::new(EngramClient::new(base_url, "engram_test"), false)
     }
 
     fn card_dto_json() -> serde_json::Value {

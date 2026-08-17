@@ -330,7 +330,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EngramClient::new(&server.uri(), "tok");
+        let client = EngramClient::new(server.uri(), "tok");
         let result = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
             .await
             .unwrap();
@@ -360,7 +360,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EngramClient::new(&server.uri(), "tok");
+        let client = EngramClient::new(server.uri(), "tok");
         let result = read(&client, ReadResourceRequestParams::new(URI_STATS))
             .await
             .unwrap();
@@ -384,7 +384,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EngramClient::new(&server.uri(), "tok");
+        let client = EngramClient::new(server.uri(), "tok");
         let err = read(&client, ReadResourceRequestParams::new(URI_DUE))
             .await
             .unwrap_err();

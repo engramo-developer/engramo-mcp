@@ -74,7 +74,7 @@ mod tests {
     }
 
     fn make_server(base_url: &str) -> crate::server::EngramMcpServer {
-        crate::server::EngramMcpServer::new(EngramClient::new(base_url, "engram_test"))
+        crate::server::EngramMcpServer::new(EngramClient::new(base_url, "engram_test"), false)
     }
 
     #[tokio::test]

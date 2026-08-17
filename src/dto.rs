@@ -347,6 +347,46 @@ pub struct MediaDto {
     pub size: Option<i64>,
 }
 
+// ── Paid AI (feature-flagged) ────────────────────────────────────────────────
+
+/// Shared request body for card-scoped batch AI operations
+/// (`POST /catalogs/tts`, `/catalogs/translate`, `/catalogs/dictionary`).
+/// Exactly one of `catalog_id` / `card_id` must be set.
+#[derive(Debug, Serialize)]
+pub struct CardAiRequest {
+    #[serde(rename = "catalogId", skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<Uuid>,
+    #[serde(rename = "cardId", skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<Uuid>,
+    /// BCP-47 language code, e.g. "en", "uk".
+    pub lang: String,
+}
+
+/// Response body for card-scoped batch AI operations.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CardAiBatchResultDto {
+    /// Number of cards that were updated (or, for TTS, accepted for async generation).
+    pub updated: usize,
+    /// IDs of the affected cards.
+    pub card_ids: Vec<Uuid>,
+}
+
+/// Request body for `POST /ai-agent`.
+#[derive(Debug, Serialize)]
+pub struct AiChatRequest {
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    pub message: String,
+}
+
+/// Response body for `POST /ai-agent`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AiChatResponseDto {
+    #[serde(rename = "sessionId")]
+    pub session_id: Uuid,
+    pub text: String,
+}
+
 // ── Subscription ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -443,6 +483,45 @@ mod tests {
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].name, "Rust");
         assert_eq!(resp.cursor, Some("abc".to_string()));
+    }
+
+    #[test]
+    fn test_card_ai_request_serialization_omits_none() {
+        let req = CardAiRequest {
+            catalog_id: Some(Uuid::nil()),
+            card_id: None,
+            lang: "uk".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("cardId"));
+        assert!(json.contains("\"catalogId\""));
+        assert!(json.contains("\"lang\":\"uk\""));
+    }
+
+    #[test]
+    fn test_card_ai_batch_result_deserialization() {
+        let json = r#"{"updated":2,"card_ids":["00000000-0000-0000-0000-000000000001"]}"#;
+        let resp: CardAiBatchResultDto = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.updated, 2);
+        assert_eq!(resp.card_ids.len(), 1);
+    }
+
+    #[test]
+    fn test_ai_chat_request_serialization_omits_session_id_when_none() {
+        let req = AiChatRequest {
+            session_id: None,
+            message: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("sessionId"));
+        assert!(json.contains("\"message\":\"hello\""));
+    }
+
+    #[test]
+    fn test_ai_chat_response_deserialization() {
+        let json = r#"{"sessionId":"00000000-0000-0000-0000-000000000001","text":"hi there"}"#;
+        let resp: AiChatResponseDto = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.text, "hi there");
     }
 
     #[test]

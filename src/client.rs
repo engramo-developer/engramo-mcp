@@ -2,11 +2,12 @@ use reqwest::Client;
 use uuid::Uuid;
 
 use crate::dto::{
-    CardDto, CatalogDto, CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CreateCardRequest,
-    CreateCatalogRequest, CreateCatalogWithCardsApiRequest, CreateLearningPathRequest,
-    GlobalSearchResult, LearningCardDto, LearningPathDetailDto, LearningPathDto, MediaDto,
-    PagedResponse, PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest,
-    UsageSummaryDto, UserSubscriptionDto,
+    AiChatRequest, AiChatResponseDto, CardAiBatchResultDto, CardAiRequest, CardDto, CatalogDto,
+    CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CreateCardRequest, CreateCatalogRequest,
+    CreateCatalogWithCardsApiRequest, CreateLearningPathRequest, GlobalSearchResult,
+    LearningCardDto, LearningPathDetailDto, LearningPathDto, MediaDto, PagedResponse,
+    PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UsageSummaryDto,
+    UserSubscriptionDto,
 };
 use crate::error::ApiError;
 
@@ -345,6 +346,68 @@ impl EngramClient {
 
     pub async fn get_usage(&self) -> Result<UsageSummaryDto, ApiError> {
         self.get("/me/usage").await
+    }
+
+    // ── Paid AI (feature-flagged) ────────────────────────────────────────────
+
+    /// Fires server-side TTS generation for cards missing face audio.
+    /// Uses EngrAmo's paid AI — only registered when `ENGRAM_ENABLE_PAID_AI` is on.
+    /// The API accepts the request (202) and delivers audio asynchronously via
+    /// callback; the response only confirms which cards were queued.
+    pub async fn generate_tts_for_cards(
+        &self,
+        req: &CardAiRequest,
+    ) -> Result<CardAiBatchResultDto, ApiError> {
+        self.post("/catalogs/tts", req).await
+    }
+
+    /// Translates cards whose back text is empty, using EngrAmo's paid AI.
+    pub async fn translate_cards(
+        &self,
+        req: &CardAiRequest,
+    ) -> Result<CardAiBatchResultDto, ApiError> {
+        self.post("/catalogs/translate", req).await
+    }
+
+    /// Fills in missing word-level dictionary entries on cards, using EngrAmo's paid AI.
+    pub async fn generate_dictionary_for_cards(
+        &self,
+        req: &CardAiRequest,
+    ) -> Result<CardAiBatchResultDto, ApiError> {
+        self.post("/catalogs/dictionary", req).await
+    }
+
+    /// Sends a message to the EngrAmo AI agent (server-side LLM chat), using EngrAmo's paid AI.
+    pub async fn ai_agent_chat(&self, req: &AiChatRequest) -> Result<AiChatResponseDto, ApiError> {
+        self.post("/ai-agent", req).await
+    }
+
+    /// Creates a new catalog from an uploaded ZIP/JSON content file, auto-translating
+    /// every card into `target_lang`. Uses EngrAmo's paid AI.
+    pub async fn translate_batch_import(
+        &self,
+        target_lang: &str,
+        catalog_metadata: &CreateCatalogRequest,
+        content_file_name: &str,
+        content_file: Vec<u8>,
+    ) -> Result<CatalogDto, ApiError> {
+        let metadata_json = serde_json::to_string(catalog_metadata).map_err(|e| {
+            ApiError::BadRequest(format!("failed to serialize catalog metadata: {e}"))
+        })?;
+        let content_part =
+            reqwest::multipart::Part::bytes(content_file).file_name(content_file_name.to_string());
+        let form = reqwest::multipart::Form::new()
+            .text("catalog_metadata", metadata_json)
+            .part("content_file", content_part);
+
+        let resp = self
+            .http
+            .post(self.url(&format!("/catalogs/translate-batch-import/{target_lang}")))
+            .header("X-Api-Key", &self.api_token)
+            .multipart(form)
+            .send()
+            .await?;
+        self.deserialize(resp).await
     }
 }
 
@@ -1070,5 +1133,198 @@ mod tests {
 
         let err = client(&server.uri()).get_usage().await.unwrap_err();
         assert!(matches!(err, ApiError::Unauthorized));
+    }
+
+    // ── Paid AI ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_tts_for_cards_success() {
+        use crate::dto::CardAiRequest;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/tts"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "updated": 1,
+                "card_ids": [mock_id()]
+            })))
+            .mount(&server)
+            .await;
+
+        let req = CardAiRequest {
+            catalog_id: Some(mock_id()),
+            card_id: None,
+            lang: "es".to_string(),
+        };
+        let result = client(&server.uri())
+            .generate_tts_for_cards(&req)
+            .await
+            .unwrap();
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.card_ids, vec![mock_id()]);
+    }
+
+    #[tokio::test]
+    async fn test_generate_tts_for_cards_quota_exceeded() {
+        use crate::dto::CardAiRequest;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/tts"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "error": "quota_exceeded",
+                "resource_type": "tts_generations",
+                "used": 10,
+                "limit": 10
+            })))
+            .mount(&server)
+            .await;
+
+        let req = CardAiRequest {
+            catalog_id: Some(mock_id()),
+            card_id: None,
+            lang: "es".to_string(),
+        };
+        let err = client(&server.uri())
+            .generate_tts_for_cards(&req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::QuotaExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_translate_cards_success() {
+        use crate::dto::CardAiRequest;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/translate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "updated": 3,
+                "card_ids": []
+            })))
+            .mount(&server)
+            .await;
+
+        let req = CardAiRequest {
+            catalog_id: None,
+            card_id: Some(mock_id()),
+            lang: "uk".to_string(),
+        };
+        let result = client(&server.uri()).translate_cards(&req).await.unwrap();
+        assert_eq!(result.updated, 3);
+    }
+
+    #[tokio::test]
+    async fn test_generate_dictionary_for_cards_success() {
+        use crate::dto::CardAiRequest;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/dictionary"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "updated": 0,
+                "card_ids": []
+            })))
+            .mount(&server)
+            .await;
+
+        let req = CardAiRequest {
+            catalog_id: Some(mock_id()),
+            card_id: None,
+            lang: "de".to_string(),
+        };
+        let result = client(&server.uri())
+            .generate_dictionary_for_cards(&req)
+            .await
+            .unwrap();
+        assert_eq!(result.updated, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ai_agent_chat_success() {
+        use crate::dto::AiChatRequest;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ai-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sessionId": mock_id(),
+                "text": "Here's your deck idea..."
+            })))
+            .mount(&server)
+            .await;
+
+        let req = AiChatRequest {
+            session_id: None,
+            message: "Make me a Spanish restaurant deck".to_string(),
+        };
+        let result = client(&server.uri()).ai_agent_chat(&req).await.unwrap();
+        assert_eq!(result.session_id, mock_id());
+        assert_eq!(result.text, "Here's your deck idea...");
+    }
+
+    #[tokio::test]
+    async fn test_ai_agent_chat_unauthorized() {
+        use crate::dto::AiChatRequest;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ai-agent"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let req = AiChatRequest {
+            session_id: None,
+            message: "hi".to_string(),
+        };
+        let err = client(&server.uri()).ai_agent_chat(&req).await.unwrap_err();
+        assert!(matches!(err, ApiError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/catalogs/translate-batch-import/{}", "es")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": mock_id(),
+                "name": "Imported",
+                "version": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let metadata = CreateCatalogRequest {
+            name: "Imported".to_string(),
+            description: None,
+            tags: None,
+            visibility: None,
+        };
+        let result = client(&server.uri())
+            .translate_batch_import("es", &metadata, "import.json", b"[]".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "Imported");
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_bad_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/translate-batch-import/es"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"error": "Content file must be provided"})),
+            )
+            .mount(&server)
+            .await;
+
+        let metadata = CreateCatalogRequest {
+            name: "Imported".to_string(),
+            description: None,
+            tags: None,
+            visibility: None,
+        };
+        let err = client(&server.uri())
+            .translate_batch_import("es", &metadata, "import.json", vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 }

@@ -8,10 +8,10 @@ const fs = require('fs');
 const { spawnSync } = require('child_process');
 
 const PLATFORM_PACKAGES = {
-  'darwin-arm64': '@engram-fc/mcp-darwin-arm64',
-  'darwin-x64': '@engram-fc/mcp-darwin-x64',
-  'linux-arm64': '@engram-fc/mcp-linux-arm64',
-  'linux-x64': '@engram-fc/mcp-linux-x64',
+  'darwin-arm64': '@engramo/mcp-darwin-arm64',
+  'darwin-x64': '@engramo/mcp-darwin-x64',
+  'linux-arm64': '@engramo/mcp-linux-arm64',
+  'linux-x64': '@engramo/mcp-linux-x64',
 };
 
 function getPlatformKey() {
@@ -29,7 +29,7 @@ function resolveBinaryPath(pkg) {
   try {
     const pkgJsonPath = require.resolve(`${pkg}/package.json`);
     const pkgDir = path.dirname(pkgJsonPath);
-    return path.join(pkgDir, 'engram-mcp');
+    return path.join(pkgDir, 'engramo-mcp');
   } catch {
     return null;
   }
@@ -41,9 +41,9 @@ const pkg = platformKey ? PLATFORM_PACKAGES[platformKey] : null;
 if (!pkg) {
   const supported = Object.keys(PLATFORM_PACKAGES).join(', ');
   process.stderr.write(
-    `engram-mcp: unsupported platform: ${os.platform()}-${os.arch()}\n` +
+    `engramo-mcp: unsupported platform: ${os.platform()}-${os.arch()}\n` +
     `Supported platforms: ${supported}\n` +
-    `Build from source: https://github.com/volmyrdot/engram-mcp\n`
+    `Build from source: https://github.com/engramo-developer/engramo-mcp\n`
   );
   process.exit(1);
 }
@@ -52,7 +52,7 @@ const binPath = resolveBinaryPath(pkg);
 
 if (!binPath) {
   process.stderr.write(
-    `engram-mcp: could not find binary for ${platformKey}.\n` +
+    `engramo-mcp: could not find binary for ${platformKey}.\n` +
     `The optional dependency '${pkg}' may not have been installed.\n` +
     `Try: npm install ${pkg}\n`
   );
@@ -69,7 +69,7 @@ try {
 const result = spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
 
 if (result.error) {
-  process.stderr.write(`engram-mcp: failed to start binary: ${result.error.message}\n`);
+  process.stderr.write(`engramo-mcp: failed to start binary: ${result.error.message}\n`);
   process.exit(1);
 }
 

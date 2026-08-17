@@ -1,15 +1,15 @@
 {
-  "name": "@engram-fc/mcp-darwin-arm64",
+  "name": "@engramo/mcp-darwin-arm64",
   "version": "0.0.0",
-  "description": "macOS arm64 binary for engram-mcp",
+  "description": "macOS arm64 binary for engramo-mcp",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/volmyrdot/engram-mcp"
+    "url": "https://github.com/engramo-developer/engramo-mcp"
   },
   "os": ["darwin"],
   "cpu": ["arm64"],
   "files": [
-    "engram-mcp"
+    "engramo-mcp"
   ]
 }

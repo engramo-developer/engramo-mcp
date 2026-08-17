@@ -33,20 +33,28 @@ use crate::tools::search::SearchParams;
 use uuid::Uuid;
 
 pub struct EngramMcpServer {
-    client: EngramClient,
+    pub(crate) client: EngramClient,
     tool_router: ToolRouter<Self>,
 }
 
 impl EngramMcpServer {
-    pub fn new(client: EngramClient) -> Self {
+    /// `paid_ai_enabled` gates whether the paid-AI tool router (TTS, translation,
+    /// dictionary, AI-agent chat — see `tools/ai.rs`) is registered at all. When
+    /// `false`, those tools are entirely absent from `tools/list` — the public,
+    /// bring-your-own-AI deployment default (`ENGRAM_ENABLE_PAID_AI` unset).
+    pub fn new(client: EngramClient, paid_ai_enabled: bool) -> Self {
+        let mut tool_router = Self::catalog_tools_router()
+            + Self::card_tools_router()
+            + Self::learning_tools_router()
+            + Self::learning_path_tools_router()
+            + Self::search_tools_router()
+            + Self::media_tools_router()
+            + Self::generate_tools_router();
+        if paid_ai_enabled {
+            tool_router += Self::paid_ai_tools_router();
+        }
         Self {
-            tool_router: Self::catalog_tools_router()
-                + Self::card_tools_router()
-                + Self::learning_tools_router()
-                + Self::learning_path_tools_router()
-                + Self::search_tools_router()
-                + Self::media_tools_router()
-                + Self::generate_tools_router(),
+            tool_router,
             client,
         }
     }
@@ -870,6 +878,62 @@ impl EngramMcpServer {
 mod tests {
     use super::*;
     use crate::dto::{CardContent, RichTextSpan, RichTextSpanStyle};
+
+    // ── Paid-AI flag gates tool registration ─────────────────────────────────
+
+    const PAID_AI_TOOL_NAMES: [&str; 5] = [
+        "generate_tts_for_cards",
+        "translate_cards",
+        "generate_dictionary_for_cards",
+        "ai_agent_chat",
+        "translate_batch_import",
+    ];
+
+    fn tool_names(server: &EngramMcpServer) -> Vec<String> {
+        server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_paid_ai_tools_absent_when_flag_off() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let names = tool_names(&server);
+        for tool in PAID_AI_TOOL_NAMES {
+            assert!(
+                !names.contains(&tool.to_string()),
+                "expected {tool} to be ABSENT when ENGRAM_ENABLE_PAID_AI is off"
+            );
+        }
+    }
+
+    #[test]
+    fn test_paid_ai_tools_present_when_flag_on() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, true);
+        let names = tool_names(&server);
+        for tool in PAID_AI_TOOL_NAMES {
+            assert!(
+                names.contains(&tool.to_string()),
+                "expected {tool} to be registered when ENGRAM_ENABLE_PAID_AI is on"
+            );
+        }
+    }
+
+    #[test]
+    fn test_always_on_tools_present_regardless_of_flag() {
+        for flag in [false, true] {
+            let client = EngramClient::new("http://localhost", "engram_test");
+            let server = EngramMcpServer::new(client, flag);
+            let names = tool_names(&server);
+            assert!(names.contains(&"list_catalogs".to_string()));
+            assert!(names.contains(&"generate_card".to_string()));
+        }
+    }
 
     fn span(text: &str) -> RichTextSpan {
         RichTextSpan {

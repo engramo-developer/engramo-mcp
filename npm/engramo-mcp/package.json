@@ -1,0 +1,26 @@
+{
+  "name": "@engramo/mcp",
+  "version": "0.0.0",
+  "description": "MCP server for the EngrAmo spaced-repetition flashcard platform",
+  "keywords": ["mcp", "engramo", "flashcard", "spaced-repetition", "claude", "cursor"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/engramo-developer/engramo-mcp"
+  },
+  "bin": {
+    "engramo-mcp": "bin/run.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@engramo/mcp-darwin-arm64": "0.0.0",
+    "@engramo/mcp-darwin-x64": "0.0.0",
+    "@engramo/mcp-linux-arm64": "0.0.0",
+    "@engramo/mcp-linux-x64": "0.0.0"
+  }
+}

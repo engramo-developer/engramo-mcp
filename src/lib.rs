@@ -6,3 +6,4 @@ pub mod prompts;
 pub mod resources;
 pub mod server;
 pub mod tools;
+pub mod well_known;

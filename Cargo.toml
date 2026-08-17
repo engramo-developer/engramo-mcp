@@ -1,17 +1,19 @@
 [package]
-name = "engram-mcp"
+name = "engramo-mcp"
 version = "0.1.0"
 edition = "2024"
 authors = ["Volodymyr Dotsenko <volmyrdot@gmail.com>"]
-repository = "https://github.com/volmyrdot/engram-mcp"
+repository = "https://github.com/engramo-developer/engramo-mcp"
 
 [[bin]]
-name = "engram-mcp"
+name = "engramo-mcp"
 path = "src/main.rs"
 
 [dependencies]
+axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.13", features = ["json", "query"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "query"] }
 rmcp = { version = "1.3", features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server", "reqwest"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
