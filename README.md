@@ -11,6 +11,21 @@ MCP server for [EngrAmo](https://engramo.app), the spaced-repetition flashcard p
 - An EngrAmo account
 - An EngrAmo API token — generate one from your account's Settings → API Tokens page
 
+## Environments
+
+`engramo-mcp` is environment-agnostic — the binary itself has no baked-in "dev" or "prod." Which server it
+talks to is controlled entirely by the `ENGRAM_API_URL` you set in your client config, paired with a token
+minted from that **same** environment:
+
+| Environment | `ENGRAM_API_URL` | Who it's for |
+|---|---|---|
+| **Production** (default in every example below) | `https://api.engramo.app` | Real accounts — use this unless you have a specific reason not to |
+| **Dev** | `https://api-engram.volmyr.com` | EngrAmo team / internal testing only |
+
+**Dev and prod are separate backends with separate accounts.** A token minted from one will not authenticate
+against the other — if you switch `ENGRAM_API_URL`, you must also swap in a token generated from that same
+environment's Settings → API Tokens page.
+
 ## Installation
 
 Install the MCP server globally so it's available as a system command:
@@ -158,18 +173,12 @@ conversation into flashcards"* call `generate_catalog_with_cards` directly; open
 > A published, one-click ChatGPT App (OAuth login instead of a pasted token) is planned but not yet available
 > — see the project tracker for status.
 
-## Bring-your-own-AI vs. paid tools
+## Bring-your-own-AI
 
-By default, every deployment (including the hosted one) is **bring-your-own-AI**: the calling model (Claude,
-ChatGPT, …) does all generation — translation, dictionaries, phrasing — and `engramo-mcp` only persists the
-result via `generate_card` / `generate_catalog_with_cards` / `generate_cards`. This costs the EngrAmo account
-nothing beyond normal storage quotas.
-
-Setting `ENGRAM_ENABLE_PAID_AI=true` additionally registers a small set of tools that call **EngrAmo's own
-server-side AI** (TTS, translation, dictionary generation, AI-agent chat — see [Paid AI tools](#paid-ai-tools-feature-flagged)
-below). These consume the account's paid quotas, so they are **off by default** and absent from `tools/list`
-entirely unless explicitly enabled — a ChatGPT/Claude session never even sees them exist unless the deployer
-opts in.
+Every deployment is **bring-your-own-AI**: the calling model (Claude, ChatGPT, …) does all generation —
+translation, dictionaries, phrasing — and `engramo-mcp` only persists the result via `generate_card` /
+`generate_catalog_with_cards` / `generate_cards`. This costs the EngrAmo account nothing beyond normal
+storage quotas, and needs no paid EngrAmo plan.
 
 ## Environment variables
 
@@ -178,7 +187,6 @@ opts in.
 | `ENGRAM_API_URL` | `https://api.engramo.app` | Base URL of the EngrAmo API |
 | `ENGRAM_API_TOKEN` | *(required for `stdio`)* | Your EngrAmo API token. Unused in `http` mode — each session supplies its own via the `Authorization: Bearer` header. |
 | `MCP_BIND_ADDR` | `0.0.0.0:8080` | Bind address for `http` mode |
-| `ENGRAM_ENABLE_PAID_AI` | `false` | Set to `true`/`1`/`yes`/`on` to register the paid-AI tools (TTS, translation, dictionary, AI-agent chat) |
 
 ## Available tools
 
@@ -226,24 +234,12 @@ opts in.
 |---|---|
 | `list_media` | List uploaded media assets |
 
-### AI generation (bring-your-own-AI, always on)
+### AI generation (bring-your-own-AI)
 | Tool | Description |
 |---|---|
 | `generate_card` | Create a flashcard — the calling model does any translation/wording itself |
 | `generate_catalog_with_cards` | Create a catalog with cards in one call — same bring-your-own-AI model |
 | `generate_cards` | Add multiple cards to an existing catalog — same bring-your-own-AI model |
-
-### Paid AI tools (feature-flagged)
-Only present in `tools/list` when the deployment sets `ENGRAM_ENABLE_PAID_AI=true` — see
-[Bring-your-own-AI vs. paid tools](#bring-your-own-ai-vs-paid-tools). Absent entirely otherwise.
-
-| Tool | Description |
-|---|---|
-| `generate_tts_for_cards` | Queue server-side TTS audio generation for cards missing face audio |
-| `translate_cards` | Translate cards whose back text is empty, using EngrAmo's server-side AI |
-| `generate_dictionary_for_cards` | Fill in missing word-level dictionary entries on cards |
-| `ai_agent_chat` | Chat with EngrAmo's server-side AI agent (e.g. to draft a deck idea) |
-| `translate_batch_import` | Bulk-import a ZIP/JSON content file into a new catalog, auto-translating every card |
 
 ## Resources and Prompts
 
