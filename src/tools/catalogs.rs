@@ -54,7 +54,15 @@ pub(crate) fn ok_text(text: impl Into<String>) -> CallToolResult {
 }
 
 pub(crate) fn err_result(e: impl std::fmt::Display) -> CallToolResult {
-    CallToolResult::error(vec![rmcp::model::Content::text(e.to_string())])
+    let message = e.to_string();
+    // WARN, not ERROR: this is the single choke point for every failed tool call
+    // (~87 call sites), most of which are routine 4xx-shaped outcomes (not found,
+    // bad input, quota, conflict) rather than bugs. Genuine system failures (backend
+    // 5xx, network errors) are logged at ERROR at their own point of origin (see
+    // `ApiError::from_response` and `impl From<reqwest::Error> for ApiError` in
+    // `error.rs`), which is what feeds GCP Error Reporting.
+    tracing::warn!(error = %message, "tool call returned an error");
+    CallToolResult::error(vec![rmcp::model::Content::text(message)])
 }
 
 pub(crate) fn parse_uuid(s: &str) -> Result<Uuid, String> {

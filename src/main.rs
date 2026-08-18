@@ -17,7 +17,7 @@ use rmcp::{
         },
     },
 };
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "engramo-mcp", version, about = "EngrAmo MCP server")]
@@ -41,14 +41,62 @@ enum Command {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse(); // handles --version / --help before touching env vars
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    init_logging();
 
     match cli.command {
         None | Some(Command::Stdio) => run_stdio().await,
         Some(Command::Http) => run_http().await,
+    }
+}
+
+/// Sets up the global tracing subscriber. `APP_ENV=local` (or unset — the default for a
+/// developer running `cargo run`/the stdio binary directly) gets human-readable output;
+/// any other value (e.g. `dev`/`prod`, set by `cloudbuild.yaml` on real deployments) gets
+/// GCP Cloud Logging-shaped structured JSON on stdout plus a second, Error-Reporting-shaped
+/// JSON line on stderr for every `ERROR`-level event (see `error_reporting::ErrorReportingLayer`).
+/// `RUST_LOG` still controls verbosity in both branches; unlike `EnvFilter`'s own default
+/// (`ERROR` only), an unset `RUST_LOG` here defaults to `info` so routine startup/operational
+/// logs aren't silently dropped on a fresh deployment that hasn't set it.
+fn init_logging() {
+    let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "local".to_string());
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if app_env == "local" {
+        Registry::default()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+    } else {
+        let subscriber = Registry::default()
+            .with(env_filter)
+            .with(tracing_stackdriver::layer())
+            .with(engramo_mcp::error_reporting::ErrorReportingLayer::new(
+                "engramo-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ));
+        tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+
+        std::panic::set_hook(Box::new(|panic_info| {
+            let payload = panic_info.payload();
+            let message: &str = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("Unknown panic");
+
+            let location = panic_info
+                .location()
+                .map(|l| {
+                    let file = std::path::Path::new(l.file())
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or(l.file());
+                    format!("{file}:{}", l.line())
+                })
+                .unwrap_or_default();
+
+            tracing::error!("Panic occurred at {}: {}", location, message);
+        }));
     }
 }
 
@@ -99,9 +147,16 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     let paid_ai_enabled = cfg.paid_ai_enabled;
     let allowed_hosts = cfg.allowed_hosts();
     let factory = move || {
-        let token = CURRENT_BEARER_TOKEN
-            .try_with(|t| t.clone())
-            .map_err(|_| std::io::Error::other("missing bearer token for this MCP session"))?;
+        let token = CURRENT_BEARER_TOKEN.try_with(|t| t.clone()).map_err(|_| {
+            // Invariant violation: `bearer_auth_middleware` already rejects any
+            // request without a non-empty bearer token before this factory ever
+            // runs, so this should be unreachable. Log at ERROR (not a routine
+            // auth failure) so it reaches GCP Error Reporting if it ever does fire.
+            tracing::error!(
+                "missing bearer token for this MCP session (auth middleware invariant violated)"
+            );
+            std::io::Error::other("missing bearer token for this MCP session")
+        })?;
         let client = EngramClient::new(&api_url, &token);
         Ok(EngramMcpServer::new(client, paid_ai_enabled))
     };

@@ -109,9 +109,8 @@ gcloud run services add-iam-policy-binding engramo-mcp \
 
 ## 4. Review `cloudbuild.yaml`
 
-Repo-root `cloudbuild.yaml` is environment-agnostic via substitutions — no `_APP_ENV` branching
-needed since there's no config file per environment, just three plain env vars passed straight to
-Cloud Run:
+Repo-root `cloudbuild.yaml` is environment-agnostic via substitutions — there's no config file per
+environment, just plain env vars passed straight to Cloud Run:
 
 ```yaml
 substitutions:
@@ -119,11 +118,17 @@ substitutions:
   _ENGRAM_API_URL: 'https://api-engram.volmyr.com'
   _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com/mcp'
   _ENGRAM_ENABLE_PAID_AI: 'false'
+  _APP_ENV: 'dev'
 ```
 
-The defaults above are **dev** values. The prod trigger (Section 5) overrides `_ENGRAM_API_URL` and
-`_MCP_PUBLIC_URL` — leave `_ENGRAM_ENABLE_PAID_AI` as `'false'` on both unless you're deliberately
-testing the paid-AI path (see root `README.md`).
+The defaults above are **dev** values. The prod trigger (Section 5) overrides `_ENGRAM_API_URL`,
+`_MCP_PUBLIC_URL`, and `_APP_ENV` — leave `_ENGRAM_ENABLE_PAID_AI` as `'false'` on both unless
+you're deliberately testing the paid-AI path (see root `README.md`).
+
+`_APP_ENV` controls logging only (`src/main.rs`'s `init_logging()`): `'local'` (the binary's own
+default when unset, e.g. running it directly) gets human-readable output, anything else — `'dev'`
+or `'prod'` — switches to GCP Cloud Logging-shaped structured JSON plus Error Reporting for `ERROR`-level
+events. It has no effect on which backend is called; that's entirely `_ENGRAM_API_URL`.
 
 `_MCP_PUBLIC_URL` must include the `/mcp` path suffix — it becomes the `resource` value in
 `.well-known/oauth-protected-resource` (see `src/well_known.rs`), and ChatGPT resolves the MCP
@@ -144,6 +149,7 @@ Via console (**Cloud Build → Triggers → Create Trigger**), once per project:
    dev). **prod**: override
    - `_ENGRAM_API_URL` = `https://api.engramo.app`
    - `_MCP_PUBLIC_URL` = `https://mcp.engramo.app/mcp`
+   - `_APP_ENV` = `prod`
 8. Create.
 
 Run it from the CLI once created:

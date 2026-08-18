@@ -35,7 +35,9 @@ steps:
       # alongside its custom domain — rmcp's Host-header allowlist (DNS-rebinding
       # guard) would otherwise 403 every authenticated request to that fallback
       # URL, since only MCP_PUBLIC_URL's host is allowed automatically.
-      - 'ENGRAM_API_URL=${_ENGRAM_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAM_ENABLE_PAID_AI=${_ENGRAM_ENABLE_PAID_AI},MCP_ALLOWED_HOSTS=${_SERVICE_NAME}-$PROJECT_NUMBER.europe-west1.run.app'
+      # APP_ENV=dev/prod switches src/main.rs's init_logging() from human-readable
+      # local output to GCP Cloud Logging JSON + Error Reporting (see error_reporting.rs).
+      - 'ENGRAM_API_URL=${_ENGRAM_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAM_ENABLE_PAID_AI=${_ENGRAM_ENABLE_PAID_AI},MCP_ALLOWED_HOSTS=${_SERVICE_NAME}-$PROJECT_NUMBER.europe-west1.run.app,APP_ENV=${_APP_ENV}'
 
 images:
   - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
@@ -45,6 +47,7 @@ substitutions:
   _ENGRAM_API_URL: 'https://api-engram.volmyr.com'
   _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com/mcp'
   _ENGRAM_ENABLE_PAID_AI: 'false'
+  _APP_ENV: 'dev'
 
 options:
   logging: CLOUD_LOGGING_ONLY

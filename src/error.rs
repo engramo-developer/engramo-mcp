@@ -45,7 +45,17 @@ pub enum ApiError {
     Internal,
 
     #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(reqwest::Error),
+}
+
+impl From<reqwest::Error> for ApiError {
+    /// Connectivity failures to the Engram API (DNS, TLS, timeout, connection
+    /// refused) are a genuine system failure, not a routine tool-call outcome —
+    /// log at ERROR here so it reaches GCP Error Reporting (see `error_reporting`).
+    fn from(e: reqwest::Error) -> Self {
+        tracing::error!(error = %e, "network error calling Engram API");
+        Self::Network(e)
+    }
 }
 
 impl ApiError {
@@ -79,7 +89,26 @@ impl ApiError {
                 }
             }
             400 => Self::BadRequest(extract_error_message(&body)),
-            _ => Self::Internal,
+            _ => {
+                // Unrecognized/5xx status — a genuine backend failure, not a routine
+                // tool-call outcome. Log at ERROR so it reaches GCP Error Reporting.
+                const MAX_BODY_LEN: usize = 512;
+                let truncated_body = if body.len() > MAX_BODY_LEN {
+                    let cut = (0..=MAX_BODY_LEN)
+                        .rev()
+                        .find(|&i| body.is_char_boundary(i))
+                        .unwrap_or(0);
+                    format!("{}...[truncated]", &body[..cut])
+                } else {
+                    body.clone()
+                };
+                tracing::error!(
+                    status = %status,
+                    body = %truncated_body,
+                    "Engram API returned an unexpected status"
+                );
+                Self::Internal
+            }
         }
     }
 }
