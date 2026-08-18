@@ -187,6 +187,8 @@ storage quotas, and needs no paid EngrAmo plan.
 | `ENGRAM_API_URL` | `https://api.engramo.app` | Base URL of the EngrAmo API |
 | `ENGRAM_API_TOKEN` | *(required for `stdio`)* | Your EngrAmo API token. Unused in `http` mode — each session supplies its own via the `Authorization: Bearer` header. |
 | `MCP_BIND_ADDR` | `0.0.0.0:8080` | Bind address for `http` mode |
+| `MCP_PUBLIC_URL` | *(unset)* | `http` mode only — this deployment's own public URL, e.g. `https://mcp.engramo.app/mcp`. Also allowlists that host for inbound requests; without it, every request is rejected (see `MCP_ALLOWED_HOSTS`). |
+| `MCP_ALLOWED_HOSTS` | *(unset)* | `http` mode only — extra comma-separated hostnames/`host:port` values to permit, on top of the one derived from `MCP_PUBLIC_URL`. Only needed for extra entry points (e.g. a Cloud Run service's own `*.run.app` fallback URL alongside its custom domain). |
 
 ## Available tools
 

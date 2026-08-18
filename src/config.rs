@@ -18,6 +18,12 @@ pub struct McpConfig {
     /// token for. `None` in `stdio` mode (unused there) and, in `http` mode, when
     /// `MCP_PUBLIC_URL` hasn't been set — a real deployment must set it.
     pub public_url: Option<String>,
+    /// Extra hostnames/`host:port` values permitted on the inbound HTTP `Host`
+    /// header, on top of the one auto-derived from `public_url` — see
+    /// [`Self::allowed_hosts`]. Loaded from `MCP_ALLOWED_HOSTS` (comma-separated),
+    /// e.g. to also allow a Cloud Run service's own `*.run.app` fallback URL
+    /// alongside its custom domain mapping.
+    pub extra_allowed_hosts: Vec<String>,
 }
 
 impl McpConfig {
@@ -44,6 +50,7 @@ impl McpConfig {
             api_token,
             paid_ai_enabled,
             public_url: None,
+            extra_allowed_hosts: Vec::new(),
         })
     }
 
@@ -53,6 +60,36 @@ impl McpConfig {
     pub fn with_public_url(mut self, public_url: impl Into<String>) -> Self {
         self.public_url = Some(public_url.into());
         self
+    }
+
+    /// Sets [`Self::extra_allowed_hosts`]. Builder-style, same reasoning as
+    /// [`Self::with_public_url`].
+    pub fn with_extra_allowed_hosts(
+        mut self,
+        hosts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.extra_allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Hosts permitted on the inbound HTTP `Host` header in `http` mode (rmcp's
+    /// `StreamableHttpServerConfig::allowed_hosts` DNS-rebinding guard — see
+    /// `main.rs::run_http`): the loopback defaults (for local testing without
+    /// `MCP_PUBLIC_URL` set), the host:port parsed out of `public_url` (a real
+    /// deployment's own domain), and `extra_allowed_hosts`.
+    pub fn allowed_hosts(&self) -> Vec<String> {
+        let mut hosts = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ];
+        if let Some(url) = &self.public_url
+            && let Some(host) = authority_from_url(url)
+        {
+            hosts.push(host);
+        }
+        hosts.extend(self.extra_allowed_hosts.iter().cloned());
+        hosts
     }
 
     /// Load configuration from environment variables.
@@ -67,6 +104,8 @@ impl McpConfig {
     ///   tools; defaults to `false`.
     /// - `MCP_PUBLIC_URL` — this server's own canonical public URL; only read by
     ///   `http` mode's OAuth protected-resource metadata route.
+    /// - `MCP_ALLOWED_HOSTS` — comma-separated extra hostnames/`host:port` values
+    ///   for the `http` mode inbound `Host`-header allowlist (see `allowed_hosts`).
     pub fn from_env() -> Result<Self, ConfigError> {
         let api_url =
             env::var("ENGRAM_API_URL").map_err(|_| ConfigError::MissingVar("ENGRAM_API_URL"))?;
@@ -75,10 +114,20 @@ impl McpConfig {
             .map(|v| parse_bool_flag(&v))
             .unwrap_or(false);
         let cfg = Self::new(api_url, api_token, paid_ai_enabled)?;
-        Ok(match env::var("MCP_PUBLIC_URL").ok() {
+        let cfg = match env::var("MCP_PUBLIC_URL").ok() {
             Some(url) if !url.is_empty() => cfg.with_public_url(url),
             _ => cfg,
-        })
+        };
+        let extra_hosts: Vec<String> = env::var("MCP_ALLOWED_HOSTS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(cfg.with_extra_allowed_hosts(extra_hosts))
     }
 
     /// Returns the configured API token, or an error if none was set.
@@ -87,6 +136,20 @@ impl McpConfig {
         self.api_token
             .as_deref()
             .ok_or(ConfigError::MissingVar("ENGRAM_API_TOKEN"))
+    }
+}
+
+/// Extracts the `host[:port]` authority out of a URL, e.g.
+/// `"https://mcp.engramo.app/mcp"` -> `Some("mcp.engramo.app")`. Used to derive
+/// an `allowed_hosts` entry from `public_url` without pulling in a full URL
+/// parsing crate for this one call site.
+fn authority_from_url(url: &str) -> Option<String> {
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next()?;
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_string())
     }
 }
 
@@ -233,6 +296,92 @@ mod tests {
         assert_eq!(
             cfg.public_url.as_deref(),
             Some("https://mcp.engramo.app/mcp")
+        );
+    }
+
+    #[test]
+    fn test_authority_from_url_strips_scheme_and_path() {
+        assert_eq!(
+            authority_from_url("https://mcp.engramo.app/mcp"),
+            Some("mcp.engramo.app".to_string())
+        );
+    }
+
+    #[test]
+    fn test_authority_from_url_keeps_port() {
+        assert_eq!(
+            authority_from_url("http://localhost:8080/mcp"),
+            Some("localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_authority_from_url_no_scheme() {
+        assert_eq!(
+            authority_from_url("mcp.engramo.app/mcp"),
+            Some("mcp.engramo.app".to_string())
+        );
+    }
+
+    #[test]
+    fn test_authority_from_url_empty() {
+        assert_eq!(authority_from_url(""), None);
+        assert_eq!(authority_from_url("https:///mcp"), None);
+    }
+
+    #[test]
+    fn test_allowed_hosts_defaults_to_loopback_only() {
+        let cfg = McpConfig::new("https://api.engram.dev", None, false).unwrap();
+        assert_eq!(cfg.allowed_hosts(), vec!["localhost", "127.0.0.1", "::1"]);
+    }
+
+    #[test]
+    fn test_allowed_hosts_includes_public_url_authority() {
+        let cfg = McpConfig::new("https://api.engram.dev", None, false)
+            .unwrap()
+            .with_public_url("https://mcp.engramo.app/mcp");
+        assert_eq!(
+            cfg.allowed_hosts(),
+            vec!["localhost", "127.0.0.1", "::1", "mcp.engramo.app"]
+        );
+    }
+
+    #[test]
+    fn test_allowed_hosts_includes_extra_hosts() {
+        let cfg = McpConfig::new("https://api.engram.dev", None, false)
+            .unwrap()
+            .with_public_url("https://mcp.engramo.app/mcp")
+            .with_extra_allowed_hosts(["engramo-mcp-632347647951.europe-west1.run.app"]);
+        assert_eq!(
+            cfg.allowed_hosts(),
+            vec![
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "mcp.engramo.app",
+                "engramo-mcp-632347647951.europe-west1.run.app",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_from_env_parses_mcp_allowed_hosts() {
+        // SAFETY: test-only env mutation, serialized by the process-wide env lock
+        // pattern already used by other from_env tests in this module... this is
+        // the first one that needs MCP_ALLOWED_HOSTS specifically, set/cleared
+        // within the same test to avoid leaking into others.
+        unsafe {
+            std::env::set_var("ENGRAM_API_URL", "https://api.engram.dev");
+            std::env::set_var("MCP_ALLOWED_HOSTS", "example.com, foo.example.com:9000 ,,");
+        }
+        let cfg = McpConfig::from_env().unwrap();
+        unsafe {
+            std::env::remove_var("ENGRAM_API_URL");
+            std::env::remove_var("MCP_ALLOWED_HOSTS");
+        }
+        assert_eq!(
+            cfg.extra_allowed_hosts,
+            vec!["example.com", "foo.example.com:9000"]
         );
     }
 }

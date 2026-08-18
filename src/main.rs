@@ -97,6 +97,7 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
 
     let api_url = cfg.api_url.clone();
     let paid_ai_enabled = cfg.paid_ai_enabled;
+    let allowed_hosts = cfg.allowed_hosts();
     let factory = move || {
         let token = CURRENT_BEARER_TOKEN
             .try_with(|t| t.clone())
@@ -105,11 +106,20 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
         Ok(EngramMcpServer::new(client, paid_ai_enabled))
     };
 
+    // rmcp's `allowed_hosts` defaults to loopback-only (DNS-rebinding protection for
+    // locally run servers) — a real deployment must extend it to its own domain, or
+    // every authenticated request gets rejected with 403 "Host header is not
+    // allowed" before it ever reaches this server's own auth/routing logic. See
+    // `McpConfig::allowed_hosts`.
+    tracing::info!(
+        ?allowed_hosts,
+        "Configured Host-header allowlist for http mode"
+    );
     let session_manager = Arc::new(LocalSessionManager::default());
     let service = StreamableHttpService::new(
         factory,
         session_manager,
-        StreamableHttpServerConfig::default(),
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
     // Bearer auth applies only to `/mcp` — `.well-known/oauth-protected-resource`

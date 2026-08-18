@@ -31,7 +31,11 @@ steps:
       - '80'
       - '--allow-unauthenticated'
       - '--set-env-vars'
-      - 'ENGRAM_API_URL=${_ENGRAM_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAM_ENABLE_PAID_AI=${_ENGRAM_ENABLE_PAID_AI}'
+      # MCP_ALLOWED_HOSTS also permits this service's own stable *.run.app URL
+      # alongside its custom domain — rmcp's Host-header allowlist (DNS-rebinding
+      # guard) would otherwise 403 every authenticated request to that fallback
+      # URL, since only MCP_PUBLIC_URL's host is allowed automatically.
+      - 'ENGRAM_API_URL=${_ENGRAM_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAM_ENABLE_PAID_AI=${_ENGRAM_ENABLE_PAID_AI},MCP_ALLOWED_HOSTS=${_SERVICE_NAME}-$PROJECT_NUMBER.europe-west1.run.app'
 
 images:
   - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
