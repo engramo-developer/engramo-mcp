@@ -148,6 +148,42 @@ Add to `~/.cursor/mcp.json`:
 }
 ```
 
+## Antigravity
+
+Antigravity supports both transports directly via its own config file — no separate remote-connector UI
+needed like ChatGPT's. Add to `~/.gemini/config/mcp_config.json` (global) or `.agents/mcp_config.json`
+(workspace-local):
+
+**stdio, via npx** (no prior installation needed):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "npx",
+      "args": ["-y", "@engramo/mcp"],
+      "env": {
+        "ENGRAM_API_URL": "https://api.engramo.app",
+        "ENGRAM_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+**Remote, over Streamable HTTP** (point at a running `engramo-mcp http` deployment — see below):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "serverUrl": "https://mcp.engramo.app/",
+      "headers": {
+        "Authorization": "Bearer your-token"
+      }
+    }
+  }
+}
+```
+
 ## Use in ChatGPT (remote MCP over Streamable HTTP)
 
 `engramo-mcp` also runs as a **remote** server, so it can be added to ChatGPT as a custom connector (developer
