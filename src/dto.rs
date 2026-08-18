@@ -129,6 +129,14 @@ pub struct CardStyle {
     pub text_align: Option<String>,
 }
 
+/// Image or video attached to a card face/back — mirrors `engram-api`'s `VisualType`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum VisualType {
+    Image,
+    Video,
+}
+
 /// Card face or back content.
 /// LLMs should use `rich_text` spans for visual emphasis (code → monospace, keywords → bold).
 /// If only `text` is provided, default styles are applied.
@@ -147,13 +155,20 @@ pub struct CardContent {
     pub style: Option<CardStyle>,
     /// Word-level translation dictionary for language-learning cards (set on the face).
     /// Keys are lowercased source words; values are their translations.
-    /// Populated automatically when `target_lang` is provided and no dictionary is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dictionary: Option<HashMap<String, String>>,
-    /// UUID of a stored audio asset for this card face.
-    /// Populated automatically when `source_lang` is provided.
+    /// UUID of a stored audio asset for this card face/back. Optional — set this to a
+    /// `media_id` returned by the `upload_media` tool (e.g. the user's own voice recording).
+    /// Never fabricate a UUID here; only use one you actually got from `upload_media`.
     #[serde(rename = "audioId", skip_serializing_if = "Option::is_none")]
     pub audio_id: Option<String>,
+    /// UUID of a stored image/video asset for this card face/back. Optional — same rule as
+    /// `audio_id`: only set this to a `media_id` returned by `upload_media`.
+    #[serde(rename = "visualId", skip_serializing_if = "Option::is_none")]
+    pub visual_id: Option<String>,
+    /// Required alongside `visual_id` — whether that asset is an image or a video.
+    #[serde(rename = "visualType", skip_serializing_if = "Option::is_none")]
+    pub visual_type: Option<VisualType>,
 }
 
 impl CardContent {
@@ -164,6 +179,8 @@ impl CardContent {
             style: None,
             dictionary: None,
             audio_id: None,
+            visual_id: None,
+            visual_type: None,
         }
     }
 }
@@ -237,6 +254,10 @@ pub struct CreateCatalogWithCardsApiRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// UUID of a stored image asset for the catalog's cover — set this to a `media_id`
+    /// returned by the `upload_media` tool. Never fabricate a UUID here.
+    #[serde(rename = "imageId", skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,6 +368,25 @@ pub struct MediaDto {
     pub size: Option<i64>,
 }
 
+/// Raw shape of `POST /media`'s response body: `{"media_ids": {"ids": [...]}}`.
+/// We always upload exactly one file per call, so callers take the first id.
+#[derive(Debug, Deserialize)]
+pub struct UploadMediaResponseDto {
+    pub media_ids: MediaIdsDto,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MediaIdsDto {
+    pub ids: Vec<Uuid>,
+}
+
+/// Result of the `upload_media` MCP tool — the new media's id, ready to attach via a
+/// card's `audio_id`/`visual_id` or a catalog's `image_id`.
+#[derive(Debug, Serialize)]
+pub struct UploadMediaResult {
+    pub media_id: Uuid,
+}
+
 // ── Paid AI (feature-flagged) ────────────────────────────────────────────────
 
 /// Shared request body for card-scoped batch AI operations
@@ -444,6 +484,8 @@ mod tests {
                 style: None,
                 dictionary: None,
                 audio_id: None,
+                visual_id: None,
+                visual_type: None,
             },
             back: CardContent::plain("Every value has one owner."),
             order_number: Some(1),
@@ -460,6 +502,34 @@ mod tests {
         assert_eq!(c.text, "Hello");
         assert!(c.rich_text.is_none());
         assert!(c.style.is_none());
+        assert!(c.visual_id.is_none());
+        assert!(c.visual_type.is_none());
+    }
+
+    #[test]
+    fn test_card_content_visual_fields_round_trip() {
+        let mut c = CardContent::plain("A card with a picture");
+        c.visual_id = Some("3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string());
+        c.visual_type = Some(VisualType::Image);
+        c.audio_id = Some("3fa85f64-5717-4562-b3fc-2c963f66afa7".to_string());
+
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"visualId\":\"3fa85f64-5717-4562-b3fc-2c963f66afa6\""));
+        assert!(json.contains("\"visualType\":\"image\""));
+        assert!(json.contains("\"audioId\":\"3fa85f64-5717-4562-b3fc-2c963f66afa7\""));
+
+        let round_tripped: CardContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.visual_id, c.visual_id);
+        assert_eq!(round_tripped.visual_type, Some(VisualType::Image));
+        assert_eq!(round_tripped.audio_id, c.audio_id);
+    }
+
+    #[test]
+    fn test_card_content_visual_fields_omitted_when_none() {
+        let json = serde_json::to_string(&CardContent::plain("no media")).unwrap();
+        assert!(!json.contains("visualId"));
+        assert!(!json.contains("visualType"));
+        assert!(!json.contains("audioId"));
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub struct GenerateCardParams {
 
     /// Front of the card.
     ///
-    /// Read `engram://card-schema` for the complete schema, validation rules, and 3 annotated examples.
+    /// Read `engram://card-schema` for the complete schema, validation rules, and 4 annotated examples.
     ///
     /// Rich-text span rules (IMPORTANT):
     /// - Each span.text must be a VERBATIM contiguous slice of the original sentence.
@@ -28,15 +28,20 @@ pub struct GenerateCardParams {
     /// - Omit rich_text entirely if no styling is needed.
     ///
     /// For language-learning cards, set `face.dictionary` yourself (word → translation map).
+    ///
+    /// For audio/images: EngrAmo does NOT generate these for you. If the user already has an
+    /// audio recording or image (their own voice, a self-generated file, a picture they gave
+    /// you), call `upload_media` first and set `audio_id`/`visual_id` (+ `visual_type`) to the
+    /// returned `media_id`. Never fabricate a UUID for either field.
     pub face: CardContent,
 
     /// Back of the card (answer / explanation).
     ///
-    /// Read `engram://card-schema` for the complete schema, validation rules, and 3 annotated examples.
+    /// Read `engram://card-schema` for the complete schema, validation rules, and 4 annotated examples.
     ///
     /// Same rich-text rules as `face`: always set `text`; spans must match it exactly.
     /// For language-learning cards, translate `face.text` yourself and set `back.text` —
-    /// do not leave it empty.
+    /// do not leave it empty. Same `upload_media` rule as `face` for `audio_id`/`visual_id`.
     pub back: CardContent,
 }
 
@@ -44,11 +49,11 @@ pub struct GenerateCardParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardInputParams {
     /// Front of the card. Read `engram://card-schema` for the complete schema, validation rules,
-    /// and 3 annotated examples. Always set `text` to the full sentence; spans must concatenate
+    /// and 4 annotated examples. Always set `text` to the full sentence; spans must concatenate
     /// to match `text` exactly.
     pub face: CardContent,
     /// Back of the card. Read `engram://card-schema` for the complete schema, validation rules,
-    /// and 3 annotated examples. Same rich-text rules as `face`.
+    /// and 4 annotated examples. Same rich-text rules as `face`.
     pub back: CardContent,
 }
 
@@ -59,6 +64,11 @@ pub struct GenerateCatalogWithCardsParams {
     pub name: String,
     #[schemars(description = "Optional description")]
     pub description: Option<String>,
+    /// UUID of a stored image asset for the catalog's cover. Set this to a `media_id`
+    /// returned by `upload_media` (e.g. an image the user provided). Omit if no cover
+    /// image was requested — never fabricate a UUID here.
+    #[schemars(description = "Optional cover image media_id, from upload_media")]
+    pub image_id: Option<String>,
     #[schemars(description = "Optional list of tags")]
     pub tags: Option<Vec<String>>,
     #[schemars(description = "Visibility: 'public' or 'private' (default: 'private')")]
@@ -187,6 +197,8 @@ mod tests {
             style: None,
             dictionary: None,
             audio_id: None,
+            visual_id: None,
+            visual_type: None,
         };
 
         make_server(&server.uri())
@@ -274,6 +286,7 @@ mod tests {
             .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
                 name: "Test".to_string(),
                 description: None,
+                image_id: None,
                 tags: None,
                 visibility: None,
                 cards: vec![CardInputParams {
@@ -295,6 +308,81 @@ mod tests {
             Some("Ellos están")
         );
         assert_eq!(body["cards"][0]["back"]["text"].as_str(), Some("Theyare"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_threads_image_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .mount(&server)
+            .await;
+
+        make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Ordering Coffee".to_string(),
+                description: None,
+                image_id: Some("3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string()),
+                tags: None,
+                visibility: None,
+                cards: vec![CardInputParams {
+                    face: CardContent::plain("Face"),
+                    back: CardContent::plain("Back"),
+                }],
+            }))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.url.path() == "/catalogs/with-cards")
+            .expect("POST /catalogs/with-cards not called");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(
+            body["imageId"].as_str(),
+            Some("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_omits_image_id_when_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .mount(&server)
+            .await;
+
+        make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "No Cover".to_string(),
+                description: None,
+                image_id: None,
+                tags: None,
+                visibility: None,
+                cards: vec![CardInputParams {
+                    face: CardContent::plain("Face"),
+                    back: CardContent::plain("Back"),
+                }],
+            }))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.url.path() == "/catalogs/with-cards")
+            .expect("POST /catalogs/with-cards not called");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert!(body.get("imageId").is_none());
     }
 
     // ── generate_card ─────────────────────────────────────────────────────────
@@ -378,6 +466,7 @@ mod tests {
             .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
                 name: "Rust Basics".to_string(),
                 description: None,
+                image_id: None,
                 tags: None,
                 visibility: None,
                 cards: vec![
@@ -414,6 +503,7 @@ mod tests {
             .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
                 name: "Overflow".to_string(),
                 description: None,
+                image_id: None,
                 tags: None,
                 visibility: None,
                 cards: vec![CardInputParams {
@@ -452,6 +542,7 @@ mod tests {
             .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
                 name: "Empty Catalog".to_string(),
                 description: None,
+                image_id: None,
                 tags: None,
                 visibility: None,
                 cards: vec![],
@@ -513,6 +604,7 @@ mod tests {
             .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
                 name: "UA Lang".to_string(),
                 description: None,
+                image_id: None,
                 tags: None,
                 visibility: None,
                 cards: vec![CardInputParams {

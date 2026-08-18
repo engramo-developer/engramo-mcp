@@ -10,10 +10,12 @@ use rmcp::{
 };
 use tracing::{debug, warn};
 
+use base64::Engine;
+
 use crate::client::EngramClient;
 use crate::dto::{
     CardInput, CreateCardRequest, CreateCatalogWithCardsApiRequest, CreateLearningPathRequest,
-    UpdateCardRequest, UpdateCatalogRequest,
+    UpdateCardRequest, UpdateCatalogRequest, UploadMediaResult,
 };
 use crate::tools::cards::{DeleteCardParams, GetCardParams, ListCardsParams, UpdateCardParams};
 use crate::tools::catalogs::{
@@ -28,7 +30,7 @@ use crate::tools::learning_paths::{
     ActivateLearningPathParams, CreateLearningPathParams, GetLearningPathParams,
     ListLearningPathsParams,
 };
-use crate::tools::media::ListMediaParams;
+use crate::tools::media::{ListMediaParams, UploadMediaParams};
 use crate::tools::search::SearchParams;
 use uuid::Uuid;
 
@@ -446,7 +448,11 @@ impl EngramMcpServer {
 #[tool_router(router = search_tools_router)]
 impl EngramMcpServer {
     #[tool(
-        description = "Search across all cards, catalogs, and learning paths. Returns ids and types."
+        description = "Search across all cards, catalogs, and learning paths. Returns ids and types. \
+        If the user gives you a catalog's short ID (the ~8-character code shown in the app/URL, e.g. \
+        \"A7KX9QM2\" — NOT a UUID), search for that exact code here (or with search_catalogs) instead \
+        of paginating through list_catalogs — the short ID is indexed for search and matches fast, \
+        usually returning a single unique result with the real UUID you need for other tools."
     )]
     pub async fn search_global(
         &self,
@@ -458,7 +464,12 @@ impl EngramMcpServer {
         })
     }
 
-    #[tool(description = "Search catalogs by name or description.")]
+    #[tool(
+        description = "Search catalogs by name, description, or short ID. If the user gives you a \
+        catalog's short ID (the ~8-character code shown in the app/URL, e.g. \"A7KX9QM2\" — NOT a \
+        UUID) rather than a name, search for that exact code here instead of paginating through \
+        list_catalogs — it's indexed for search and resolves fast to the real UUID other tools need."
+    )]
     pub async fn search_catalogs(
         &self,
         Parameters(p): Parameters<SearchParams>,
@@ -492,6 +503,46 @@ impl EngramMcpServer {
             },
         )
     }
+
+    #[tool(
+        description = "Upload a media file you already have — a user's own voice recording, a \
+        self-generated audio clip, or an image — and get back a media_id. Use that id as \
+        `audio_id`/`visual_id` on a card's face/back, or as `image_id` for a catalog cover, via \
+        generate_card/generate_catalog_with_cards/generate_cards/update_card. This does NOT \
+        generate audio or images itself — EngrAmo has no server-side TTS/image generation in this \
+        flow; the caller must already have the file. Max ~10MB after decoding. \
+        If you use a shell/code tool to prepare content_base64: prefer standard line-wrapped \
+        `base64` output over `-w 0`/`--wrap=0` (a single unbroken multi-KB line can break some \
+        tool-output pipelines), and encode directly to stdout in one step rather than writing to \
+        a file and reading it back in a second command."
+    )]
+    pub async fn upload_media(
+        &self,
+        Parameters(p): Parameters<UploadMediaParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+        let content = match base64::engine::general_purpose::STANDARD.decode(&p.content_base64) {
+            Ok(bytes) => bytes,
+            Err(e) => return Ok(err_result(format!("Invalid base64 content_base64: {e}"))),
+        };
+        if content.len() > MAX_UPLOAD_BYTES {
+            return Ok(err_result(format!(
+                "File is {} bytes, which exceeds the 10MB limit",
+                content.len()
+            )));
+        }
+        let filename = p.filename.unwrap_or_else(|| "upload".to_string());
+        Ok(
+            match self
+                .client
+                .upload_media(content, &filename, &p.content_type)
+                .await
+            {
+                Ok(media_id) => ok_json(&UploadMediaResult { media_id }),
+                Err(e) => err_result(e),
+            },
+        )
+    }
 }
 
 // ── ServerHandler ─────────────────────────────────────────────────────────────
@@ -508,8 +559,17 @@ impl ServerHandler for EngramMcpServer {
         .with_instructions(
             "Engram flashcard assistant. Use catalog and card tools to manage flashcards, \
              learning tools to track spaced-repetition progress, and search to find content. \
-             Resources expose live data (catalogs, due cards, stats). \
-             Prompts guide you through review sessions, flashcard creation, and study planning.",
+             Cards can carry more than plain text — a dictionary (word translations), rich_text/style \
+             (font, color, per-side styling), and your own audio/images via upload_media (bring your \
+             own recording or picture; no paid AI is used for any of this, ever). \
+             Every tool taking a catalog_id needs the real UUID, never the ~8-character short ID \
+             shown in the app/URL (e.g. \"A7KX9QM2\") — if the user gives you a short ID, resolve it \
+             first with search_catalogs/search_global (it's indexed, so this is fast and usually \
+             returns one exact match), don't page through list_catalogs guessing. \
+             Resources expose live data (catalogs, due cards, stats) and engram://card-schema documents \
+             all of the above with worked examples. \
+             Prompts guide you through review sessions, flashcard creation (including \
+             create_language_deck for styled, translated, dictionary-annotated decks), and study planning.",
         )
     }
 
@@ -807,6 +867,7 @@ impl EngramMcpServer {
         let req = CreateCatalogWithCardsApiRequest {
             name: p.name,
             description: p.description,
+            image_id: p.image_id,
             tags: p.tags,
             visibility: p.visibility,
             cards: p
@@ -896,6 +957,83 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect()
+    }
+
+    #[test]
+    fn test_get_info_instructions_mention_rich_card_capabilities() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        // These are the capabilities a plain "what can you do?" should surface without the
+        // user needing to already know a tool/prompt name — see docs/prompt-examples.md.
+        assert!(instructions.contains("dictionary"), "{instructions}");
+        assert!(instructions.contains("upload_media"), "{instructions}");
+        assert!(instructions.contains("short ID"), "{instructions}");
+        assert!(instructions.contains("search_catalogs"), "{instructions}");
+        assert!(
+            instructions.contains("create_language_deck"),
+            "{instructions}"
+        );
+        assert!(instructions.contains("card-schema"), "{instructions}");
+    }
+
+    #[test]
+    fn test_upload_media_is_registered_on_the_real_server() {
+        // Regression guard: `tools/media.rs`'s `MediaTools` struct is a separate, unused
+        // scaffold (like every other `tools/*.rs` XxxTools struct in this codebase) — the
+        // tool actually served to clients is the one registered directly on
+        // `EngramMcpServer` below. A tool added only to `MediaTools` would pass its own
+        // tests while being completely unreachable from a real MCP client.
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let names = tool_names(&server);
+        assert!(names.contains(&"upload_media".to_string()), "{names:?}");
+        assert!(names.contains(&"list_media".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn test_search_tools_describe_short_id_resolution_on_the_real_server() {
+        // Same regression class as the upload_media test above: assert against the tool
+        // actually registered on EngramMcpServer, not the unused tools/search.rs scaffold.
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        for name in ["search_global", "search_catalogs"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let description = tool.description.clone().unwrap_or_default();
+            assert!(description.contains("short ID"), "{name}: {description}");
+            assert!(description.contains("UUID"), "{name}: {description}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_end_to_end_on_real_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "media_ids": { "ids": ["00000000-0000-0000-0000-000000000001"] }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = EngramClient::new(mock_server.uri(), "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let result = server
+            .upload_media(Parameters(UploadMediaParams {
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"test audio"),
+                content_type: "audio/mpeg".to_string(),
+                filename: Some("test.mp3".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
     }
 
     #[test]
@@ -1086,6 +1224,8 @@ mod tests {
             style: None,
             dictionary: None,
             audio_id: None,
+            visual_id: None,
+            visual_type: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me estoy muriendo de ganas de verte pronto.");
@@ -1113,6 +1253,8 @@ mod tests {
             style: None,
             dictionary: None,
             audio_id: None,
+            visual_id: None,
+            visual_type: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -1134,6 +1276,8 @@ mod tests {
             style: None,
             dictionary: None,
             audio_id: None,
+            visual_id: None,
+            visual_type: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -1149,6 +1293,8 @@ mod tests {
             style: None,
             dictionary: None,
             audio_id: None,
+            visual_id: None,
+            visual_type: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me gusta el café.");

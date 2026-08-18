@@ -31,7 +31,7 @@ enum Command {
     /// Run over stdio (default, for Claude Desktop / Cursor). One process serves one
     /// user, authenticated via the ENGRAM_API_TOKEN env var.
     Stdio,
-    /// Run over Streamable HTTP at `/mcp` (for remote clients such as ChatGPT). Each
+    /// Run over Streamable HTTP at `/` (for remote clients such as ChatGPT). Each
     /// session authenticates with its own `Authorization: Bearer <token>` header —
     /// no global ENGRAM_API_TOKEN is used. Binds `MCP_BIND_ADDR` (default `0.0.0.0:8080`).
     Http,
@@ -136,7 +136,7 @@ tokio::task_local! {
     static CURRENT_BEARER_TOKEN: String;
 }
 
-/// Remote entry point: serves the MCP over Streamable HTTP at `/mcp`, deriving a fresh
+/// Remote entry point: serves the MCP over Streamable HTTP at `/`, deriving a fresh
 /// `EngramClient` per session from the caller's own `Authorization: Bearer <token>` —
 /// there is no global `ENGRAM_API_TOKEN` in this mode (`McpConfig.api_token` is unused).
 async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,11 +177,12 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
-    // Bearer auth applies only to `/mcp` — `.well-known/oauth-protected-resource`
-    // (RFC 9728, Track 3 Phase 3) must be fetchable *without* a token, since its
-    // whole purpose is telling an unauthenticated client where to go get one.
+    // Bearer auth applies only to the MCP endpoint itself (served at root, `/`) —
+    // `.well-known/oauth-protected-resource` (RFC 9728, Track 3 Phase 3) must be
+    // fetchable *without* a token, since its whole purpose is telling an
+    // unauthenticated client where to go get one.
     let mcp_router = axum::Router::new()
-        .nest_service("/mcp", service)
+        .fallback_service(service)
         .layer(middleware::from_fn(bearer_auth_middleware));
 
     let protected_resource_state = well_known::ProtectedResourceState {
@@ -189,10 +190,10 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!(
                 "MCP_PUBLIC_URL is not set — .well-known/oauth-protected-resource will \
                  advertise a placeholder \"resource\" value. Set MCP_PUBLIC_URL to this \
-                 server's real public URL (e.g. https://mcp.engramo.app/mcp) before \
+                 server's real public URL (e.g. https://mcp.engramo.app) before \
                  deploying for OAuth."
             );
-            "http://localhost:8080/mcp".to_string()
+            "http://localhost:8080".to_string()
         }),
         authorization_server: cfg.api_url.clone(),
     };
@@ -206,7 +207,7 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    tracing::info!(addr = %bind_addr, "Starting Engram MCP server over Streamable HTTP at /mcp");
+    tracing::info!(addr = %bind_addr, "Starting Engram MCP server over Streamable HTTP at /");
 
     axum::serve(listener, app).await?;
     Ok(())

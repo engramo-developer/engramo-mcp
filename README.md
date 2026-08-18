@@ -159,13 +159,13 @@ default `stdio` — so a self-hosted deployment serves both Claude Desktop users
 ENGRAM_API_URL=https://api.engramo.app MCP_BIND_ADDR=0.0.0.0:8080 engramo-mcp http
 ```
 
-This serves MCP over Streamable HTTP at `POST /mcp`. Unlike `stdio` mode, there is **no global
+This serves MCP over Streamable HTTP at `POST /` (root). Unlike `stdio` mode, there is **no global
 `ENGRAM_API_TOKEN`** — every session authenticates with its own `Authorization: Bearer <token>` header, so one
 deployment safely serves many users at once (each session's calls to the EngrAmo API use only that session's
 token). Requests without a valid, non-empty bearer token are rejected with `401` before a session is created.
 
 In ChatGPT: **Settings → Connectors → Advanced → Developer mode**, then add a custom connector pointing at
-your deployment's `https://<host>/mcp`, pasting an EngrAmo API token (from Settings → API Tokens) as the
+your deployment's `https://<host>/`, pasting an EngrAmo API token (from Settings → API Tokens) as the
 bearer token. Once connected, prompts like *"Make me a 10-card Spanish restaurant deck"* or *"Turn this
 conversation into flashcards"* call `generate_catalog_with_cards` directly; open the result at
 `https://study.engramo.app/catalog/<shortId>` to study it.
@@ -187,7 +187,7 @@ storage quotas, and needs no paid EngrAmo plan.
 | `ENGRAM_API_URL` | `https://api.engramo.app` | Base URL of the EngrAmo API |
 | `ENGRAM_API_TOKEN` | *(required for `stdio`)* | Your EngrAmo API token. Unused in `http` mode — each session supplies its own via the `Authorization: Bearer` header. |
 | `MCP_BIND_ADDR` | `0.0.0.0:8080` | Bind address for `http` mode |
-| `MCP_PUBLIC_URL` | *(unset)* | `http` mode only — this deployment's own public URL, e.g. `https://mcp.engramo.app/mcp`. Also allowlists that host for inbound requests; without it, every request is rejected (see `MCP_ALLOWED_HOSTS`). |
+| `MCP_PUBLIC_URL` | *(unset)* | `http` mode only — this deployment's own public URL (bare origin, no path — the endpoint is served at `/`), e.g. `https://mcp.engramo.app`. Also allowlists that host for inbound requests; without it, every request is rejected (see `MCP_ALLOWED_HOSTS`). |
 | `MCP_ALLOWED_HOSTS` | *(unset)* | `http` mode only — extra comma-separated hostnames/`host:port` values to permit, on top of the one derived from `MCP_PUBLIC_URL`. Only needed for extra entry points (e.g. a Cloud Run service's own `*.run.app` fallback URL alongside its custom domain). |
 
 ## Available tools
@@ -235,6 +235,7 @@ storage quotas, and needs no paid EngrAmo plan.
 | Tool | Description |
 |---|---|
 | `list_media` | List uploaded media assets |
+| `upload_media` | Upload a file you already have (a voice recording, an image) and get back a `media_id` to attach to a card or catalog |
 
 ### AI generation (bring-your-own-AI)
 | Tool | Description |
@@ -242,6 +243,29 @@ storage quotas, and needs no paid EngrAmo plan.
 | `generate_card` | Create a flashcard — the calling model does any translation/wording itself |
 | `generate_catalog_with_cards` | Create a catalog with cards in one call — same bring-your-own-AI model |
 | `generate_cards` | Add multiple cards to an existing catalog — same bring-your-own-AI model |
+
+## Rich cards: dictionary, styling, images, audio
+
+Beyond plain text, a card's `face`/`back` can carry:
+
+| Field | What it does |
+|---|---|
+| `dictionary` | Word → translation map, rendered as clickable highlights in the app |
+| `rich_text` | Styled spans (bold, color, monospace) within the text |
+| `style` | Font/color/background/alignment for the whole face or back |
+| `audio_id` | Your own audio (a recording, a clip from your own TTS) — upload it with `upload_media` first |
+| `visual_id` + `visual_type` | Your own image/video, same pattern as `audio_id` |
+
+A catalog can also have `image_id` (cover image) set the same way. None of this needs a paid EngrAmo
+plan — dictionary/translation are done by the calling model, and audio/images are entirely
+bring-your-own via `upload_media` (max ~10MB per file). See `engram://card-schema` for the full
+schema and four worked examples, and [`docs/prompt-examples.md`](docs/prompt-examples.md) for
+ready-to-paste prompts covering all of this end to end.
+
+**Adding a lot of cards/media at once?** `upload_media` is one file per call, fine for a handful of
+files through a chat client. For bulk imports (many cards, many audio files, in one request) see
+[`docs/bulk-import.md`](docs/bulk-import.md) — a direct API recipe for CLI/scripted use (Claude
+Code, a terminal, a script), not a chat-driven MCP tool.
 
 ## Resources and Prompts
 
@@ -262,6 +286,7 @@ And **MCP Prompts** (guided workflows):
 |---|---|
 | `review_session` | Start a guided spaced-repetition review session |
 | `create_flashcard` | Create a high-quality flashcard for a topic |
+| `create_language_deck` | Create a styled, translated, dictionary-annotated language-learning deck — see [`docs/prompt-examples.md`](docs/prompt-examples.md) |
 | `explain_card` | Explain a flashcard in depth with examples |
 | `study_plan` | Build a structured study plan from your catalogs |
 

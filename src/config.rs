@@ -11,7 +11,7 @@ pub struct McpConfig {
     /// Whether the paid-AI tool router (TTS, translation, dictionary, AI-agent
     /// chat) is registered. Loaded from `ENGRAM_ENABLE_PAID_AI` (default `false`).
     pub paid_ai_enabled: bool,
-    /// This server's own canonical public URL (e.g. `https://mcp.engramo.app/mcp`),
+    /// This server's own canonical public URL (e.g. `https://mcp.engramo.app`),
     /// used only by `http` mode's `.well-known/oauth-protected-resource` route
     /// (Track 3 Phase 3 — see `engram-ws/tdds/track3-mcp-chatgpt-app.md`) to
     /// advertise the `resource` value a ChatGPT-side OAuth client must request a
@@ -140,7 +140,7 @@ impl McpConfig {
 }
 
 /// Extracts the `host[:port]` authority out of a URL, e.g.
-/// `"https://mcp.engramo.app/mcp"` -> `Some("mcp.engramo.app")`. Used to derive
+/// `"https://mcp.engramo.app/status"` -> `Some("mcp.engramo.app")`. Used to derive
 /// an `allowed_hosts` entry from `public_url` without pulling in a full URL
 /// parsing crate for this one call site.
 fn authority_from_url(url: &str) -> Option<String> {
@@ -292,17 +292,14 @@ mod tests {
     fn test_with_public_url_sets_field() {
         let cfg = McpConfig::new("https://api.engram.dev", None, false)
             .unwrap()
-            .with_public_url("https://mcp.engramo.app/mcp");
-        assert_eq!(
-            cfg.public_url.as_deref(),
-            Some("https://mcp.engramo.app/mcp")
-        );
+            .with_public_url("https://mcp.engramo.app");
+        assert_eq!(cfg.public_url.as_deref(), Some("https://mcp.engramo.app"));
     }
 
     #[test]
     fn test_authority_from_url_strips_scheme_and_path() {
         assert_eq!(
-            authority_from_url("https://mcp.engramo.app/mcp"),
+            authority_from_url("https://mcp.engramo.app/status"),
             Some("mcp.engramo.app".to_string())
         );
     }
@@ -310,7 +307,7 @@ mod tests {
     #[test]
     fn test_authority_from_url_keeps_port() {
         assert_eq!(
-            authority_from_url("http://localhost:8080/mcp"),
+            authority_from_url("http://localhost:8080"),
             Some("localhost:8080".to_string())
         );
     }
@@ -318,7 +315,7 @@ mod tests {
     #[test]
     fn test_authority_from_url_no_scheme() {
         assert_eq!(
-            authority_from_url("mcp.engramo.app/mcp"),
+            authority_from_url("mcp.engramo.app/status"),
             Some("mcp.engramo.app".to_string())
         );
     }
@@ -326,7 +323,7 @@ mod tests {
     #[test]
     fn test_authority_from_url_empty() {
         assert_eq!(authority_from_url(""), None);
-        assert_eq!(authority_from_url("https:///mcp"), None);
+        assert_eq!(authority_from_url("https:///status"), None);
     }
 
     #[test]
@@ -339,7 +336,7 @@ mod tests {
     fn test_allowed_hosts_includes_public_url_authority() {
         let cfg = McpConfig::new("https://api.engram.dev", None, false)
             .unwrap()
-            .with_public_url("https://mcp.engramo.app/mcp");
+            .with_public_url("https://mcp.engramo.app");
         assert_eq!(
             cfg.allowed_hosts(),
             vec!["localhost", "127.0.0.1", "::1", "mcp.engramo.app"]

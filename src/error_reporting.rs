@@ -141,9 +141,30 @@ impl tracing::field::Visit for EventVisitor {
     }
 }
 
+/// Crate-name prefixes whose own `ERROR`-level events are excluded from Error
+/// Reporting. `rmcp`'s Streamable HTTP session worker logs its own documented,
+/// routine idle-session cleanup (a 5-minute inactivity safety net — see
+/// `SessionConfig::keep_alive` in rmcp) via `tracing::error!`, which would
+/// otherwise page for every ordinary idle MCP session. These events remain
+/// fully visible in normal Cloud Logging (this layer is additive, not a filter
+/// on the primary Stackdriver layer) — only the Error Reporting forwarding is
+/// suppressed, keeping that dashboard reserved for this service's own failures.
+const EXCLUDED_TARGET_PREFIXES: &[&str] = &["rmcp"];
+
+fn is_excluded_target(target: &str) -> bool {
+    EXCLUDED_TARGET_PREFIXES.iter().any(|prefix| {
+        target
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
 impl<S: Subscriber> Layer<S> for ErrorReportingLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         if *event.metadata().level() > Level::ERROR {
+            return;
+        }
+        if is_excluded_target(event.metadata().target()) {
             return;
         }
 
@@ -240,6 +261,70 @@ mod tests {
         let layer = ErrorReportingLayer::new("test-svc", "1.0.0");
         assert_eq!(layer.service_name, "test-svc");
         assert_eq!(layer.service_version, "1.0.0");
+    }
+
+    // is_excluded_target helper
+
+    #[test]
+    fn test_is_excluded_target_exact_crate_name() {
+        assert!(is_excluded_target("rmcp"));
+    }
+
+    #[test]
+    fn test_is_excluded_target_submodule() {
+        assert!(is_excluded_target("rmcp::transport::worker"));
+        assert!(is_excluded_target(
+            "rmcp::transport::streamable_http_server::tower"
+        ));
+    }
+
+    #[test]
+    fn test_is_excluded_target_does_not_match_unrelated_crate() {
+        // must not false-positive on a crate name that merely starts with "rmcp"
+        assert!(!is_excluded_target("rmcpx"));
+        assert!(!is_excluded_target("rmcp_extras"));
+    }
+
+    #[test]
+    fn test_is_excluded_target_own_crate_not_excluded() {
+        assert!(!is_excluded_target("engramo_mcp"));
+        assert!(!is_excluded_target("engramo_mcp::client"));
+    }
+
+    // on_event target filtering — end-to-end via the real layer (writes to real
+    // stderr with no injectable writer, same as the pre-existing
+    // `test_on_event_error_emits_without_panic`/`test_on_event_warn_is_filtered_out`
+    // below — those assert "runs without panicking" for the level guard, this
+    // does the same for the target guard; the actual filtering logic itself is
+    // covered precisely by the `is_excluded_target` unit tests above).
+    #[test]
+    fn test_on_event_excluded_target_does_not_panic() {
+        let layer = ErrorReportingLayer::new("test-svc", "1.2.3");
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(
+                target: "rmcp::transport::worker",
+                "worker quit with fatal: keep alive timeout"
+            );
+        });
+    }
+
+    #[test]
+    fn test_on_event_own_crate_target_still_emits() {
+        let (layer, captured) = capture_layer();
+        let sub = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(sub, || {
+            tracing::error!(target: "engramo_mcp::client", "network error calling Engram API");
+        });
+        // capture_layer's spy records every event unconditionally (it exercises
+        // EventVisitor's formatting, not ErrorReportingLayer's gating — see its
+        // definition below); this asserts the event itself reaches a layer at
+        // all with the expected message, as a sanity check that `target:`
+        // overrides in the `tracing::error!` macro behave as this test suite
+        // assumes elsewhere.
+        let msgs = captured.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("network error calling Engram API"));
     }
 
     // is_sensitive helper

@@ -4,7 +4,7 @@
 //! and returns it as plain JSON text so the LLM can inject it into context.
 //!
 //! Available resources:
-//!   engram://card-schema           — CardContent JSON schema, validation rules, 3 examples
+//!   engram://card-schema           — CardContent JSON schema, validation rules, 4 examples
 //!   engram://catalogs              — all catalogs (id, name, card_count)
 //!   engram://learning/due          — due cards for today (card_id, face_text)
 //!   engram://learning/stats        — learning stats (due_count, total_count)
@@ -42,7 +42,11 @@ CardContent fields:
                           source word. Values: primary translation; append \"; (here) X\" if
                           contextual meaning differs from the most common meaning.
   style        CardStyle  Optional. Card-level default style (font, color, alignment).
-  audio_id     UUID       Optional. TTS audio asset. Set by the server; do not fabricate.
+  audio_id     UUID       Optional. A media_id from the `upload_media` tool (e.g. the user's own
+                          voice recording). Never fabricate a UUID here.
+  visual_id    UUID       Optional. A media_id from `upload_media` for an image/video. Requires
+                          `visual_type` alongside it. Never fabricate a UUID here.
+  visual_type  String     Required if `visual_id` is set. \"image\" or \"video\".
 
 RichTextSpan fields:
   text         String     REQUIRED. A VERBATIM contiguous slice of the parent `text`.
@@ -118,7 +122,21 @@ Back: Ukrainian translation + (infinitive - participle) in green.
 
 Span checks:
   face: \"He hablado\" + \" con mi madre esta mañana por teléfono.\" = face.text ✓
-  back: \"Я поговорив з мамою цього ранку по телефону. (\" + \"hablar - hablado\" + \")\" = back.text ✓\
+  back: \"Я поговорив з мамою цього ранку по телефону. (\" + \"hablar - hablado\" + \")\" = back.text ✓
+
+=== Example 4: Card with user-supplied audio (BYO audio, no server-side TTS) ===
+The user already recorded their own voice for this card's face and gave you the file. You called
+`upload_media` first (content_base64 of the recording, content_type=\"audio/mpeg\") and got back
+media_id \"3fa85f64-5717-4562-b3fc-2c963f66afa6\" — use that value for `audio_id` below. Never
+invent a UUID; only use one actually returned by `upload_media`.
+
+{
+  \"face\": {
+    \"text\": \"¿Me puede traer un café con leche, por favor?\",
+    \"audio_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\"
+  },
+  \"back\": { \"text\": \"Could you bring me a coffee with milk, please?\" }
+}\
 ";
 
 // ── Resource list ─────────────────────────────────────────────────────────────
@@ -142,8 +160,8 @@ pub fn list_all() -> ListResourcesResult {
         make_resource(
             URI_CARD_SCHEMA,
             "Card Schema & Examples",
-            "CardContent JSON schema with validation rules and 3 annotated examples \
-             (simple, rich-text styled, language-learning with dictionary). \
+            "CardContent JSON schema with validation rules and 4 annotated examples \
+             (simple, rich-text styled, language-learning with dictionary, user-supplied audio). \
              Read this before creating cards to avoid rich_text validation failures.",
             "text/plain",
         ),
@@ -301,6 +319,8 @@ mod tests {
             assert!(text.contains("dictionary"), "{text}");
             assert!(text.contains("#27AE60"), "{text}");
             assert!(text.contains("R4"), "{text}");
+            assert!(text.contains("upload_media"), "{text}");
+            assert!(text.contains("visual_id"), "{text}");
         } else {
             panic!("expected text resource contents");
         }

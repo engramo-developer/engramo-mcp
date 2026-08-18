@@ -116,7 +116,7 @@ environment, just plain env vars passed straight to Cloud Run:
 substitutions:
   _SERVICE_NAME: 'engramo-mcp'
   _ENGRAM_API_URL: 'https://api-engram.volmyr.com'
-  _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com/mcp'
+  _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com'
   _ENGRAM_ENABLE_PAID_AI: 'false'
   _APP_ENV: 'dev'
 ```
@@ -130,9 +130,8 @@ default when unset, e.g. running it directly) gets human-readable output, anythi
 or `'prod'` — switches to GCP Cloud Logging-shaped structured JSON plus Error Reporting for `ERROR`-level
 events. It has no effect on which backend is called; that's entirely `_ENGRAM_API_URL`.
 
-`_MCP_PUBLIC_URL` must include the `/mcp` path suffix — it becomes the `resource` value in
-`.well-known/oauth-protected-resource` (see `src/well_known.rs`), and ChatGPT resolves the MCP
-endpoint from that same path.
+`_MCP_PUBLIC_URL` should be a bare origin, no path (the MCP endpoint is served at `/`, root — it
+becomes the `resource` value in `.well-known/oauth-protected-resource`, see `src/well_known.rs`).
 
 ## 5. Create the manual trigger
 
@@ -148,7 +147,7 @@ Via console (**Cloud Build → Triggers → Create Trigger**), once per project:
 7. Advanced → Substitution variables — **dev**: leave all defaults as-is (they already point at
    dev). **prod**: override
    - `_ENGRAM_API_URL` = `https://api.engramo.app`
-   - `_MCP_PUBLIC_URL` = `https://mcp.engramo.app/mcp`
+   - `_MCP_PUBLIC_URL` = `https://mcp.engramo.app`
    - `_APP_ENV` = `prod`
 8. Create.
 
@@ -190,22 +189,23 @@ Verify once DNS + cert are live:
 curl https://mcp-engramo.volmyr.com/.well-known/oauth-protected-resource
 ```
 
-should return `{"resource":"https://mcp-engramo.volmyr.com/mcp", ...}` — not a placeholder or a
+should return `{"resource":"https://mcp-engramo.volmyr.com", ...}` — not a placeholder or a
 TLS error.
 
 ## 7. Verify against the deployed service
 
-Same checks already passed locally this session, now against the real dev URL:
+Same checks already passed locally this session, now against the real dev URL. The MCP endpoint
+itself is served at root (`/`), not `/mcp`:
 
 ```bash
 curl https://mcp-engramo.volmyr.com/.well-known/oauth-protected-resource
-curl -X POST https://mcp-engramo.volmyr.com/mcp \
+curl -X POST https://mcp-engramo.volmyr.com/ \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize", ...}'   # expect 401 without a bearer token
 ```
 
-Then add `https://mcp-engramo.volmyr.com/mcp` as a ChatGPT developer-mode custom connector with an
+Then add `https://mcp-engramo.volmyr.com/` as a ChatGPT developer-mode custom connector with an
 `engram_` API token minted from **dev** (`https://api-engram.volmyr.com` — Settings → API Tokens on
-the dev web app, `study-engramo.volmyr.com`) as the bearer token. Confirm `tools/list` returns 23
-tools (paid-AI off) and a real `generate_catalog_with_cards` call succeeds. Only repeat this whole
-flow against prod once dev is fully verified end-to-end.
+the dev web app, `study-engramo.volmyr.com`) as the bearer token. Confirm `tools/list` returns the
+expected tool count (paid-AI off) and a real `generate_catalog_with_cards` call succeeds. Only
+repeat this whole flow against prod once dev is fully verified end-to-end.

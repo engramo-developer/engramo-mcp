@@ -88,7 +88,12 @@ impl ApiError {
                     }
                 }
             }
-            400 => Self::BadRequest(extract_error_message(&body)),
+            // 422 is axum's rejection status for a request body that parses as JSON but
+            // fails to deserialize into the target type (e.g. an invalid enum variant like
+            // `style.textAlign: "diagonal"`) — a client input mistake, same as 400, not a
+            // transient server failure. The rejection text names the exact field and valid
+            // values, which is directly actionable for the calling LLM to correct and retry.
+            400 | 422 => Self::BadRequest(extract_error_message(&body)),
             _ => {
                 // Unrecognized/5xx status — a genuine backend failure, not a routine
                 // tool-call outcome. Log at ERROR so it reaches GCP Error Reporting.
@@ -299,5 +304,33 @@ mod tests {
         let err = ApiError::from_response(resp).await;
 
         assert!(matches!(err, ApiError::Internal));
+    }
+
+    #[tokio::test]
+    async fn test_from_response_422_surfaces_deserialize_message() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Axum's real rejection body for an invalid enum variant is plain text, not
+        // `{"error": "..."}` — extract_error_message must fall back to the raw body.
+        let body = "Failed to deserialize the JSON body into the target type: \
+            face.style.textAlign: unknown variant `diagonal`, expected one of \
+            `left`, `center`, `right` at line 1 column 54";
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(422).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let err = ApiError::from_response(resp).await;
+
+        match err {
+            ApiError::BadRequest(msg) => {
+                assert!(msg.contains("textAlign"), "{msg}");
+                assert!(msg.contains("diagonal"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }

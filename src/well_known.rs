@@ -16,7 +16,7 @@ use serde::Serialize;
 /// held in axum `State` for the route.
 #[derive(Debug, Clone)]
 pub struct ProtectedResourceState {
-    /// This MCP server's own canonical public URL, e.g. `https://mcp.engramo.app/mcp`.
+    /// This MCP server's own canonical public URL, e.g. `https://mcp.engramo.app`.
     pub resource: String,
     /// The authorization server's issuer URL (engram-api's base URL).
     pub authorization_server: String,
@@ -46,7 +46,7 @@ mod tests {
     #[tokio::test]
     async fn returns_resource_and_authorization_servers() {
         let state = ProtectedResourceState {
-            resource: "https://mcp.engramo.app/mcp".to_string(),
+            resource: "https://mcp.engramo.app".to_string(),
             authorization_server: "https://api.engramo.app".to_string(),
         };
 
@@ -59,7 +59,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["resource"], "https://mcp.engramo.app/mcp");
+        assert_eq!(body["resource"], "https://mcp.engramo.app");
         assert_eq!(body["authorization_servers"][0], "https://api.engramo.app");
         assert_eq!(body["authorization_servers"].as_array().unwrap().len(), 1);
     }

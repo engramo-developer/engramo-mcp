@@ -6,8 +6,8 @@ use crate::dto::{
     CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CreateCardRequest, CreateCatalogRequest,
     CreateCatalogWithCardsApiRequest, CreateLearningPathRequest, GlobalSearchResult,
     LearningCardDto, LearningPathDetailDto, LearningPathDto, MediaDto, PagedResponse,
-    PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UsageSummaryDto,
-    UserSubscriptionDto,
+    PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UploadMediaResponseDto,
+    UsageSummaryDto, UserSubscriptionDto,
 };
 use crate::error::ApiError;
 
@@ -336,6 +336,36 @@ impl EngramClient {
             params.push(("limit", l.to_string()));
         }
         self.get_with_query("/media", &params).await
+    }
+
+    /// Uploads a single media file (image or audio, ≤10MB) and returns its new media id,
+    /// ready to attach via a card's `audio_id`/`visual_id` or a catalog's `image_id`.
+    pub async fn upload_media(
+        &self,
+        content: Vec<u8>,
+        filename: &str,
+        content_type: &str,
+    ) -> Result<Uuid, ApiError> {
+        let part = reqwest::multipart::Part::bytes(content)
+            .file_name(filename.to_string())
+            .mime_str(content_type)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid content type: {e}")))?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let resp = self
+            .http
+            .post(self.url("/media"))
+            .header("X-Api-Key", &self.api_token)
+            .multipart(form)
+            .send()
+            .await?;
+        let parsed: UploadMediaResponseDto = self.deserialize(resp).await?;
+        parsed
+            .media_ids
+            .ids
+            .into_iter()
+            .next()
+            .ok_or(ApiError::Internal)
     }
 
     // ── Subscription ──────────────────────────────────────────────────────────
@@ -959,6 +989,7 @@ mod tests {
         let req = CreateCatalogWithCardsApiRequest {
             name: "Batch".to_string(),
             description: None,
+            image_id: None,
             tags: None,
             visibility: None,
             cards: vec![
@@ -1326,5 +1357,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_success() {
+        let server = MockServer::start().await;
+        let id = mock_id();
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "media_ids": { "ids": [id] }
+            })))
+            .mount(&server)
+            .await;
+
+        let media_id = client(&server.uri())
+            .upload_media(b"fake audio bytes".to_vec(), "card1_face.mp3", "audio/mpeg")
+            .await
+            .unwrap();
+        assert_eq!(media_id, id);
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_bad_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "File too large"})),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .upload_media(vec![0u8; 10], "big.mp3", "audio/mpeg")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_empty_ids_returns_internal_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "media_ids": { "ids": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .upload_media(b"x".to_vec(), "f.png", "image/png")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Internal));
     }
 }

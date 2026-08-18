@@ -1,10 +1,11 @@
 //! MCP Prompts — canned instructions that guide the LLM through Engram workflows.
 //!
 //! Available prompts:
-//!   review_session   — guided spaced-repetition review (show card → wait → reveal → grade)
-//!   create_flashcard — generate a high-quality flashcard for a topic
-//!   explain_card     — explain a specific card in depth
-//!   study_plan       — build a structured study plan from available catalogs
+//!   review_session      — guided spaced-repetition review (show card → wait → reveal → grade)
+//!   create_flashcard    — generate a high-quality flashcard for a topic
+//!   create_language_deck — generate a styled, translated, dictionary-annotated language deck
+//!   explain_card        — explain a specific card in depth
+//!   study_plan          — build a structured study plan from available catalogs
 
 use rmcp::model::{
     ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult, Prompt, PromptArgument,
@@ -15,6 +16,7 @@ use rmcp::model::{
 
 pub const PROMPT_REVIEW_SESSION: &str = "review_session";
 pub const PROMPT_CREATE_FLASHCARD: &str = "create_flashcard";
+pub const PROMPT_CREATE_LANGUAGE_DECK: &str = "create_language_deck";
 pub const PROMPT_EXPLAIN_CARD: &str = "explain_card";
 pub const PROMPT_STUDY_PLAN: &str = "study_plan";
 
@@ -40,6 +42,30 @@ pub fn list_all() -> ListPromptsResult {
                     .with_required(true),
                 PromptArgument::new("catalog_id")
                     .with_description("UUID of the catalog to add the card to (optional)")
+                    .with_required(false),
+            ]),
+        ),
+        Prompt::new(
+            PROMPT_CREATE_LANGUAGE_DECK,
+            Some("Create a deck of language-learning flashcards: source-language sentences with \
+                  key words highlighted and translated (dictionary), a translated back side, and \
+                  one consistent style reused across the whole deck. No paid AI — you (the calling \
+                  model) do the translation yourself; audio is bring-your-own via upload_media."),
+            Some(vec![
+                PromptArgument::new("topic")
+                    .with_description("The theme for the deck, e.g. 'ordering coffee', 'past tense verbs'")
+                    .with_required(true),
+                PromptArgument::new("source_lang")
+                    .with_description("Language the card face is written in, e.g. 'Spanish'")
+                    .with_required(true),
+                PromptArgument::new("target_lang")
+                    .with_description("Language to translate into for the back side and dictionary, e.g. 'English'")
+                    .with_required(true),
+                PromptArgument::new("count")
+                    .with_description("Number of cards to create (default: 10)")
+                    .with_required(false),
+                PromptArgument::new("catalog_id")
+                    .with_description("UUID of an existing catalog to add the cards to (optional — creates a new catalog if omitted)")
                     .with_required(false),
             ]),
         ),
@@ -81,6 +107,20 @@ pub fn get(params: GetPromptRequestParams) -> Result<GetPromptResult, ErrorData>
             let topic = get_arg("topic").unwrap_or_else(|| "<topic>".to_string());
             let catalog_id = get_arg("catalog_id");
             Ok(create_flashcard(&topic, catalog_id.as_deref()))
+        }
+        PROMPT_CREATE_LANGUAGE_DECK => {
+            let topic = get_arg("topic").unwrap_or_else(|| "<topic>".to_string());
+            let source_lang = get_arg("source_lang").unwrap_or_else(|| "<source_lang>".to_string());
+            let target_lang = get_arg("target_lang").unwrap_or_else(|| "<target_lang>".to_string());
+            let count = get_arg("count").unwrap_or_else(|| "10".to_string());
+            let catalog_id = get_arg("catalog_id");
+            Ok(create_language_deck(
+                &topic,
+                &source_lang,
+                &target_lang,
+                &count,
+                catalog_id.as_deref(),
+            ))
         }
         PROMPT_EXPLAIN_CARD => {
             let face = get_arg("face").unwrap_or_else(|| "<face>".to_string());
@@ -154,6 +194,58 @@ fn create_flashcard(topic: &str, catalog_id: Option<&str>) -> GetPromptResult {
     ))])
 }
 
+fn create_language_deck(
+    topic: &str,
+    source_lang: &str,
+    target_lang: &str,
+    count: &str,
+    catalog_id: Option<&str>,
+) -> GetPromptResult {
+    let catalog_line = match catalog_id {
+        Some(id) => {
+            format!("Add all cards to the existing catalog `{id}` (call `generate_cards`).")
+        }
+        None => "Create a new catalog for this deck (call `generate_catalog_with_cards`); pick a \
+                 short, descriptive name from the topic."
+            .to_string(),
+    };
+
+    GetPromptResult::new(vec![user_msg(format!(
+        "Create a {count}-card language-learning deck:\n\
+             \n\
+             **Topic:** {topic}\n\
+             **Source language (face):** {source_lang}\n\
+             **Target language (back + dictionary):** {target_lang}\n\
+             \n\
+             Before drafting, read the `engram://card-schema` resource — Example 4 shows the \
+             user-supplied-audio pattern referenced below.\n\
+             \n\
+             For EACH card:\n\
+             1. Write a natural face sentence/phrase in {source_lang}.\n\
+             2. Highlight 1-4 key words with `rich_text` — bold + fontColor \"#27AE60\" (green) — \
+                and add each highlighted word to `face.dictionary`, translated into {target_lang}.\n\
+             3. Translate the full sentence into {target_lang} for `back.text`. If a grammar \
+                reference is useful (e.g. infinitive/root form), highlight it in `back.rich_text` \
+                the same green.\n\
+             \n\
+             Pick ONE `CardStyle` (font/color/background) before drafting the first card, then \
+             reuse that exact same style on every card's face and every card's back — this is \
+             what makes the whole deck look consistent; there is no catalog-level style field, so \
+             consistency comes from you repeating the same style object.\n\
+             \n\
+             {catalog_line}\n\
+             \n\
+             No paid AI is used anywhere in this flow — you do the translation and dictionary \
+             yourself. Audio and a catalog cover image are optional and fully bring-your-own: if \
+             the user already has a recording or an image, call `upload_media` first and set \
+             `audio_id`/`visual_id` (cards) or `image_id` (catalog) to the returned `media_id` \
+             before your final generate call — never fabricate a UUID. If they don't have media \
+             yet, create the deck now and offer to add it afterward once they do (via `update_card` \
+             for audio/images on existing cards). More worked examples, including a full deck \
+             walkthrough, are in `docs/prompt-examples.md` in the engramo-mcp repo."
+    ))])
+}
+
 fn explain_card(face: &str, back: &str) -> GetPromptResult {
     GetPromptResult::new(vec![user_msg(format!(
         "Please explain the following flashcard in depth.\n\
@@ -205,12 +297,13 @@ mod tests {
     }
 
     #[test]
-    fn test_list_all_returns_four_prompts() {
+    fn test_list_all_returns_five_prompts() {
         let result = list_all();
-        assert_eq!(result.prompts.len(), 4);
+        assert_eq!(result.prompts.len(), 5);
         let names: Vec<&str> = result.prompts.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&PROMPT_REVIEW_SESSION));
         assert!(names.contains(&PROMPT_CREATE_FLASHCARD));
+        assert!(names.contains(&PROMPT_CREATE_LANGUAGE_DECK));
         assert!(names.contains(&PROMPT_EXPLAIN_CARD));
         assert!(names.contains(&PROMPT_STUDY_PLAN));
     }
@@ -269,6 +362,133 @@ mod tests {
         if let PromptMessageContent::Text { text } = &result.messages[0].content {
             assert!(
                 text.contains("00000000-0000-0000-0000-000000000001"),
+                "{text}"
+            );
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_includes_topic_and_langs() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "ordering coffee"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+            ]));
+        let result = get(params).unwrap();
+        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+            assert!(text.contains("ordering coffee"), "{text}");
+            assert!(text.contains("Spanish"), "{text}");
+            assert!(text.contains("English"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_default_count() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "greetings"),
+                ("source_lang", "French"),
+                ("target_lang", "English"),
+            ]));
+        let result = get(params).unwrap();
+        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+            assert!(text.contains("10-card"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_custom_count() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "greetings"),
+                ("source_lang", "French"),
+                ("target_lang", "English"),
+                ("count", "3"),
+            ]));
+        let result = get(params).unwrap();
+        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+            assert!(text.contains("3-card"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_with_catalog_hint() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "verbs"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+                ("catalog_id", "00000000-0000-0000-0000-000000000002"),
+            ]));
+        let result = get(params).unwrap();
+        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+            assert!(
+                text.contains("00000000-0000-0000-0000-000000000002"),
+                "{text}"
+            );
+            assert!(text.contains("generate_cards"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_no_catalog_hint_uses_catalog_with_cards() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "verbs"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+            ]));
+        let result = get(params).unwrap();
+        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+            assert!(text.contains("generate_catalog_with_cards"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_references_card_schema_and_dictionary() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "verbs"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+            ]));
+        let result = get(params).unwrap();
+        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+            assert!(text.contains("engram://card-schema"), "{text}");
+            assert!(text.contains("dictionary"), "{text}");
+            assert!(text.contains("CardStyle"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_mentions_upload_media_for_audio_no_paid_ai() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "verbs"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+            ]));
+        let result = get(params).unwrap();
+        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+            assert!(text.contains("upload_media"), "{text}");
+            assert!(text.contains("No paid AI"), "{text}");
+            assert!(
+                !text.to_lowercase().contains("generate_tts_for_cards"),
                 "{text}"
             );
         } else {

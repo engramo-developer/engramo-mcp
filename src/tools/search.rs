@@ -33,7 +33,11 @@ impl SearchTools {
     }
 
     #[tool(
-        description = "Search across all cards, catalogs, and learning paths. Returns ids and types."
+        description = "Search across all cards, catalogs, and learning paths. Returns ids and types. \
+        If the user gives you a catalog's short ID (the ~8-character code shown in the app/URL, e.g. \
+        \"A7KX9QM2\" — NOT a UUID), search for that exact code here (or with search_catalogs) instead \
+        of paginating through list_catalogs — the short ID is indexed for search and matches fast, \
+        usually returning a single unique result with the real UUID you need for other tools."
     )]
     async fn search_global(
         &self,
@@ -45,7 +49,12 @@ impl SearchTools {
         })
     }
 
-    #[tool(description = "Search catalogs by name or description.")]
+    #[tool(
+        description = "Search catalogs by name, description, or short ID. If the user gives you a \
+        catalog's short ID (the ~8-character code shown in the app/URL, e.g. \"A7KX9QM2\" — NOT a \
+        UUID) rather than a name, search for that exact code here instead of paginating through \
+        list_catalogs — it's indexed for search and resolves fast to the real UUID other tools need."
+    )]
     async fn search_catalogs(
         &self,
         Parameters(p): Parameters<SearchParams>,

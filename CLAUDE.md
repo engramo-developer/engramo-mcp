@@ -4,7 +4,7 @@
 
 Standalone Rust 2024 binary that exposes the EngrAmo flashcard API to AI clients. Two transports, one binary:
 - `engramo-mcp stdio` (default) — Claude Desktop, Cursor. One process = one user (`ENGRAM_API_TOKEN` env var).
-- `engramo-mcp http` — Streamable HTTP at `/mcp` for remote clients (e.g. ChatGPT). Multi-user: each session
+- `engramo-mcp http` — Streamable HTTP at `/` (root) for remote clients (e.g. ChatGPT). Multi-user: each session
   authenticates with its own `Authorization: Bearer <token>`; there is no global token in this mode.
 
 **Stack:** Rust 2024 · rmcp 1.3 · reqwest 0.13 · Tokio · Tracing
@@ -77,7 +77,8 @@ Spans must satisfy all five rules or `rich_text` is discarded:
 - **stdio** (default): `cargo run -- stdio` (or no subcommand). One process = one user, `EngramClient` built
   once from `ENGRAM_API_TOKEN`. Compatible with Claude Desktop and Cursor.
   Start with: `ENGRAM_API_URL=... ENGRAM_API_TOKEN=... cargo run`
-- **http**: `cargo run -- http`. Serves rmcp's `StreamableHttpService` at `/mcp` behind an axum `Router`.
+- **http**: `cargo run -- http`. Serves rmcp's `StreamableHttpService` at `/` (root, via `fallback_service` —
+  axum no longer allows `nest_service` at root) behind an axum `Router`.
   A `bearer_auth_middleware` extracts `Authorization: Bearer <token>` and scopes it into a
   `tokio::task_local!` (`CURRENT_BEARER_TOKEN`) — the only way to reach the rmcp session factory, since
   `StreamableHttpService::new` takes a plain `Fn() -> Result<S, io::Error>` with no access to request

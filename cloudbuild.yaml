@@ -45,7 +45,7 @@ images:
 substitutions:
   _SERVICE_NAME: 'engramo-mcp'
   _ENGRAM_API_URL: 'https://api-engram.volmyr.com'
-  _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com/mcp'
+  _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com'
   _ENGRAM_ENABLE_PAID_AI: 'false'
   _APP_ENV: 'dev'
 
