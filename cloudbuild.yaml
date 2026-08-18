@@ -1,0 +1,46 @@
+steps:
+  # 1. Build the container image (see Dockerfile — builds `engramo-mcp http` mode).
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA', '.']
+
+  # 2. Push the container image to Google Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA']
+
+  # 3. Deploy to Cloud Run. No Secret Manager binding needed — engramo-mcp has no
+  # database and no server-side credentials (see src/config.rs): ENGRAM_API_URL and
+  # MCP_PUBLIC_URL are plain per-environment values, and http mode takes each caller's
+  # own bearer token per-request rather than holding one of its own.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+      - '--region'
+      - 'europe-west1'
+      - '--platform'
+      - 'managed'
+      - '--max-instances'
+      - '5'
+      - '--min-instances'
+      - '0'
+      - '--concurrency'
+      - '80'
+      - '--allow-unauthenticated'
+      - '--set-env-vars'
+      - 'ENGRAM_API_URL=${_ENGRAM_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAM_ENABLE_PAID_AI=${_ENGRAM_ENABLE_PAID_AI}'
+
+images:
+  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+
+substitutions:
+  _SERVICE_NAME: 'engramo-mcp'
+  _ENGRAM_API_URL: 'https://api-engram.volmyr.com'
+  _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com/mcp'
+  _ENGRAM_ENABLE_PAID_AI: 'false'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
