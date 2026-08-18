@@ -170,7 +170,20 @@ needed like ChatGPT's. Add to `~/.gemini/config/mcp_config.json` (global) or `.a
 }
 ```
 
-**Remote, over Streamable HTTP** (point at a running `engramo-mcp http` deployment — see below):
+**Remote, over Streamable HTTP** (point at a running `engramo-mcp http` deployment — see below).
+`engramo-mcp` supports OAuth 2.1 dynamic client registration, so Antigravity can handle
+authentication automatically — no token to paste or manage:
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "serverUrl": "https://mcp.engramo.app/"
+    }
+  }
+}
+```
+
+If you'd rather use a static token instead (no OAuth login prompt), add `headers` manually:
 ```json
 {
   "mcpServers": {
