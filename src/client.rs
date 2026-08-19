@@ -456,6 +456,20 @@ impl EngramClient {
         content_file_name: &str,
         content_file: Vec<u8>,
     ) -> Result<CatalogDto, ApiError> {
+        // `target_lang` is interpolated into the request path below, so restrict it to
+        // the shape of a real BCP-47 code (ASCII letters, digits, `-`). This keeps a
+        // free-form LLM-supplied value from injecting extra path segments (`/`, `..`) or
+        // URL delimiters (`?`, `#`) that would silently retarget the request — same
+        // defensive stance as `grade_card`'s allowlist and the UUID parsing elsewhere.
+        if target_lang.is_empty()
+            || !target_lang
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(ApiError::BadRequest(format!(
+                "invalid target_lang '{target_lang}': expected a BCP-47 code like 'es' or 'pt-BR'"
+            )));
+        }
         let metadata_json = serde_json::to_string(catalog_metadata).map_err(|e| {
             ApiError::BadRequest(format!("failed to serialize catalog metadata: {e}"))
         })?;
@@ -1392,6 +1406,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_rejects_path_injecting_lang() {
+        let server = MockServer::start().await;
+        // No mock mounted: a value that passed validation would hit the network and
+        // fail with a connection error. Rejecting before any request is sent proves
+        // the guard short-circuits path-injecting input.
+        let metadata = CreateCatalogRequest {
+            name: "Imported".to_string(),
+            description: None,
+            tags: None,
+            visibility: None,
+        };
+        for bad in ["es/../../me/subscription", "es?x=1", "", "es#frag", "en US"] {
+            let err = client(&server.uri())
+                .translate_batch_import(bad, &metadata, "import.json", b"[]".to_vec())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ApiError::BadRequest(_)),
+                "expected BadRequest for target_lang {bad:?}, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
