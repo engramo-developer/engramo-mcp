@@ -521,6 +521,14 @@ impl EngramMcpServer {
         Parameters(p): Parameters<UploadMediaParams>,
     ) -> Result<CallToolResult, ErrorData> {
         const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+        // Base64 expands data by 4/3 — reject on the encoded length before decoding so an
+        // oversized payload doesn't get allocated in full just to be rejected afterward.
+        const MAX_BASE64_LEN: usize = MAX_UPLOAD_BYTES.div_ceil(3) * 4;
+        if p.content_base64.len() > MAX_BASE64_LEN {
+            return Ok(err_result(
+                "Encoded content exceeds the 10MB upload limit".to_string(),
+            ));
+        }
         let content = match base64::engine::general_purpose::STANDARD.decode(&p.content_base64) {
             Ok(bytes) => bytes,
             Err(e) => return Ok(err_result(format!("Invalid base64 content_base64: {e}"))),

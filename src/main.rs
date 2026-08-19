@@ -146,6 +146,15 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     let api_url = cfg.api_url.clone();
     let paid_ai_enabled = cfg.paid_ai_enabled;
     let allowed_hosts = cfg.allowed_hosts();
+    // Shared across every session's `EngramClient` (see `EngramClient::with_http`) so
+    // concurrent users reuse one connection pool instead of each paying for its own
+    // TLS handshakes; `EngramClient::new`'s per-instance timeouts still apply since
+    // this is built the same way.
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client with static, well-formed config must build");
     let factory = move || {
         let token = CURRENT_BEARER_TOKEN.try_with(|t| t.clone()).map_err(|_| {
             // Invariant violation: `bearer_auth_middleware` already rejects any
@@ -157,7 +166,7 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::io::Error::other("missing bearer token for this MCP session")
         })?;
-        let client = EngramClient::new(&api_url, &token);
+        let client = EngramClient::with_http(http.clone(), &api_url, &token);
         Ok(EngramMcpServer::new(client, paid_ai_enabled))
     };
 
@@ -207,7 +216,12 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    tracing::info!(addr = %bind_addr, "Starting Engram MCP server over Streamable HTTP at /");
+    tracing::info!(
+        addr = %bind_addr,
+        "Starting Engram MCP server over Streamable HTTP at / — this binds plain HTTP; \
+         bearer tokens are only protected in transit if a TLS-terminating proxy (e.g. \
+         Cloud Run) sits in front of this listener"
+    );
 
     axum::serve(listener, app).await?;
     Ok(())

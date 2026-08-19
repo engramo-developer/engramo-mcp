@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::Client;
 use uuid::Uuid;
 
@@ -22,10 +24,38 @@ pub struct EngramClient {
     api_token: String,
 }
 
+/// Connect timeout for requests to the Engram REST API. Kept shorter than the overall
+/// request timeout so a dead/unreachable host fails fast instead of tying up the
+/// connection budget.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overall per-request timeout (connect + send + receive). Without this, a slow or
+/// hung upstream stalls the tool call indefinitely — in `http` mode that pins the
+/// session task and its connection until the client gives up.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl EngramClient {
+    /// Builds an `EngramClient` with its own dedicated `reqwest::Client`. Prefer
+    /// [`Self::with_http`] when serving multiple sessions from one process (`http`
+    /// mode) so they share a single connection pool instead of each paying for its
+    /// own TLS handshakes.
     pub fn new(base_url: impl Into<String>, api_token: impl Into<String>) -> Self {
+        let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("reqwest client with static, well-formed config must build");
+        Self::with_http(http, base_url, api_token)
+    }
+
+    /// Builds an `EngramClient` from a pre-built, shared `reqwest::Client` — used by
+    /// `http` mode so every session's requests flow through one connection pool.
+    pub fn with_http(
+        http: Client,
+        base_url: impl Into<String>,
+        api_token: impl Into<String>,
+    ) -> Self {
         Self {
-            http: Client::new(),
+            http,
             base_url: base_url.into(),
             api_token: api_token.into(),
         }
@@ -256,6 +286,11 @@ impl EngramClient {
 
     /// Grade a card. `grade` must be one of: "again", "hard", "good", "easy".
     pub async fn grade_card(&self, card_id: Uuid, grade: &str) -> Result<(), ApiError> {
+        if !matches!(grade, "again" | "hard" | "good" | "easy") {
+            return Err(ApiError::BadRequest(format!(
+                "invalid grade '{grade}': must be one of \"again\", \"hard\", \"good\", \"easy\""
+            )));
+        }
         self.post_void(&format!("/learning/cards/{card_id}/{grade}"))
             .await
     }
