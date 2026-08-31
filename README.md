@@ -17,14 +17,23 @@ MCP server for [EngrAmo](https://engramo.app), the spaced-repetition flashcard p
 talks to is controlled entirely by the `ENGRAM_API_URL` you set in your client config, paired with a token
 minted from that **same** environment:
 
-| Environment | `ENGRAM_API_URL` | Who it's for |
-|---|---|---|
-| **Production** (default in every example below) | `https://api.engramo.app` | Real accounts — use this unless you have a specific reason not to |
-| **Dev** | `https://api-engram.volmyr.com` | EngrAmo team / internal testing only |
+| Environment | `ENGRAM_API_URL` | MCP server URL (`http` transport only) | Who it's for |
+|---|---|---|---|
+| **Production** (default in every example below) | `https://api.engramo.app` | `https://mcp.engramo.app` | Real accounts — use this unless you have a specific reason not to |
+| **Dev** | `https://api-engram.volmyr.com` | `https://mcp-engramo.volmyr.com` | EngrAmo team / internal testing only |
 
 **Dev and prod are separate backends with separate accounts.** A token minted from one will not authenticate
 against the other — if you switch `ENGRAM_API_URL`, you must also swap in a token generated from that same
 environment's Settings → API Tokens page.
+
+**`ENGRAM_API_URL` vs the MCP server URL — these are not interchangeable.** `ENGRAM_API_URL` is the plain
+EngrAmo backend; it's never something a client connects to directly. In `stdio` config (Claude Desktop,
+Gemini CLI, Cursor below), the client sets `ENGRAM_API_URL` **together with** `ENGRAM_API_TOKEN`, since the
+locally-launched binary calls the backend itself. In `http`/remote config (Antigravity remote, ChatGPT), the
+client instead points `serverUrl` at the MCP server's own URL (`mcp.engramo.app` / `mcp-engramo.volmyr.com`
+above) and authenticates separately per session — via OAuth by default, or a static `Authorization: Bearer`
+header if you'd rather skip the login prompt. `ENGRAM_API_URL` still matters in `http` mode, but only as an
+env var set by whoever deploys `engramo-mcp http` — a client never sets it.
 
 ## Installation
 
