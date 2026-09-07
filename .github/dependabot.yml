@@ -1,0 +1,28 @@
+version: 2
+
+# `cargo audit` (see ci.yml) catches published advisories in the locked tree;
+# these updates are what actually let it stay green.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Actions are pinned to commit SHAs (release.yml holds NPM_TOKEN), so this is
+  # the only thing that keeps those pins current — Dependabot rewrites the SHA
+  # and updates the trailing version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: npm
+    directory: /npm/engramo-mcp
+    schedule:
+      interval: monthly

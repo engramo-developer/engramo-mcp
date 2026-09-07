@@ -14,6 +14,7 @@ use serde::Deserialize;
 use crate::dto::{AiChatRequest, CardAiRequest, CreateCatalogRequest};
 use crate::server::EngramMcpServer;
 use crate::tools::catalogs::{err_result, ok_json, parse_uuid};
+use crate::tools::media::MAX_UPLOAD_BASE64_LEN;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardAiToolParams {
@@ -189,6 +190,14 @@ impl EngramMcpServer {
         &self,
         Parameters(p): Parameters<TranslateBatchImportParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Same 10MB whole-request limit as `/media` (see `docs/bulk-import.md`), checked
+        // on the encoded string so an oversized import is refused before it is decoded
+        // and buffered again as a multipart body.
+        if p.content_file_base64.len() > MAX_UPLOAD_BASE64_LEN {
+            return Ok(err_result(
+                "Encoded content_file exceeds the 10MB import limit".to_string(),
+            ));
+        }
         let content_file =
             match base64::engine::general_purpose::STANDARD.decode(&p.content_file_base64) {
                 Ok(bytes) => bytes,
@@ -388,6 +397,28 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_rejects_oversized_file_without_network_call() {
+        // No MockServer mounted: an oversized payload must be refused before the
+        // request is built, let alone sent.
+        let tools = EngramMcpServer::new(EngramClient::new("http://127.0.0.1:1", "t"), true);
+        let result = tools
+            .translate_batch_import(Parameters(TranslateBatchImportParams {
+                target_lang: "es".to_string(),
+                name: "Deck".to_string(),
+                description: None,
+                tags: None,
+                visibility: None,
+                content_file_base64: "A".repeat(MAX_UPLOAD_BASE64_LEN + 1),
+                content_file_name: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("10MB"), "{text}");
     }
 
     #[tokio::test]

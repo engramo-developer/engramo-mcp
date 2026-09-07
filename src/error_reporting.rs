@@ -51,7 +51,11 @@ impl EventVisitor {
 /// `access_token`, `api_secret`, `api_key`, `db_password`, etc.
 /// Uses `_key` (not bare `key`) to avoid false-positive redaction of unrelated
 /// fields such as `monkey` or `turkey`.
-const SENSITIVE_TERMS: &[&str] = &["token", "secret", "password", "_key"];
+///
+/// `session_id` is in here because an MCP session id authorizes requests against
+/// that session's EngrAmo token (see `crate::http_auth`) — it is a credential, not
+/// a correlation id.
+const SENSITIVE_TERMS: &[&str] = &["token", "secret", "password", "_key", "session_id"];
 
 fn is_sensitive(field_name: &str) -> bool {
     SENSITIVE_TERMS

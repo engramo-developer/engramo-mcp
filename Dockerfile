@@ -34,7 +34,14 @@ RUN apt-get update -y \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/engramo-mcp /app/engramo-mcp
+# Run as an unprivileged user: this image serves a public, unauthenticated
+# endpoint, so nothing in it should have root's reach if the process is ever
+# compromised. A dedicated system account, not the base image's `ubuntu` user —
+# that one is in the `sudo` group.
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin app \
+    && install -o app -g app -d /app
+COPY --from=builder --chown=app:app /app/target/release/engramo-mcp /app/engramo-mcp
+USER app
 
 # Cloud Run routes traffic to the container's configured port (defaults to
 # 8080 unless the service is configured otherwise); MCP_BIND_ADDR defaults to

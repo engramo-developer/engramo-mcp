@@ -5,6 +5,13 @@ on:
     tags:
       - 'v*'
 
+# This workflow holds NPM_TOKEN and publishes signed artifacts, so every job
+# starts from the minimum and opts in to what it needs. Third-party actions are
+# pinned to a commit SHA: a mutable tag in a job with the publish token is a
+# direct path to a supply-chain compromise of `@engramo/mcp`.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -30,11 +37,15 @@ jobs:
             use_zigbuild: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          # Required explicitly: pinned by SHA, the action can no longer infer the
+          # toolchain from the `@stable` ref.
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -43,7 +54,7 @@ jobs:
 
       - name: Install zig + cargo-zigbuild (Linux)
         if: matrix.use_zigbuild
-        uses: goto-bus-stop/setup-zig@v2
+        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2
 
       - name: Install cargo-zigbuild (Linux)
         if: matrix.use_zigbuild
@@ -60,7 +71,7 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/engramo-mcp ${{ matrix.artifact }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -72,11 +83,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |
@@ -89,14 +100,19 @@ jobs:
     name: Publish to npm
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required by `npm publish --provenance`: npm exchanges this for a signed
+      # attestation tying each published tarball to this workflow run.
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -130,7 +146,7 @@ jobs:
             cp "$artifact" "$pkg_dir/engramo-mcp"
             chmod +x "$pkg_dir/engramo-mcp"
 
-            npm publish "$pkg_dir" --access public
+            npm publish "$pkg_dir" --access public --provenance
           done
 
       - name: Publish main package
@@ -151,4 +167,4 @@ jobs:
             fs.writeFileSync('$pkg_dir/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
-          npm publish "$pkg_dir" --access public
+          npm publish "$pkg_dir" --access public --provenance

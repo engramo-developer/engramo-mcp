@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::Request,
-    http::{StatusCode, header::AUTHORIZATION},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-};
+use axum::middleware;
 use clap::{Parser, Subcommand};
-use engramo_mcp::{client::EngramClient, config::McpConfig, server::EngramMcpServer, well_known};
+use engramo_mcp::{
+    client::EngramClient,
+    config::McpConfig,
+    http_auth::{SessionTokens, bearer_auth_middleware, current_bearer_token},
+    server::EngramMcpServer,
+    well_known,
+};
 use rmcp::{
     ServiceExt,
     transport::{
@@ -37,6 +38,20 @@ enum Command {
     Http,
 }
 
+/// Verbosity used when `RUST_LOG` is unset: `info` everywhere, except rmcp's session
+/// manager, which logs every new `Mcp-Session-Id` at INFO (`create new session`). A
+/// session id authorizes requests against the session's EngrAmo token, so it is a
+/// credential-equivalent value and must not be shipped to Cloud Logging — see
+/// `engramo_mcp::http_auth`.
+const DEFAULT_LOG_FILTER: &str = "info,rmcp::transport::streamable_http_server::session=warn";
+
+/// Largest request body accepted in `http` mode. rmcp buffers the whole body in memory
+/// before parsing it (`expect_json`) and axum's `DefaultBodyLimit` does not apply to a
+/// `fallback_service`, so without this an unauthenticated caller can drive the process
+/// out of memory with one POST. 16 MiB leaves room for the ~13.4 MiB of base64 a maximum
+/// 10 MB `upload_media` produces, plus JSON-RPC framing.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse(); // handles --version / --help before touching env vars
@@ -55,11 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// GCP Cloud Logging-shaped structured JSON on stdout plus a second, Error-Reporting-shaped
 /// JSON line on stderr for every `ERROR`-level event (see `error_reporting::ErrorReportingLayer`).
 /// `RUST_LOG` still controls verbosity in both branches; unlike `EnvFilter`'s own default
-/// (`ERROR` only), an unset `RUST_LOG` here defaults to `info` so routine startup/operational
-/// logs aren't silently dropped on a fresh deployment that hasn't set it.
+/// (`ERROR` only), an unset `RUST_LOG` here defaults to [`DEFAULT_LOG_FILTER`] so routine
+/// startup/operational logs aren't silently dropped on a fresh deployment that hasn't set it.
 fn init_logging() {
     let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "local".to_string());
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
 
     if app_env == "local" {
         Registry::default()
@@ -126,16 +142,6 @@ fn config_help(e: engramo_mcp::config::ConfigError) -> String {
     )
 }
 
-// Carries the per-request bearer token from the axum auth middleware to the rmcp
-// `StreamableHttpService` session factory, which is a plain `Fn() -> Result<S, io::Error>`
-// with no access to the HTTP request. The factory is invoked synchronously, inline,
-// while handling the `initialize` request that opens a new MCP session (see
-// `StreamableHttpService::handle_post` in rmcp) — i.e. still inside the async task this
-// task-local is scoped over — so `try_with` reliably sees the value the middleware set.
-tokio::task_local! {
-    static CURRENT_BEARER_TOKEN: String;
-}
-
 /// Remote entry point: serves the MCP over Streamable HTTP at `/`, deriving a fresh
 /// `EngramClient` per session from the caller's own `Authorization: Bearer <token>` —
 /// there is no global `ENGRAM_API_TOKEN` in this mode (`McpConfig.api_token` is unused).
@@ -156,7 +162,7 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("reqwest client with static, well-formed config must build");
     let factory = move || {
-        let token = CURRENT_BEARER_TOKEN.try_with(|t| t.clone()).map_err(|_| {
+        let token = current_bearer_token().ok_or_else(|| {
             // Invariant violation: `bearer_auth_middleware` already rejects any
             // request without a non-empty bearer token before this factory ever
             // runs, so this should be unreachable. Log at ERROR (not a routine
@@ -190,9 +196,17 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     // `.well-known/oauth-protected-resource` (RFC 9728, Track 3 Phase 3) must be
     // fetchable *without* a token, since its whole purpose is telling an
     // unauthenticated client where to go get one.
+    let sessions = SessionTokens::new();
     let mcp_router = axum::Router::new()
         .fallback_service(service)
-        .layer(middleware::from_fn(bearer_auth_middleware));
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            MAX_BODY_BYTES,
+        ))
+        .layer(middleware::from_fn_with_state(
+            sessions.clone(),
+            bearer_auth_middleware,
+        ))
+        .with_state(sessions);
 
     let protected_resource_state = well_known::ProtectedResourceState {
         resource: cfg.public_url.clone().unwrap_or_else(|| {
@@ -225,28 +239,4 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-/// Extracts `Authorization: Bearer <token>` and scopes it into `CURRENT_BEARER_TOKEN`
-/// for the duration of the request. Missing or empty bearer tokens are rejected with
-/// 401 at the edge — before ever reaching the rmcp session factory (which would 500 on
-/// a missing task-local, since it has no HTTP-status-aware rejection path of its own).
-async fn bearer_auth_middleware(req: Request, next: Next) -> Response {
-    let token = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string);
-
-    match token {
-        Some(token) => CURRENT_BEARER_TOKEN.scope(token, next.run(req)).await,
-        None => (
-            StatusCode::UNAUTHORIZED,
-            "Missing or empty Authorization: Bearer <token> header",
-        )
-            .into_response(),
-    }
 }
