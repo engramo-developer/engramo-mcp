@@ -20,7 +20,7 @@
   "optionalDependencies": {
     "@engramo/mcp-darwin-arm64": "0.0.0",
     "@engramo/mcp-darwin-x64": "0.0.0",
-    "@engramo/mcp-linux-arm64": "0.0.0",
+    "@engramo/mcp-linux-arm64": "1.1.1",
     "@engramo/mcp-linux-x64": "0.0.0"
   }
 }
