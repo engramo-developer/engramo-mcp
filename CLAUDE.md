@@ -16,12 +16,16 @@ Standalone Rust 2024 binary that exposes the EngrAmo flashcard API to AI clients
 ```
 src/
 ├── main.rs          — CLI (Stdio/Http subcommands); http mode wires an axum Router (auth
-│                       middleware + task-local bearer token) around rmcp's StreamableHttpService
+│                       middleware + task-local bearer token + request body limit) around rmcp's
+│                       StreamableHttpService
 ├── lib.rs           — re-exports public modules
 ├── config.rs        — McpConfig: ENGRAM_API_URL (required), ENGRAM_API_TOKEN (optional — required
 │                       only for stdio, see require_token()), ENGRAM_ENABLE_PAID_AI (default off)
 ├── client.rs        — EngramClient: typed HTTP client, attaches X-Api-Key header
 ├── error.rs         — ApiError enum: maps HTTP status → typed error
+├── http_auth.rs     — http mode's auth edge: bearer extraction/validation, the CURRENT_BEARER_TOKEN
+│                       task-local, and SessionTokens (binds each MCP session to the token that
+│                       opened it — rmcp authorizes later requests on the session id alone)
 ├── dto.rs           — lightweight DTOs mirroring API JSON shapes
 ├── server.rs        — EngramMcpServer: ServerHandler impl + always-on tool handlers; `new()`
 │                       conditionally sums in `Self::paid_ai_tools_router()` when the flag is on
@@ -79,13 +83,20 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   Start with: `ENGRAM_API_URL=... ENGRAM_API_TOKEN=... cargo run`
 - **http**: `cargo run -- http`. Serves rmcp's `StreamableHttpService` at `/` (root, via `fallback_service` —
   axum no longer allows `nest_service` at root) behind an axum `Router`.
-  A `bearer_auth_middleware` extracts `Authorization: Bearer <token>` and scopes it into a
+  A `bearer_auth_middleware` (`http_auth.rs`) extracts `Authorization: Bearer <token>` and scopes it into a
   `tokio::task_local!` (`CURRENT_BEARER_TOKEN`) — the only way to reach the rmcp session factory, since
   `StreamableHttpService::new` takes a plain `Fn() -> Result<S, io::Error>` with no access to request
   headers. The factory runs synchronously inside `handle_post` while establishing a new session
   (`initialize` request), which is still within the task the middleware scoped, so `try_with` sees the
   value. Missing/empty bearer → `401` at the middleware, before a session is ever created. One
   `EngramClient` (and thus one EngrAmo account) per MCP session, for the session's lifetime.
+- **Session binding (security):** rmcp authorizes every post-`initialize` request on the `Mcp-Session-Id`
+  header alone, so `SessionTokens` records which token opened each session and 401s a request that presents a
+  different one — otherwise a leaked session id would let anyone act as that session's owner. Requests are
+  capped at 16 MiB (`RequestBodyLimitLayer`): rmcp buffers the whole body before parsing, and axum's
+  `DefaultBodyLimit` does not reach a `fallback_service`.
+- **Never log a session id.** It is credential-equivalent; the default `RUST_LOG` filter silences rmcp's
+  session manager and `error_reporting` redacts `session_id` fields.
 
 ---
 

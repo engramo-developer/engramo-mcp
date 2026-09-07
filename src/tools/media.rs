@@ -14,8 +14,13 @@ use crate::tools::catalogs::{err_result, ok_json};
 
 /// Matches the `/media` upload endpoint's own limit (`engram-api/app/src/routes/media.rs`) —
 /// checked here too so an oversized upload fails fast with a clear message instead of a
-/// confusing server error after the (wasted) network round trip.
-const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+/// confusing server error after the (wasted) network round trip. `/catalogs/translate-batch-import`
+/// carries the same whole-request limit (see `docs/bulk-import.md`).
+pub(crate) const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+/// The same limit expressed on the *encoded* string, so an oversized payload is rejected
+/// before `base64::decode` allocates a buffer for it (base64 expands data by 4/3).
+pub(crate) const MAX_UPLOAD_BASE64_LEN: usize = MAX_UPLOAD_BYTES.div_ceil(3) * 4;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListMediaParams {
@@ -91,6 +96,11 @@ impl MediaTools {
         &self,
         Parameters(p): Parameters<UploadMediaParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if p.content_base64.len() > MAX_UPLOAD_BASE64_LEN {
+            return Ok(err_result(
+                "Encoded content exceeds the 10MB upload limit".to_string(),
+            ));
+        }
         let content = match base64::engine::general_purpose::STANDARD.decode(&p.content_base64) {
             Ok(bytes) => bytes,
             Err(e) => return Ok(err_result(format!("Invalid base64 content_base64: {e}"))),

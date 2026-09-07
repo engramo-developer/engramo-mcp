@@ -13,6 +13,21 @@ use crate::dto::{
 };
 use crate::error::ApiError;
 
+/// True for Unicode formatting characters that have no visible glyph of their
+/// own but can still change how a filename *displays* — e.g. RIGHT-TO-LEFT
+/// OVERRIDE can make a name ending `cod.exe` render as `exe.doc`. Neither
+/// `char::is_control()` nor reqwest's header escaping catches these, since
+/// they aren't CR/LF or C0 control bytes.
+fn is_unicode_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{061C}' // ARABIC LETTER MARK
+        | '\u{200B}'..='\u{200F}' // ZERO WIDTH SPACE .. RIGHT-TO-LEFT MARK
+        | '\u{202A}'..='\u{202E}' // bidi embedding/override controls (incl. RTLO)
+        | '\u{2060}'..='\u{2069}' // WORD JOINER .. bidi isolates
+        | '\u{FEFF}' // BOM / ZERO WIDTH NO-BREAK SPACE
+    )
+}
+
 /// Typed HTTP client for the Engram REST API.
 /// Every request automatically attaches the user's API token via `X-Api-Key`.
 /// All methods return `Result<T, ApiError>` — callers convert errors to `CallToolResult`
@@ -63,6 +78,29 @@ impl EngramClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Makes an LLM-supplied filename safe to put in a multipart
+    /// `Content-Disposition` header. reqwest escapes `"` and `\` but still emits a
+    /// raw CR/LF byte for a newline in the name (`\\r`/`\\n` quoted-pairs), which a
+    /// lenient upstream parser can read as the start of another header. Drop
+    /// control characters, bidi/format characters, and path separators, and cap
+    /// the length.
+    fn sanitize_filename(name: &str) -> String {
+        const MAX_FILENAME_LEN: usize = 200;
+        let cleaned: String = name
+            .chars()
+            .filter(|c| {
+                !c.is_control() && !is_unicode_format_char(*c) && !matches!(c, '/' | '\\' | '"')
+            })
+            .take(MAX_FILENAME_LEN)
+            .collect();
+        let cleaned = cleaned.trim().trim_start_matches('.').trim().to_string();
+        if cleaned.is_empty() {
+            "upload".to_string()
+        } else {
+            cleaned
+        }
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
@@ -382,7 +420,7 @@ impl EngramClient {
         content_type: &str,
     ) -> Result<Uuid, ApiError> {
         let part = reqwest::multipart::Part::bytes(content)
-            .file_name(filename.to_string())
+            .file_name(Self::sanitize_filename(filename))
             .mime_str(content_type)
             .map_err(|e| ApiError::BadRequest(format!("Invalid content type: {e}")))?;
         let form = reqwest::multipart::Form::new().part("file", part);
@@ -473,8 +511,8 @@ impl EngramClient {
         let metadata_json = serde_json::to_string(catalog_metadata).map_err(|e| {
             ApiError::BadRequest(format!("failed to serialize catalog metadata: {e}"))
         })?;
-        let content_part =
-            reqwest::multipart::Part::bytes(content_file).file_name(content_file_name.to_string());
+        let content_part = reqwest::multipart::Part::bytes(content_file)
+            .file_name(Self::sanitize_filename(content_file_name));
         let form = reqwest::multipart::Form::new()
             .text("catalog_metadata", metadata_json)
             .part("content_file", content_part);
@@ -1406,6 +1444,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn test_sanitize_filename_strips_crlf_and_path_separators() {
+        // A CR/LF in the name reaches the multipart Content-Disposition header;
+        // reqwest only backslash-escapes it, leaving the raw byte in place.
+        assert_eq!(
+            EngramClient::sanitize_filename("a.mp3\r\nContent-Type: text/html"),
+            "a.mp3Content-Type: texthtml"
+        );
+        assert_eq!(
+            EngramClient::sanitize_filename("../../etc/passwd"),
+            "etcpasswd"
+        );
+        assert_eq!(
+            EngramClient::sanitize_filename("say\"hi\".mp3"),
+            "sayhi.mp3"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_filename_strips_bidi_override_characters() {
+        // U+202E (RTLO) has no glyph of its own but flips render order for
+        // everything after it — a name ending "cod\u{202E}exe.mp3" would
+        // display as "cod.mp3exe" in a lenient file picker. Not caught by
+        // `is_control()` since it isn't a C0 control byte.
+        assert_eq!(
+            EngramClient::sanitize_filename("safe\u{202E}exe.mp3"),
+            "safeexe.mp3"
+        );
+        // Zero-width space / BOM: invisible but can hide extra characters.
+        assert_eq!(
+            EngramClient::sanitize_filename("a\u{200B}b\u{FEFF}.mp3"),
+            "ab.mp3"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_filename_keeps_ordinary_names() {
+        assert_eq!(
+            EngramClient::sanitize_filename("card1_face.mp3"),
+            "card1_face.mp3"
+        );
+        assert_eq!(
+            EngramClient::sanitize_filename("ñandú — foto.png"),
+            "ñandú — foto.png"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_filename_falls_back_when_nothing_survives() {
+        assert_eq!(EngramClient::sanitize_filename(""), "upload");
+        assert_eq!(EngramClient::sanitize_filename("///"), "upload");
+        assert_eq!(EngramClient::sanitize_filename("\r\n"), "upload");
+    }
+
+    #[test]
+    fn test_sanitize_filename_caps_length() {
+        let long = "a".repeat(5000);
+        assert_eq!(EngramClient::sanitize_filename(&long).chars().count(), 200);
     }
 
     #[tokio::test]

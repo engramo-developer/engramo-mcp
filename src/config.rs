@@ -1,13 +1,43 @@
 use std::env;
 
+/// Wraps a secret value so it is redacted from `{:?}` by construction, rather
+/// than relying on a hand-maintained `Debug` impl on whatever struct holds it —
+/// a field added to that struct later is covered automatically instead of
+/// silently reaching a log line through a derived `Debug`.
+#[derive(Clone)]
+pub struct Redacted<T>(T);
+
+impl<T> Redacted<T> {
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T> std::fmt::Debug for Redacted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+/// `Target = str` (not `String`) so `Option<Redacted<String>>::as_deref()` —
+/// used by `require_token` and by tests — yields `Option<&str>` directly.
+impl std::ops::Deref for Redacted<String> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct McpConfig {
     /// Base URL of the Engram REST API (e.g. "https://api.engram.dev")
     pub api_url: String,
     /// User's API token (starts with "engram_"). Required for `stdio` mode
     /// (one server process = one user). `None` in `http` mode, where each
-    /// session supplies its own bearer token — see `require_token`.
-    pub api_token: Option<String>,
+    /// session supplies its own bearer token — see `require_token`. Wrapped in
+    /// [`Redacted`] so it can never reach a log line through a `?`-sigil
+    /// tracing field or a `{:?}` format — see `error_reporting::ErrorReportingLayer`.
+    pub api_token: Option<Redacted<String>>,
     /// Whether the paid-AI tool router (TTS, translation, dictionary, AI-agent
     /// chat) is registered. Loaded from `ENGRAM_ENABLE_PAID_AI` (default `false`).
     pub paid_ai_enabled: bool,
@@ -47,7 +77,7 @@ impl McpConfig {
         let api_url = api_url.trim_end_matches('/').to_string();
         Ok(Self {
             api_url,
-            api_token,
+            api_token: api_token.map(Redacted::new),
             paid_ai_enabled,
             public_url: None,
             extra_allowed_hosts: Vec::new(),
@@ -359,6 +389,32 @@ mod tests {
                 "engramo-mcp-632347647951.europe-west1.run.app",
             ]
         );
+    }
+
+    #[test]
+    fn test_redacted_debug_never_prints_the_wrapped_value() {
+        let r = Redacted::new("engram_super_secret".to_string());
+        let rendered = format!("{r:?}");
+        assert_eq!(rendered, "[REDACTED]");
+    }
+
+    #[test]
+    fn test_debug_redacts_api_token() {
+        let cfg = McpConfig::new(
+            "https://api.engram.dev",
+            Some("engram_super_secret".to_string()),
+            false,
+        )
+        .unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("engram_super_secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    #[test]
+    fn test_debug_shows_none_token_as_none() {
+        let cfg = McpConfig::new("https://api.engram.dev", None, false).unwrap();
+        assert!(format!("{cfg:?}").contains("api_token: None"));
     }
 
     #[test]

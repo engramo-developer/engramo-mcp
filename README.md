@@ -220,7 +220,8 @@ ENGRAM_API_URL=https://api.engramo.app MCP_BIND_ADDR=0.0.0.0:8080 engramo-mcp ht
 This serves MCP over Streamable HTTP at `POST /` (root). Unlike `stdio` mode, there is **no global
 `ENGRAM_API_TOKEN`** — every session authenticates with its own `Authorization: Bearer <token>` header, so one
 deployment safely serves many users at once (each session's calls to the EngrAmo API use only that session's
-token). Requests without a valid, non-empty bearer token are rejected with `401` before a session is created.
+token). Requests without a well-formed, non-empty bearer token are rejected with `401` before a session is
+created, and once a session exists every later request on it must carry the same token that opened it.
 
 In ChatGPT: **Settings → Connectors → Advanced → Developer mode**, then add a custom connector pointing at
 your deployment's `https://<host>/`, pasting an EngrAmo API token (from Settings → API Tokens) as the
