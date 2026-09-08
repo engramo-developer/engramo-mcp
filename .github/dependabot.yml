@@ -13,16 +13,28 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # rmcp majors carry breaking API changes (Content / CallToolResult renames,
+      # moved model imports). Upgrade deliberately in its own PR, not via a
+      # Dependabot bump that only ever lands red.
+      - dependency-name: rmcp
+        update-types:
+          - version-update:semver-major
 
   # Actions are pinned to commit SHAs (release.yml holds NPM_TOKEN), so this is
   # the only thing that keeps those pins current — Dependabot rewrites the SHA
-  # and updates the trailing version comment.
+  # and updates the trailing version comment. One grouped PR per run keeps the
+  # queue from filling with a PR per action.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
-  - package-ecosystem: npm
-    directory: /npm/engramo-mcp
-    schedule:
-      interval: monthly
+  # No npm entry: npm/engramo-mcp declares no third-party dependencies. Its
+  # @engramo/mcp-* optionalDependencies are 0.0.0 placeholders that the
+  # npm-publish job in release.yml rewrites to the release tag at publish time,
+  # so Dependabot bumping them just produces churn that never ships.
