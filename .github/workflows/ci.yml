@@ -3,18 +3,22 @@ name: CI
 on:
   push:
     branches: [main]
+    # Test / Audit are required checks in the main ruleset, so workflow- and
+    # Dependabot-config-only PRs have to trigger them too or they never merge.
     paths:
       - 'src/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/**'
+      - '.github/dependabot.yml'
   pull_request:
     branches: [main]
     paths:
       - 'src/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/**'
+      - '.github/dependabot.yml'
   # Advisories land without anyone pushing, so audit on a timer too.
   schedule:
     - cron: '17 6 * * 1'
