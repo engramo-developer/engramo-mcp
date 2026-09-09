@@ -126,3 +126,4 @@ cargo sort
 | `/test` | Generate comprehensive tests targeting >90% coverage |
 | `/security` | Security audit: token handling, input validation, panic safety |
 | `/coverage` | Identify uncovered code paths and suggest missing tests |
+| `/orchestration` | Orchestrator playbook: drive a multi-phase rollout by spawning one subagent per phase |
