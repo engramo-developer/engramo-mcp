@@ -9,7 +9,7 @@
 
 use rmcp::model::{
     ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult, Prompt, PromptArgument,
-    PromptMessage, PromptMessageRole,
+    PromptMessage, Role,
 };
 
 // ── Prompt names ──────────────────────────────────────────────────────────────
@@ -141,11 +141,11 @@ pub fn get(params: GetPromptRequestParams) -> Result<GetPromptResult, ErrorData>
 // ── Prompt builders ───────────────────────────────────────────────────────────
 
 fn user_msg(text: impl Into<String>) -> PromptMessage {
-    PromptMessage::new_text(PromptMessageRole::User, text)
+    PromptMessage::new_text(Role::User, text)
 }
 
 fn assistant_msg(text: impl Into<String>) -> PromptMessage {
-    PromptMessage::new_text(PromptMessageRole::Assistant, text)
+    PromptMessage::new_text(Role::Assistant, text)
 }
 
 fn review_session(limit: Option<String>) -> GetPromptResult {
@@ -284,7 +284,7 @@ fn study_plan(goal: Option<&str>) -> GetPromptResult {
 
 #[cfg(test)]
 mod tests {
-    use rmcp::model::{JsonObject, PromptMessageContent};
+    use rmcp::model::{ContentBlock, JsonObject, TextContent};
     use serde_json::Value;
 
     use super::*;
@@ -313,12 +313,9 @@ mod tests {
         let params = GetPromptRequestParams::new(PROMPT_REVIEW_SESSION);
         let result = get(params).unwrap();
         assert_eq!(result.messages.len(), 2);
-        assert!(matches!(result.messages[0].role, PromptMessageRole::User));
-        assert!(matches!(
-            result.messages[1].role,
-            PromptMessageRole::Assistant
-        ));
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        assert!(matches!(result.messages[0].role, Role::User));
+        assert!(matches!(result.messages[1].role, Role::Assistant));
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("get_due_cards"), "{text}");
             assert!(text.contains("Engram app"), "{text}");
         } else {
@@ -331,7 +328,7 @@ mod tests {
         let params = GetPromptRequestParams::new(PROMPT_REVIEW_SESSION)
             .with_arguments(args(&[("limit", "10")]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("limit=10"), "{text}");
         } else {
             panic!("expected text content");
@@ -343,7 +340,7 @@ mod tests {
         let params = GetPromptRequestParams::new(PROMPT_CREATE_FLASHCARD)
             .with_arguments(args(&[("topic", "Rust ownership")]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("Rust ownership"), "{text}");
             assert!(text.contains("generate_card"), "{text}");
             assert!(text.contains("engram://card-schema"), "{text}");
@@ -359,7 +356,7 @@ mod tests {
             ("catalog_id", "00000000-0000-0000-0000-000000000001"),
         ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(
                 text.contains("00000000-0000-0000-0000-000000000001"),
                 "{text}"
@@ -378,7 +375,7 @@ mod tests {
                 ("target_lang", "English"),
             ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("ordering coffee"), "{text}");
             assert!(text.contains("Spanish"), "{text}");
             assert!(text.contains("English"), "{text}");
@@ -396,7 +393,7 @@ mod tests {
                 ("target_lang", "English"),
             ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("10-card"), "{text}");
         } else {
             panic!("expected text content");
@@ -413,7 +410,7 @@ mod tests {
                 ("count", "3"),
             ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("3-card"), "{text}");
         } else {
             panic!("expected text content");
@@ -430,7 +427,7 @@ mod tests {
                 ("catalog_id", "00000000-0000-0000-0000-000000000002"),
             ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(
                 text.contains("00000000-0000-0000-0000-000000000002"),
                 "{text}"
@@ -450,7 +447,7 @@ mod tests {
                 ("target_lang", "English"),
             ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("generate_catalog_with_cards"), "{text}");
         } else {
             panic!("expected text content");
@@ -466,7 +463,7 @@ mod tests {
                 ("target_lang", "English"),
             ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("engram://card-schema"), "{text}");
             assert!(text.contains("dictionary"), "{text}");
             assert!(text.contains("CardStyle"), "{text}");
@@ -484,7 +481,7 @@ mod tests {
                 ("target_lang", "English"),
             ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("upload_media"), "{text}");
             assert!(text.contains("No paid AI"), "{text}");
             assert!(
@@ -503,7 +500,7 @@ mod tests {
             ("back", "Every value has one owner."),
         ]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("What is ownership?"), "{text}");
             assert!(text.contains("Every value has one owner."), "{text}");
         } else {
@@ -516,7 +513,7 @@ mod tests {
         let params = GetPromptRequestParams::new(PROMPT_STUDY_PLAN)
             .with_arguments(args(&[("goal", "review all due Rust cards")]));
         let result = get(params).unwrap();
-        if let PromptMessageContent::Text { text } = &result.messages[0].content {
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("review all due Rust cards"), "{text}");
             assert!(text.contains("get_due_cards"), "{text}");
         } else {

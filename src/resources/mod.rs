@@ -12,8 +12,7 @@
 //!   engram://subscription          — user subscription / plan info
 
 use rmcp::model::{
-    AnnotateAble, ListResourcesResult, RawResource, ReadResourceRequestParams, ReadResourceResult,
-    Resource, ResourceContents,
+    ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
 };
 
 use crate::client::EngramClient;
@@ -142,17 +141,9 @@ invent a UUID; only use one actually returned by `upload_media`.
 // ── Resource list ─────────────────────────────────────────────────────────────
 
 fn make_resource(uri: &str, name: &str, description: &str, mime_type: &str) -> Resource {
-    RawResource {
-        uri: uri.to_string(),
-        name: name.to_string(),
-        title: None,
-        description: Some(description.to_string()),
-        mime_type: Some(mime_type.to_string()),
-        size: None,
-        icons: None,
-        meta: None,
-    }
-    .no_annotation()
+    Resource::new(uri, name)
+        .with_description(description)
+        .with_mime_type(mime_type)
 }
 
 pub fn list_all() -> ListResourcesResult {
