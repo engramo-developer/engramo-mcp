@@ -8,7 +8,7 @@ maintenance rollout).
 | # | Item | Type | Priority | Status |
 |---|---|---|---|---|
 | 1 | rmcp 1.8 → 3.x migration | rework (breaking API) | high | **closed — done** |
-| 2 | Verify `release.yml` after the GitHub Actions major bumps | verification | high (before next release) | static audit DONE; dry-run path added — open until exercised |
+| 2 | Verify `release.yml` after the GitHub Actions major bumps | verification | high (before next release) | dry-run exercised 2026-09-09; open until a real tag ships |
 | 3 | Decide on Dependabot auto-merge for patch/minor | decision | low | **closed — no** |
 | 4 | Confirm the new Dependabot grouping/ignore config behaves on the next weekly run | verification | low | open — waiting on next weekly run |
 
@@ -57,8 +57,20 @@ real — so `build` → `github-release` / `npm-publish` can now be exercised en
 including `download-artifact@v8` + `merge-multiple: true` (checked by a new verification
 step) and `action-gh-release@v3`'s asset upload, without shipping anything. A real tag push
 is unaffected: `dry_run` resolves to `false` there and every step keeps its exact prior
-inputs. What's still open is actually *running* the dry-run dispatch once and, separately,
-watching a real tag release end-to-end — see work items below.
+inputs.
+
+**Dry run exercised (2026-09-09), [run 34356001987](https://github.com/engramo-developer/engramo-mcp/actions/runs/34356001987):**
+all 7 jobs green. `resolve` fell back to `Cargo.toml`'s `1.1.2` correctly. All four
+binaries verified present and non-empty (12.5–18MB each). The draft landed at
+`dry-run-1.1.2-34356001987` exactly as designed — `v1.1.2`, the real published release,
+was untouched, confirming the tag-collision fix actually holds and not just in theory.
+All 5 npm packages logged `Publishing to https://registry.npmjs.org/ ... (dry-run)` —
+nothing hit the real registry. Draft deleted afterward. One unrelated nit surfaced: every
+publish emitted `npm warn ... "repository.url" was normalized to "git+https://..."` — the
+`npm/*/package.json` files have `repository.url` in a form npm auto-corrects on every
+publish. Harmless (npm silently fixes it), pre-existing, out of scope here.
+
+What's still open is watching a real tag release end-to-end — see work items below.
 
 PR #18 bumped these four release-only actions (SHA-pinned):
 
@@ -98,12 +110,7 @@ was not installed for this pass, per instructions.
 
 ### Work items
 
-- [ ] Run `workflow_dispatch` with `dry_run: true` once and confirm: the verification step
-      after `download-artifact@v8` reports all four binaries present and non-empty, a draft
-      GitHub release is created with the four assets attached, and `npm-publish` logs a
-      `--dry-run` publish (no `--provenance`) for all five packages. Delete the draft
-      release afterward — dry runs don't clean up after themselves; it's the one
-      titled "DRY RUN ... delete me".
+- [x] Run `workflow_dispatch` with `dry_run: true` once — done 2026-09-09, see above.
 - [ ] On the next real release tag, watch `build` → `github-release` / `npm-publish`
       end-to-end too — the dry run proves the mechanics, but a real tag is still the only
       way to confirm the actual publish (npm registry, non-draft GitHub release) succeeds.
