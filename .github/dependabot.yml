@@ -13,13 +13,6 @@ updates:
         update-types:
           - minor
           - patch
-    ignore:
-      # rmcp majors carry breaking API changes (Content / CallToolResult renames,
-      # moved model imports). Upgrade deliberately in its own PR, not via a
-      # Dependabot bump that only ever lands red.
-      - dependency-name: rmcp
-        update-types:
-          - version-update:semver-major
 
   # Actions are pinned to commit SHAs (release.yml holds NPM_TOKEN), so this is
   # the only thing that keeps those pins current — Dependabot rewrites the SHA

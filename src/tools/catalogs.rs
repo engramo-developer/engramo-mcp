@@ -42,15 +42,15 @@ pub struct DeleteCatalogParams {
 
 pub(crate) fn ok_json<T: serde::Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
-        Ok(json) => CallToolResult::success(vec![rmcp::model::Content::text(json)]),
-        Err(e) => CallToolResult::error(vec![rmcp::model::Content::text(format!(
+        Ok(json) => CallToolResult::success(vec![rmcp::model::ContentBlock::text(json)]),
+        Err(e) => CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
             "Serialization error: {e}"
         ))]),
     }
 }
 
 pub(crate) fn ok_text(text: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![rmcp::model::Content::text(text.into())])
+    CallToolResult::success(vec![rmcp::model::ContentBlock::text(text.into())])
 }
 
 pub(crate) fn err_result(e: impl std::fmt::Display) -> CallToolResult {
@@ -62,7 +62,7 @@ pub(crate) fn err_result(e: impl std::fmt::Display) -> CallToolResult {
     // `ApiError::from_response` and `impl From<reqwest::Error> for ApiError` in
     // `error.rs`), which is what feeds GCP Error Reporting.
     tracing::warn!(error = %message, "tool call returned an error");
-    CallToolResult::error(vec![rmcp::model::Content::text(message)])
+    CallToolResult::error(vec![rmcp::model::ContentBlock::text(message)])
 }
 
 pub(crate) fn parse_uuid(s: &str) -> Result<Uuid, String> {

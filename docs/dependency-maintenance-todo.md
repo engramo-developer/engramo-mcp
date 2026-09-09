@@ -7,7 +7,7 @@ maintenance rollout).
 
 | # | Item | Type | Priority | Status |
 |---|---|---|---|---|
-| 1 | rmcp 1.8 → 3.x migration | rework (breaking API) | high | open — on a separate branch/PR |
+| 1 | rmcp 1.8 → 3.x migration | rework (breaking API) | high | **closed — done** |
 | 2 | Verify `release.yml` after the GitHub Actions major bumps | verification | high (before next release) | static audit DONE; live run still gated on a real tag |
 | 3 | Decide on Dependabot auto-merge for patch/minor | decision | low | **closed — no** |
 | 4 | Confirm the new Dependabot grouping/ignore config behaves on the next weekly run | verification | low | open — waiting on next weekly run |
@@ -21,88 +21,26 @@ version. Bumped to `1.1.2` to match.
 
 ---
 
-## 1. rmcp 1.8 → 3.x migration
+## 1. rmcp 1.8 → 3.x migration — CLOSED
 
-**Status:** open, being done on a separate branch with its own PR. This section only
-corrects the map of what actually changes — the earlier version of this doc was
-transcribed from PR #16's CI failure log and does not match rmcp 3.2.
+Done: `rmcp` is on **3.2**. The migration came to six mechanical changes, not the
+sweeping rewrite the original entry here implied — that list had been transcribed from
+PR #16's CI failure and was wrong for 3.2 (`CallToolResult` / `ReadResourceResult` are
+not renamed; new `*Response` enums wrap them to carry an MRTR `InputRequired` variant
+this server never produces, and macro-routed `#[tool]` methods were unaffected
+throughout). See the migrating PR for the full account.
 
-**Why deferred:** two major versions of breaking API change; the Dependabot PR failed to
-compile. This is a focused migration, not a version-bump merge.
+Two consequences worth carrying forward:
 
-### Corrected breaking-change map
-
-Verified against the official
-[Migrating to 3.0.0 guide](https://github.com/modelcontextprotocol/rust-sdk/discussions/969)
-and docs.rs for rmcp 3.2.0.
-
-The old list here claimed `CallToolResult` → `CallToolResponse`, `ReadResourceResult` →
-`ReadResourceResponse`, and that `PaginatedRequestParams` had moved. That's wrong:
-
-- `CallToolResult`, `ReadResourceResult` and `PaginatedRequestParams` **all still exist**.
-  The crate already uses the plural `*RequestParams` spellings, so nothing to do there.
-- `CallToolResponse` is not a rename — it's a **new** enum (`Complete` | `InputRequired`)
-  that **wraps** the still-existing `CallToolResult`. Same shape of relationship for
-  `ReadResourceResponse` wrapping `ReadResourceResult`, and `GetPromptResponse` wrapping
-  `GetPromptResult`.
-- `#[tool_router]` / `#[tool]` macro users are **unaffected** — all 43 `#[tool]` methods
-  and their `CallToolResult` returns are unchanged by the 3.x bump.
-
-The real surface to migrate:
-
-1. `rmcp::model::Content` → `ContentBlock`. Only 4 sites, all in `src/tools/catalogs.rs`
-   (`ok_json` / `ok_text` / `err_result`, lines 45/46/53/65).
-2. Three hand-written `ServerHandler` methods in `src/server.rs` need widened return types
-   plus `.into()` at the return site: `call_tool` → `CallToolResponse`, `read_resource` →
-   `ReadResourceResponse`, `get_prompt` → `GetPromptResponse`. Note `EngramMcpServer` has
-   **no** `#[tool_handler]` — its `call_tool` is hand-rolled — so it does not get the
-   macro's free ride the way `#[tool]`-routed methods do.
-3. `AnnotateAble` / `RawResource` are removed → `Annotations` + direct `Resource`
-   construction in `src/resources/mod.rs`.
-4. `PromptMessageRole` / `PromptMessageContent` / `GetPromptResult` relocated, affecting
-   the hand-rolled `src/prompts/mod.rs`.
-5. `StreamableHttpService<S, M>`'s bound moved from `S: Service<RoleServer>` to
-   `S: ServerHandler`, and `StreamableHttpServerConfig::stateful_mode` was renamed to
-   `legacy_session_mode`.
-6. MSRV is now Rust 1.88.
-
-### Risk to watch
-
-`main.rs`'s `DEFAULT_LOG_FILTER` hardcodes the module path
-`rmcp::transport::streamable_http_server::session` to silence session-id logging. If that
-module path moved in 3.x, session ids start reaching the logs unfiltered — CLAUDE.md
-treats a session id as credential-equivalent, so this needs an explicit check during the
-migration, not just "does it compile."
-
-### Work items
-
-- [ ] Bump `Cargo.toml`: `rmcp = { version = "3", features = [...] }` (keep the current feature list:
-      `server`, `macros`, `schemars`, `transport-io`, `transport-streamable-http-server`, `reqwest`).
-- [ ] Update the shared result helpers first — `ok_json` / `err_result` in `src/tools/catalogs.rs`
-      (~lines 45–65) — since every tool routes through them. `Content` → `ContentBlock`.
-- [ ] Fix the three hand-rolled `ServerHandler` methods in `src/server.rs`
-      (`call_tool`/`read_resource`/`get_prompt` → the `*Response` wrapper types, `.into()`
-      at each return).
-- [ ] Fix `src/resources/mod.rs` (`AnnotateAble`/`RawResource` → `Annotations` + `Resource`).
-- [ ] Fix prompt code in `src/prompts/mod.rs` (`PromptMessageRole`, `PromptMessageContent`,
-      `GetPromptResult` relocations).
-- [ ] Sweep the remaining `rmcp`-touching files:
-      `src/main.rs`, `src/http_auth.rs`, `src/error_reporting.rs`, `src/config.rs`,
-      `src/tools/{cards,catalogs,search,media,generate,learning,learning_paths,ai}.rs`.
-- [ ] Check `StreamableHttpService` wiring in `src/main.rs` — `S: ServerHandler` bound,
-      `legacy_session_mode` rename, session factory signature, `CURRENT_BEARER_TOKEN`
-      task-local.
-- [ ] Confirm `DEFAULT_LOG_FILTER`'s `rmcp::transport::streamable_http_server::session`
-      path still matches in 3.x (see "Risk to watch" above); update it if the module moved.
-- [ ] Re-check the rich-text / `normalize_card_content` path in `src/server.rs` for the
-      `ContentBlock` rename.
-- [ ] Run the full gate: `cargo fmt --all` · `cargo check` · `cargo clippy` · `cargo test`.
-- [ ] Manual smoke test both transports (`stdio` against a real token; `http` + a `Bearer` request).
-- [ ] Update `CLAUDE.md` — it says "rmcp 1.3" in the stack line and architecture notes.
-- [ ] Once merged, remove the `rmcp` `ignore` block from `.github/dependabot.yml`.
-
-Consider going straight to the latest 3.x rather than stepping through 2.x — there is no
-partial value in landing on an intermediate major.
+- **The `rmcp` `version-update:semver-major` ignore has been removed from
+  `.github/dependabot.yml`**, so rmcp majors will start arriving as PRs again. That is
+  intended — it existed only because majors were broken. It also means item 4's "no
+  stray rmcp-major PRs" check no longer applies.
+- The server's advertised identity was wrong and is now fixed. `ServerInfo::new`
+  defaults `server_info` to `Implementation::from_build_env()`, whose `env!` macros
+  expand when *rmcp* is compiled, so clients displayed this server as `rmcp` rather
+  than `engramo-mcp`. Long-standing, unrelated to the bump; the changed version string
+  is just what surfaced it. A regression test now guards it.
 
 ---
 
@@ -199,7 +137,8 @@ required checks pass, leaving majors for a human:
 `.github/dependabot.yml` was changed in PR #17:
 
 - `github-actions` updates are now grouped into one PR (`groups: github-actions: patterns: ["*"]`).
-- `rmcp` `version-update:semver-major` is ignored.
+- `rmcp` `version-update:semver-major` was ignored. **No longer** — the ignore was
+  removed once the 3.x migration landed (item 1), so rmcp majors arrive as PRs again.
 - The `npm` ecosystem entry was removed entirely — `npm/engramo-mcp` has no third-party
   deps; its `@engramo/mcp-*` `optionalDependencies` are `0.0.0` placeholders that the
   `npm-publish` job in `release.yml` rewrites to the release tag at publish time.
@@ -210,7 +149,8 @@ once the next weekly Dependabot run actually happens, not by static inspection:
 ### Work items
 
 - [ ] After the next weekly Dependabot run, confirm action updates arrive as a single
-      grouped PR and no stray `npm` or `rmcp`-major PRs appear.
+      grouped PR and that no `npm`-ecosystem PRs appear. An rmcp-major PR is now
+      expected rather than stray, since item 1 removed that ignore.
 
 The other half of this item — confirming a workflow/docs/config-only Dependabot PR shows
 the `Test` / `Audit` checks and is mergeable without admin — is no longer open: PR #17

@@ -2,9 +2,10 @@ use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult,
-        ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, CallToolResult, GetPromptRequestParams,
+        GetPromptResponse, Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        ServerCapabilities, ServerInfo,
     },
     tool, tool_router,
 };
@@ -564,6 +565,17 @@ impl ServerHandler for EngramMcpServer {
                 .enable_prompts()
                 .build(),
         )
+        // `InitializeResult::new` defaults `server_info` to `Implementation::from_build_env()`,
+        // which expands `CARGO_CRATE_NAME`/`CARGO_PKG_VERSION` at the time **rmcp itself** is
+        // compiled — not at this crate's compile time. Left alone, every client (Claude
+        // Desktop, Cursor, …) would display this server as "rmcp" / rmcp's own version instead
+        // of "engramo-mcp". Override it explicitly with this crate's own build-env values so
+        // the identity clients see is actually ours. Do not remove this — it looks redundant
+        // with `ServerInfo::new` but isn't.
+        .with_server_info(Implementation::new(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
         .with_instructions(
             "Engram flashcard assistant. Use catalog and card tools to manage flashcards, \
              learning tools to track spaced-repetition progress, and search to find content. \
@@ -587,20 +599,14 @@ impl ServerHandler for EngramMcpServer {
         _ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
         let tools = self.tool_router.list_all();
-        async move {
-            Ok(ListToolsResult {
-                tools,
-                next_cursor: None,
-                meta: None,
-            })
-        }
+        async move { Ok(ListToolsResult::with_all_items(tools)) }
     }
 
     async fn call_tool(
         &self,
         params: CallToolRequestParams,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         self.tool_router
             .call(ToolCallContext::new(self, params, ctx))
             .await
@@ -618,8 +624,10 @@ impl ServerHandler for EngramMcpServer {
         &self,
         params: ReadResourceRequestParams,
         _ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        crate::resources::read(&self.client, params).await
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        crate::resources::read(&self.client, params)
+            .await
+            .map(Into::into)
     }
 
     async fn list_prompts(
@@ -634,8 +642,8 @@ impl ServerHandler for EngramMcpServer {
         &self,
         params: GetPromptRequestParams,
         _ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
-        crate::prompts::get(params)
+    ) -> Result<GetPromptResponse, ErrorData> {
+        crate::prompts::get(params).map(Into::into)
     }
 }
 
@@ -983,6 +991,20 @@ mod tests {
             "{instructions}"
         );
         assert!(instructions.contains("card-schema"), "{instructions}");
+    }
+
+    #[test]
+    fn test_get_info_reports_this_crate_as_server_info_not_rmcp() {
+        // Regression guard: `InitializeResult::new` defaults `server_info` to
+        // `Implementation::from_build_env()`, which resolves to rmcp's own crate name/version
+        // (since those `env!` macros expand when rmcp is compiled) rather than ours. Assert
+        // clients actually see "engramo-mcp" / this crate's version.
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let server_info = server.get_info().server_info;
+        assert_eq!(server_info.name, "engramo-mcp");
+        assert!(!server_info.version.is_empty());
+        assert_eq!(server_info.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

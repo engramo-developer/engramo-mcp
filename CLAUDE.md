@@ -7,7 +7,7 @@ Standalone Rust 2024 binary that exposes the EngrAmo flashcard API to AI clients
 - `engramo-mcp http` — Streamable HTTP at `/` (root) for remote clients (e.g. ChatGPT). Multi-user: each session
   authenticates with its own `Authorization: Bearer <token>`; there is no global token in this mode.
 
-**Stack:** Rust 2024 · rmcp 1.3 · reqwest 0.13 · Tokio · Tracing
+**Stack:** Rust 2024 · rmcp 3 · reqwest 0.13 · Tokio · Tracing
 
 ---
 
