@@ -4,6 +4,23 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >-
+          Dry run — build and exercise every job (including GitHub-release and
+          npm-publish) without publishing anything real. The GitHub release is
+          created as a deletable draft and npm publish runs with --dry-run.
+          Set to false to have a manual run actually publish.
+        type: boolean
+        default: true
+      version:
+        description: >-
+          Version to use for a workflow_dispatch run (e.g. 1.2.0, no leading
+          "v"). Leave empty to fall back to the version in Cargo.toml. Ignored
+          on a tag push, where the version always comes from the tag.
+        type: string
+        required: false
 
 # This workflow holds NPM_TOKEN and publishes signed artifacts, so every job
 # starts from the minimum and opts in to what it needs. Third-party actions are
@@ -13,6 +30,48 @@ permissions:
   contents: read
 
 jobs:
+  # Computes the version and dry_run flag once so every other job can consume
+  # them instead of reading GITHUB_REF_NAME (or the dispatch inputs) directly.
+  # On a tag push GITHUB_REF_NAME is the tag (e.g. "v1.2.0"); on a
+  # workflow_dispatch run it's the branch that was dispatched from (e.g.
+  # "main"), so `${GITHUB_REF_NAME#v}` cannot be used unconditionally without
+  # silently producing "main" as the version on a manual run.
+  resolve:
+    name: Resolve release parameters
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve version and dry_run
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # A real tag push is always a real release.
+            VERSION="${GITHUB_REF_NAME#v}"
+            DRY_RUN="false"
+          else
+            VERSION="$INPUT_VERSION"
+            if [ -z "$VERSION" ]; then
+              VERSION=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+            fi
+            DRY_RUN="$INPUT_DRY_RUN"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not resolve a version (no tag, no input, no Cargo.toml version)"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION dry_run=$DRY_RUN"
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -78,7 +137,7 @@ jobs:
 
   github-release:
     name: GitHub Release
-    needs: build
+    needs: [build, resolve]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -87,8 +146,47 @@ jobs:
         with:
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - name: Verify downloaded artifacts
+        run: |
+          set -euo pipefail
+          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64; do
+            if [ ! -s "$f" ]; then
+              echo "::error::missing or empty artifact: $f"
+              exit 1
+            fi
+          done
+          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64
+
+      # Real tag release: unchanged from before this workflow gained
+      # workflow_dispatch. Same inputs, same behavior.
+      - name: Create GitHub Release
+        if: needs.resolve.outputs.dry_run != 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          generate_release_notes: true
+          files: |
+            engramo-mcp-linux-x64
+            engramo-mcp-linux-arm64
+            engramo-mcp-darwin-arm64
+            engramo-mcp-darwin-x64
+
+      # Dry run: creates a draft release (deletable, not visible to normal
+      # users) so the action, including asset upload, still gets exercised.
+      # tag_name is explicit because a dispatch run has no tag to infer it from.
+      #
+      # It is deliberately NOT `v<version>`: action-gh-release upserts by tag,
+      # so reusing a real version tag would edit the existing published release
+      # of that version rather than create a new draft — and `draft: true`
+      # would then un-publish it. The run id makes the tag unique per run, so a
+      # dry run can never touch a real release. Nothing ever creates this tag;
+      # deleting the draft discards it.
+      - name: Create draft GitHub Release (dry run)
+        if: needs.resolve.outputs.dry_run == 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          tag_name: dry-run-${{ needs.resolve.outputs.version }}-${{ github.run_id }}
+          name: "DRY RUN v${{ needs.resolve.outputs.version }} (run ${{ github.run_id }}) — delete me"
           generate_release_notes: true
           files: |
             engramo-mcp-linux-x64
@@ -98,12 +196,13 @@ jobs:
 
   npm-publish:
     name: Publish to npm
-    needs: build
+    needs: [build, resolve]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       # Required by `npm publish --provenance`: npm exchanges this for a signed
-      # attestation tying each published tarball to this workflow run.
+      # attestation tying each published tarball to this workflow run. Harmless
+      # to keep on a dry run, where --provenance isn't passed.
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -111,6 +210,17 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
+
+      - name: Verify downloaded artifacts
+        run: |
+          set -euo pipefail
+          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64; do
+            if [ ! -s "$f" ]; then
+              echo "::error::missing or empty artifact: $f"
+              exit 1
+            fi
+          done
+          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -120,15 +230,25 @@ jobs:
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-
           declare -A PLATFORMS=(
             ["darwin-arm64"]="engramo-mcp-darwin-arm64"
             ["darwin-x64"]="engramo-mcp-darwin-x64"
             ["linux-arm64"]="engramo-mcp-linux-arm64"
             ["linux-x64"]="engramo-mcp-linux-x64"
           )
+
+          # --provenance requires a real registry interaction and fails/warns
+          # under --dry-run, so it's swapped for --dry-run on a dry run and
+          # kept exactly as-is (--access public --provenance) on a real run.
+          NPM_PUBLISH_FLAGS="--access public"
+          if [ "$DRY_RUN" = "true" ]; then
+            NPM_PUBLISH_FLAGS="$NPM_PUBLISH_FLAGS --dry-run"
+          else
+            NPM_PUBLISH_FLAGS="$NPM_PUBLISH_FLAGS --provenance"
+          fi
 
           for platform in "${!PLATFORMS[@]}"; do
             artifact="${PLATFORMS[$platform]}"
@@ -146,15 +266,23 @@ jobs:
             cp "$artifact" "$pkg_dir/engramo-mcp"
             chmod +x "$pkg_dir/engramo-mcp"
 
-            npm publish "$pkg_dir" --access public --provenance
+            npm publish "$pkg_dir" $NPM_PUBLISH_FLAGS
           done
 
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
           pkg_dir="./npm/engramo-mcp"
+
+          NPM_PUBLISH_FLAGS="--access public"
+          if [ "$DRY_RUN" = "true" ]; then
+            NPM_PUBLISH_FLAGS="$NPM_PUBLISH_FLAGS --dry-run"
+          else
+            NPM_PUBLISH_FLAGS="$NPM_PUBLISH_FLAGS --provenance"
+          fi
 
           # Update version and optionalDependency versions directly
           node -e "
@@ -167,4 +295,4 @@ jobs:
             fs.writeFileSync('$pkg_dir/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
-          npm publish "$pkg_dir" --access public --provenance
+          npm publish "$pkg_dir" $NPM_PUBLISH_FLAGS

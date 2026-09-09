@@ -8,7 +8,7 @@ maintenance rollout).
 | # | Item | Type | Priority | Status |
 |---|---|---|---|---|
 | 1 | rmcp 1.8 → 3.x migration | rework (breaking API) | high | **closed — done** |
-| 2 | Verify `release.yml` after the GitHub Actions major bumps | verification | high (before next release) | static audit DONE; live run still gated on a real tag |
+| 2 | Verify `release.yml` after the GitHub Actions major bumps | verification | high (before next release) | static audit DONE; dry-run path added — open until exercised |
 | 3 | Decide on Dependabot auto-merge for patch/minor | decision | low | **closed — no** |
 | 4 | Confirm the new Dependabot grouping/ignore config behaves on the next weekly run | verification | low | open — waiting on next weekly run |
 
@@ -46,11 +46,19 @@ Two consequences worth carrying forward:
 
 ## 2. Verify `release.yml` after the GitHub Actions major bumps
 
-**Status:** static audit **DONE** (PR #19). A live end-to-end run is still out of scope —
-it would publish `@engramo/mcp` to npm irreversibly, `release.yml` has no
-`workflow_dispatch`, and it triggers only on `push: tags: ['v*']`, so there is no way to
-dry-run the `build` → `github-release` / `npm-publish` chain short of pushing a real tag.
-That is the one line still open below.
+**Status:** static audit **DONE** (PR #19). `release.yml` now also has a `workflow_dispatch`
+dry-run path (this pass): a `resolve` job derives `version`/`dry_run` instead of every job
+reading `GITHUB_REF_NAME` directly, and on a dry run the `github-release` job creates a
+deletable draft release (tagged `dry-run-<version>-<run id>`, never `v<version>` —
+`action-gh-release` upserts by tag, so a real version tag would edit the existing
+published release instead of creating a draft) and
+`npm-publish` runs `npm publish --dry-run` (no `--provenance`) instead of publishing for
+real — so `build` → `github-release` / `npm-publish` can now be exercised end-to-end,
+including `download-artifact@v8` + `merge-multiple: true` (checked by a new verification
+step) and `action-gh-release@v3`'s asset upload, without shipping anything. A real tag push
+is unaffected: `dry_run` resolves to `false` there and every step keeps its exact prior
+inputs. What's still open is actually *running* the dry-run dispatch once and, separately,
+watching a real tag release end-to-end — see work items below.
 
 PR #18 bumped these four release-only actions (SHA-pinned):
 
@@ -90,13 +98,15 @@ was not installed for this pass, per instructions.
 
 ### Work items
 
-- [ ] On the next release tag, watch the `build` → `github-release` / `npm-publish` jobs
-      end-to-end — this is the only way to verify these four actions live, since there's
-      no `workflow_dispatch` to dry-run them.
-- [ ] Confirm `download-artifact@v8` with `merge-multiple: true` still assembles all
-      platform binaries (`engramo-mcp-{linux,darwin}-{arm64,x64}`) into one directory.
-- [ ] Confirm `action-gh-release@v3` still attaches the renamed binaries and generates notes.
-- [ ] If a release is not due soon, consider a throwaway pre-release tag to smoke-test first.
+- [ ] Run `workflow_dispatch` with `dry_run: true` once and confirm: the verification step
+      after `download-artifact@v8` reports all four binaries present and non-empty, a draft
+      GitHub release is created with the four assets attached, and `npm-publish` logs a
+      `--dry-run` publish (no `--provenance`) for all five packages. Delete the draft
+      release afterward — dry runs don't clean up after themselves; it's the one
+      titled "DRY RUN ... delete me".
+- [ ] On the next real release tag, watch `build` → `github-release` / `npm-publish`
+      end-to-end too — the dry run proves the mechanics, but a real tag is still the only
+      way to confirm the actual publish (npm registry, non-draft GitHub release) succeeds.
 
 ---
 
