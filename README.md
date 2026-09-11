@@ -223,6 +223,10 @@ deployment safely serves many users at once (each session's calls to the EngrAmo
 token). Requests without a well-formed, non-empty bearer token are rejected with `401` before a session is
 created, and once a session exists every later request on it must carry the same token that opened it.
 
+`http` mode also serves an unauthenticated `GET /version` that returns `{"name","version"}` (this
+binary's build version, read from `Cargo.toml` at compile time) — handy for deployment health and
+version probes without an MCP handshake.
+
 In ChatGPT: **Settings → Connectors → Advanced → Developer mode**, then add a custom connector pointing at
 your deployment's `https://<host>/`, pasting an EngrAmo API token (from Settings → API Tokens) as the
 bearer token. Once connected, prompts like *"Make me a 10-card Spanish restaurant deck"* or *"Turn this
@@ -250,6 +254,11 @@ storage quotas, and needs no paid EngrAmo plan.
 | `MCP_ALLOWED_HOSTS` | *(unset)* | `http` mode only — extra comma-separated hostnames/`host:port` values to permit, on top of the one derived from `MCP_PUBLIC_URL`. Only needed for extra entry points (e.g. a Cloud Run service's own `*.run.app` fallback URL alongside its custom domain). |
 
 ## Available tools
+
+### Server info
+| Tool | Description |
+|---|---|
+| `get_server_version` | Get this MCP server's own build version (not a catalog/card's `version` field) |
 
 ### Catalogs
 | Tool | Description |

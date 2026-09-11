@@ -48,7 +48,8 @@ impl EngramMcpServer {
     /// `false`, those tools are entirely absent from `tools/list` — the public,
     /// bring-your-own-AI deployment default (`ENGRAM_ENABLE_PAID_AI` unset).
     pub fn new(client: EngramClient, paid_ai_enabled: bool) -> Self {
-        let mut tool_router = Self::catalog_tools_router()
+        let mut tool_router = Self::server_info_tools_router()
+            + Self::catalog_tools_router()
             + Self::card_tools_router()
             + Self::learning_tools_router()
             + Self::learning_path_tools_router()
@@ -62,6 +63,21 @@ impl EngramMcpServer {
             tool_router,
             client,
         }
+    }
+}
+
+// ── Server info tools ─────────────────────────────────────────────────────────
+
+#[tool_router(router = server_info_tools_router)]
+impl EngramMcpServer {
+    #[tool(
+        description = "Get the version of this EngrAmo MCP server binary itself (its build/release \
+        version, e.g. from Cargo.toml) — NOT a catalog's or card's `version` field (an unrelated \
+        per-entity optimistic-locking counter used by update_catalog/update_card). Useful for \
+        diagnosing which server build is deployed or installed; makes no backend API call."
+    )]
+    pub async fn get_server_version(&self) -> Result<CallToolResult, ErrorData> {
+        Ok(ok_json(&crate::version::server_version()))
     }
 }
 
@@ -1066,6 +1082,22 @@ mod tests {
         assert!(!result.is_error.unwrap_or(false));
     }
 
+    #[tokio::test]
+    async fn test_get_server_version_returns_crate_name_and_version() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let result = server.get_server_version().await.unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_NAME")), "{text}");
+    }
+
     #[test]
     fn test_paid_ai_tools_absent_when_flag_off() {
         let client = EngramClient::new("http://localhost", "engram_test");
@@ -1100,6 +1132,7 @@ mod tests {
             let names = tool_names(&server);
             assert!(names.contains(&"list_catalogs".to_string()));
             assert!(names.contains(&"generate_card".to_string()));
+            assert!(names.contains(&"get_server_version".to_string()));
         }
     }
 

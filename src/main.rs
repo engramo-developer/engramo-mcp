@@ -226,6 +226,13 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::get(well_known::protected_resource_metadata),
         )
         .with_state(protected_resource_state)
+        // Unauthenticated by design — it returns only this deployment's public build
+        // version (name + version), nothing user- or token-scoped. Lives on the outer
+        // router so it sits outside `bearer_auth_middleware`, like the `.well-known` route.
+        .route(
+            "/version",
+            axum::routing::get(engramo_mcp::version::version_endpoint),
+        )
         .merge(mcp_router);
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
