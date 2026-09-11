@@ -124,8 +124,22 @@ cargo sort
 
 | Command | Purpose |
 |---|---|
-| `/review` | Rust code review: idioms, performance, antipatterns, security |
-| `/test` | Generate comprehensive tests targeting >90% coverage |
-| `/security` | Security audit: token handling, input validation, panic safety |
-| `/coverage` | Identify uncovered code paths and suggest missing tests |
+| `/review [target] [--iterations N] [--continue]` | Agentic review→fix loop (below). Default target: `.rs` files changed vs `main` |
+| `/release [vX.Y.Z]` | Bump the version (patch +1, or an explicit `vX.Y.Z`), verify, open the bump PR, then tag to publish |
 | `/orchestration` | Orchestrator playbook: drive a multi-phase rollout by spawning one subagent per phase |
+
+### Review loop
+
+`/review` fans out parallel Sonnet reviewers, merges their findings with an Opus synthesis step, fixes them, and
+re-reviews for regressions. Security, coverage, and test writing all run inside this loop — there are no separate
+commands for them.
+
+| Agent (`.claude/agents/`) | Applies skill (`.claude/skills/`) |
+|---|---|
+| `review-rust` | `rust-code-review` — idioms, MCP tool-handler contract, rich text, HTTP client |
+| `review-security` | `security-audit` — tokens, http auth + session binding, panics, leakage |
+| `review-coverage` | `coverage-analysis` — untested branches (skipped on the final pass) |
+| `synthesis-reviewer` | — dedupes and prioritizes into one feedback file |
+| `code-implementator` | `test-generation` — applies fixes, writes tests, runs the full gate |
+
+Feedback files land in `.claude/.review-cache/` (gitignored). Nothing is committed by the loop.
