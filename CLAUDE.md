@@ -17,7 +17,9 @@ Standalone Rust 2024 binary that exposes the EngrAmo flashcard API to AI clients
 src/
 ├── main.rs          — CLI (Stdio/Http subcommands); http mode wires an axum Router (auth
 │                       middleware + task-local bearer token + request body limit) around rmcp's
-│                       StreamableHttpService
+│                       StreamableHttpService, plus an unauthenticated `GET /version` route
+├── version.rs       — server_version() (compile-time Cargo name/version) + the `GET /version`
+│                       handler; reused by the always-on `get_server_version` MCP tool
 ├── lib.rs           — re-exports public modules
 ├── config.rs        — McpConfig: ENGRAM_API_URL (required), ENGRAM_API_TOKEN (optional — required
 │                       only for stdio, see require_token()), ENGRAM_ENABLE_PAID_AI (default off)

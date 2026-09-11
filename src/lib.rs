@@ -8,4 +8,5 @@ pub mod prompts;
 pub mod resources;
 pub mod server;
 pub mod tools;
+pub mod version;
 pub mod well_known;
