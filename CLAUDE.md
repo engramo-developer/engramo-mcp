@@ -102,6 +102,15 @@ Spans must satisfy all five rules or `rich_text` is discarded:
 
 ---
 
+## Git Workflow
+
+- **Never commit directly to `main`.** `main` is push-protected; a direct commit/push will be rejected. Always
+  create a feature/fix branch, push it, and open a PR — even for small fixes like a dependency bump.
+- If a commit is accidentally made on `main`, move it off before doing anything else: `git branch <name>` to
+  capture it, `git reset --hard origin/main` to restore `main`, then `git checkout <name>`.
+
+---
+
 ## Mandatory After Every Code Change
 
 Run in order — fix all issues before moving on:
