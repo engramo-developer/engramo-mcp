@@ -53,14 +53,17 @@ impl AudioEncoder for Mp3Encoder {
 
 /// Transcodes little-endian 16-bit mono PCM to MP3.
 ///
-/// A dangling trailing byte (odd-length input) is silently dropped
-/// (`chunks_exact(2)`). Empty input is not an error: LAME may still emit a
-/// trailing (e.g. VBR/Xing) frame on flush, so this returns `Ok` with whatever
-/// (possibly empty) bytes the encoder produces rather than a synthetic error.
+/// A dangling trailing byte (odd-length input) is silently dropped (the
+/// `as_chunks::<2>()` remainder is ignored). Empty input is not an error: LAME
+/// may still emit a trailing (e.g. VBR/Xing) frame on flush, so this returns
+/// `Ok` with whatever (possibly empty) bytes the encoder produces rather than a
+/// synthetic error.
 pub fn pcm16_mono_to_mp3(pcm_bytes: &[u8], sample_rate: u32) -> Result<Vec<u8>, AudioError> {
     let samples: Vec<i16> = pcm_bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| i16::from_le_bytes(pair))
         .collect();
 
     let mut builder =
