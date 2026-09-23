@@ -3,11 +3,11 @@ use std::sync::Arc;
 use axum::middleware;
 use clap::{Parser, Subcommand};
 use engramo_mcp::{
-    client::EngramClient,
+    client::{EngramClient, HardenedClient},
     config::McpConfig,
     http_auth::{SessionTokens, bearer_auth_middleware, current_bearer_token},
-    server::EngramMcpServer,
-    well_known,
+    server::{EngramMcpServer, build_session_server},
+    tts, well_known,
 };
 use rmcp::{
     ServiceExt,
@@ -118,12 +118,17 @@ fn init_logging() {
 
 /// One process = one user. Reads `ENGRAM_API_TOKEN` from the environment and holds a
 /// single `EngramClient` for the lifetime of the stdio connection (Claude Desktop, Cursor).
+///
+/// Also the **only** place [`tts::from_env`] is ever called — see the `tts` module's doc
+/// comment for why that's a structural, grep-provable guarantee that a Gemini key can never
+/// reach `http` mode.
 async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = McpConfig::from_env().map_err(config_help)?;
     let token = cfg.require_token().map_err(config_help)?;
 
     let client = EngramClient::new(&cfg.api_url, token);
     let server = EngramMcpServer::new(client, cfg.paid_ai_enabled);
+    let server = attach_tts(server, tts::from_env())?;
 
     tracing::info!("Starting Engram MCP server over stdio");
 
@@ -142,6 +147,54 @@ fn config_help(e: engramo_mcp::config::ConfigError) -> String {
     )
 }
 
+/// Wires up local TTS (`list_tts_voices`, `generate_card_audio`) onto a stdio `server` from
+/// the result of [`tts::from_env`]. Pulled out of `run_stdio` (a pure move, no behavior
+/// change) so the three arms — enabled, disabled, misconfigured — are directly testable.
+fn attach_tts(
+    server: EngramMcpServer,
+    tts_cfg: Result<Option<tts::TtsConfig>, tts::TtsConfigError>,
+) -> Result<EngramMcpServer, String> {
+    match tts_cfg {
+        Ok(Some(tts_cfg)) => {
+            let provider = tts_cfg.provider.name();
+            let model = tts_cfg.model.clone();
+            let default_voice = tts_cfg.default_voice.clone();
+            let key_count = tts_cfg.keys.len();
+            // `build_engine` builds its own hardened client (a longer request timeout than
+            // the main EngramClient's, since Gemini synthesis is slower than a typical
+            // EngrAmo API call) — see its doc comment for why callers can no longer supply
+            // one themselves.
+            let engine = tts::build_engine(tts_cfg);
+            let server = server.with_tts(engine);
+            tracing::info!(
+                provider,
+                model = %model,
+                default_voice = %default_voice,
+                key_count,
+                "Local TTS enabled (generate_card_audio, list_tts_voices)"
+            );
+            Ok(server)
+        }
+        Ok(None) => {
+            tracing::debug!("TTS disabled ({} not set)", tts::ENV_KEYS);
+            Ok(server)
+        }
+        Err(e) => {
+            // A misconfigured TTS setup (bad provider/model/voice) should be loud, not
+            // silently disable the feature — the user explicitly opted in by setting
+            // ENGRAM_TTS_GEMINI_API_KEYS, so a typo elsewhere in their TTS config deserves
+            // the same startup-failure treatment as a bad ENGRAM_API_TOKEN.
+            Err(format!(
+                "{e}\n\nCheck your TTS environment variables ({}, {}, {}, {}).",
+                tts::ENV_KEYS,
+                tts::ENV_PROVIDER,
+                tts::ENV_MODEL,
+                tts::ENV_VOICE
+            ))
+        }
+    }
+}
+
 /// Remote entry point: serves the MCP over Streamable HTTP at `/`, deriving a fresh
 /// `EngramClient` per session from the caller's own `Authorization: Bearer <token>` —
 /// there is no global `ENGRAM_API_TOKEN` in this mode (`McpConfig.api_token` is unused).
@@ -149,18 +202,48 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = McpConfig::from_env()
         .map_err(|e| format!("{e}\n\nSet ENGRAM_API_URL before running `engramo-mcp http`."))?;
 
+    // Local TTS is stdio-only (see `tts` module doc comment) — this reads only the env var's
+    // *name*, never its value, and never builds a TtsConfig/engine. This is the only place
+    // `http` mode references the `tts` module at all.
+    if std::env::var_os(tts::ENV_KEYS).is_some() {
+        tracing::warn!(
+            "{} is set but is ignored in http mode — local TTS only runs over stdio, since \
+             the key must never leave the user's machine. Run `engramo-mcp stdio` instead if \
+             you want local TTS.",
+            tts::ENV_KEYS
+        );
+    }
+
+    // Shared across every session's `EngramClient` (see `EngramClient::with_http`) so
+    // concurrent users reuse one connection pool instead of each paying for its own TLS
+    // handshakes. Built by `EngramClient::build_http_client` (not by hand here) so the
+    // no-redirect policy that keeps a session's bearer token from following a 3xx to
+    // another host can't be dropped by a future edit to this function.
+    let http = EngramClient::build_http_client();
+    let app = build_app(&cfg, http);
+
+    let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    tracing::info!(
+        addr = %bind_addr,
+        "Starting Engram MCP server over Streamable HTTP at / — this binds plain HTTP; \
+         bearer tokens are only protected in transit if a TLS-terminating proxy (e.g. \
+         Cloud Run) sits in front of this listener"
+    );
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Builds the `http` mode axum `Router`: the auth-guarded MCP endpoint at `/` (bearer-auth
+/// middleware + `MAX_BODY_BYTES` request body limit + rmcp's `StreamableHttpService`), plus
+/// the unauthenticated `/version` and `/.well-known/oauth-protected-resource` routes. Pulled
+/// out of `run_http` (a pure move, no behavior change) so tests can drive the router directly
+/// with `tower::ServiceExt::oneshot` instead of binding a real listener.
+fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
     let api_url = cfg.api_url.clone();
     let paid_ai_enabled = cfg.paid_ai_enabled;
     let allowed_hosts = cfg.allowed_hosts();
-    // Shared across every session's `EngramClient` (see `EngramClient::with_http`) so
-    // concurrent users reuse one connection pool instead of each paying for its own
-    // TLS handshakes; `EngramClient::new`'s per-instance timeouts still apply since
-    // this is built the same way.
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("reqwest client with static, well-formed config must build");
     let factory = move || {
         let token = current_bearer_token().ok_or_else(|| {
             // Invariant violation: `bearer_auth_middleware` already rejects any
@@ -172,8 +255,12 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::io::Error::other("missing bearer token for this MCP session")
         })?;
-        let client = EngramClient::with_http(http.clone(), &api_url, &token);
-        Ok(EngramMcpServer::new(client, paid_ai_enabled))
+        Ok(build_session_server(
+            &http,
+            &api_url,
+            &token,
+            paid_ai_enabled,
+        ))
     };
 
     // rmcp's `allowed_hosts` defaults to loopback-only (DNS-rebinding protection for
@@ -220,7 +307,7 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
         }),
         authorization_server: cfg.api_url.clone(),
     };
-    let app = axum::Router::new()
+    axum::Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             axum::routing::get(well_known::protected_resource_metadata),
@@ -233,17 +320,124 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
             "/version",
             axum::routing::get(engramo_mcp::version::version_endpoint),
         )
-        .merge(mcp_router);
+        .merge(mcp_router)
+}
 
-    let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    tracing::info!(
-        addr = %bind_addr,
-        "Starting Engram MCP server over Streamable HTTP at / — this binds plain HTTP; \
-         bearer tokens are only protected in transit if a TLS-terminating proxy (e.g. \
-         Cloud Run) sits in front of this listener"
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
-    axum::serve(listener, app).await?;
-    Ok(())
+    fn test_cfg() -> McpConfig {
+        McpConfig::new("http://localhost", None, false).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_http_app_rejects_body_over_max_body_bytes() {
+        // `RequestBodyLimitLayer` does reject a body over `MAX_BODY_BYTES` — it never lets
+        // rmcp buffer the whole oversized body into memory — but because rmcp reads the body
+        // itself (axum's `DefaultBodyLimit` machinery, which would map this to a clean 413,
+        // never reaches a `fallback_service`), the rejection surfaces as a 500 with a
+        // "length limit exceeded" message rather than 413. This pins that real, current
+        // behavior so a regression that instead buffers/accepts the oversized body (e.g. a
+        // layer reordered or dropped) still fails this test.
+        let app = build_app(&test_cfg(), EngramClient::build_http_client());
+        let body = vec![b'a'; MAX_BODY_BYTES + 1];
+        let req = Request::post("/")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "localhost")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        assert!(body_text.contains("length limit exceeded"), "{body_text}");
+    }
+
+    #[tokio::test]
+    async fn test_http_app_version_is_unauthenticated_but_root_requires_bearer() {
+        let app = build_app(&test_cfg(), EngramClient::build_http_client());
+        let v = app
+            .clone()
+            .oneshot(
+                Request::get("/version")
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v.status(), StatusCode::OK);
+
+        let root = app
+            .oneshot(
+                Request::post("/")
+                    .header("host", "localhost")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn test_server() -> EngramMcpServer {
+        let client = EngramClient::new("http://localhost", "engram_test_token");
+        EngramMcpServer::new(client, false)
+    }
+
+    #[test]
+    fn test_attach_tts_none_leaves_server_without_tts_tools() {
+        use rmcp::ServerHandler;
+
+        let server = attach_tts(test_server(), Ok(None)).unwrap();
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(
+            !instructions.contains("generate_card_audio"),
+            "{instructions}"
+        );
+    }
+
+    #[test]
+    fn test_attach_tts_some_registers_engine() {
+        use engramo_mcp::config::Redacted;
+        use rmcp::ServerHandler;
+        use tts::{TtsConfig, TtsProvider};
+
+        let cfg = TtsConfig {
+            provider: TtsProvider::Gemini,
+            keys: vec![Redacted::new("k".to_string())],
+            model: "m".to_string(),
+            default_voice: "Puck".to_string(),
+        };
+        let server = attach_tts(test_server(), Ok(Some(cfg))).unwrap();
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("generate_card_audio"),
+            "{instructions}"
+        );
+    }
+
+    #[test]
+    fn test_attach_tts_err_fails_startup_with_env_var_help() {
+        let result = attach_tts(
+            test_server(),
+            Err(tts::TtsConfigError::UnknownProvider("x".to_string())),
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected attach_tts to fail startup"),
+        };
+        assert!(err.contains(tts::ENV_KEYS), "{err}");
+        assert!(err.contains(tts::ENV_PROVIDER), "{err}");
+        assert!(err.contains(tts::ENV_MODEL), "{err}");
+        assert!(err.contains(tts::ENV_VOICE), "{err}");
+    }
 }

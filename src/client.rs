@@ -48,29 +48,59 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// session task and its connection until the client gives up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A `reqwest::Client` built by [`EngramClient::build_http_client`] — the only way to
+/// construct one outside this module, so [`EngramClient::with_http`] can never be handed a
+/// client that's missing `redirect::Policy::none()`. Without this wrapper, the no-redirect
+/// guarantee for the `X-Api-Key` header (see `build_http_client`'s doc comment) would only be
+/// kept by convention at each call site, and a future refactor could quietly pass
+/// `reqwest::Client::new()` (which follows redirects and forwards the header unchanged)
+/// instead.
+#[derive(Clone)]
+pub struct HardenedClient(Client);
+
 impl EngramClient {
+    /// Builds the `reqwest::Client` every `EngramClient` — stdio's own instance
+    /// ([`Self::new`]) and `http` mode's shared instance (`main.rs::run_http`) — is built
+    /// from. Hardcodes `redirect::Policy::none()`: reqwest's default policy follows up to 10
+    /// redirects and only strips `Authorization`/`Cookie`/`Proxy-Authorization`/
+    /// `WWW-Authenticate` on a cross-host redirect — the custom `X-Api-Key` header used here
+    /// is **not** stripped and would be forwarded verbatim to whatever host a 3xx `Location`
+    /// names (e.g. a misconfigured proxy/CDN, or an open redirect on `ENGRAM_API_URL`). One
+    /// function so both call sites can't drift apart — mirrors
+    /// `tts::gemini::build_http_client`'s reasoning for the Gemini key. Returns a
+    /// [`HardenedClient`], not a plain `Client`, so [`Self::with_http`] can't be handed a
+    /// client built some other way.
+    pub fn build_http_client() -> HardenedClient {
+        HardenedClient(
+            Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client with static, well-formed config must build"),
+        )
+    }
+
     /// Builds an `EngramClient` with its own dedicated `reqwest::Client`. Prefer
     /// [`Self::with_http`] when serving multiple sessions from one process (`http`
     /// mode) so they share a single connection pool instead of each paying for its
     /// own TLS handshakes.
     pub fn new(base_url: impl Into<String>, api_token: impl Into<String>) -> Self {
-        let http = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest client with static, well-formed config must build");
-        Self::with_http(http, base_url, api_token)
+        Self::with_http(Self::build_http_client(), base_url, api_token)
     }
 
-    /// Builds an `EngramClient` from a pre-built, shared `reqwest::Client` — used by
-    /// `http` mode so every session's requests flow through one connection pool.
+    /// Builds an `EngramClient` from a pre-built, shared, hardened `reqwest::Client` — used by
+    /// `http` mode so every session's requests flow through one connection pool. Takes a
+    /// [`HardenedClient`] (only buildable via [`Self::build_http_client`]) rather than a plain
+    /// `reqwest::Client`, so a caller can't accidentally pass one without the no-redirect
+    /// policy the `X-Api-Key` header depends on.
     pub fn with_http(
-        http: Client,
+        http: HardenedClient,
         base_url: impl Into<String>,
         api_token: impl Into<String>,
     ) -> Self {
         Self {
-            http,
+            http: http.0,
             base_url: base_url.into(),
             api_token: api_token.into(),
         }
@@ -279,6 +309,25 @@ impl EngramClient {
     pub async fn delete_card(&self, catalog_id: Uuid, card_id: Uuid) -> Result<(), ApiError> {
         self.delete_ok(&format!("/catalogs/{catalog_id}/cards/{card_id}"))
             .await
+    }
+
+    /// Raw JSON `GET /cards/{id}`, for the local-TTS attach flow (`tools/tts.rs`). Bypasses
+    /// `CardDto` on purpose: that type only models the fields this crate otherwise needs, and
+    /// `face` on the wire also carries fields we don't model (e.g. `tts`, `richText`). Since
+    /// `PATCH /cards/{id}` replaces `face` wholesale, round-tripping through the typed DTO
+    /// would silently drop anything we don't model — see the local-TTS rollout plan §0 R1.
+    pub async fn get_card_raw(&self, card_id: Uuid) -> Result<serde_json::Value, ApiError> {
+        self.get(&format!("/cards/{card_id}")).await
+    }
+
+    /// Raw JSON `PATCH /cards/{id}`, the counterpart to [`Self::get_card_raw`]. Callers build
+    /// `body` from a `get_card_raw` response so unmodelled fields survive the round trip.
+    pub async fn patch_card_raw(
+        &self,
+        card_id: Uuid,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.patch(&format!("/cards/{card_id}"), body).await
     }
 
     // ── Learning ──────────────────────────────────────────────────────────────
@@ -1061,6 +1110,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_card_raw_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .and(header("x-api-key", "engram_test_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(),
+                "version": 3,
+                "orderNumber": 5,
+                "face": {"text": "Q?", "tts": {"voice": "Puck"}},
+                "back": {"text": "A."},
+                "catalogs": [{"id": mock_id()}]
+            })))
+            .mount(&server)
+            .await;
+
+        let raw = client(&server.uri()).get_card_raw(mock_id()).await.unwrap();
+        assert_eq!(raw["version"], json!(3));
+        assert_eq!(raw["face"]["tts"]["voice"], json!("Puck"));
+        assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_card_raw_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({"error": "card not found"})),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .get_card_raw(mock_id())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_patch_card_raw_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .and(header("x-api-key", "engram_test_token"))
+            .and(wiremock::matchers::body_json(json!({
+                "catalogIds": [mock_id()],
+                "orderNumber": 5,
+                "version": 3,
+                "face": {"text": "Q?", "audioId": mock_id()}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(),
+                "version": 4,
+                "face": {"text": "Q?", "audioId": mock_id()},
+                "back": {"text": "A."}
+            })))
+            .mount(&server)
+            .await;
+
+        let body = json!({
+            "catalogIds": [mock_id()],
+            "orderNumber": 5,
+            "version": 3,
+            "face": {"text": "Q?", "audioId": mock_id()}
+        });
+        let updated = client(&server.uri())
+            .patch_card_raw(mock_id(), &body)
+            .await
+            .unwrap();
+        assert_eq!(updated["version"], json!(4));
+        assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_patch_card_raw_conflict() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .patch_card_raw(mock_id(), &json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)));
+    }
+
+    #[tokio::test]
     async fn test_create_catalog_with_cards_success() {
         use crate::dto::{CardContent, CardInput, CreateCatalogWithCardsApiRequest};
         let server = MockServer::start().await;
@@ -1565,6 +1706,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn test_redirect_response_is_not_followed_and_api_key_never_reaches_redirect_target() {
+        let primary = MockServer::start().await;
+        let redirect_target = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/catalogs", redirect_target.uri())),
+            )
+            .mount(&primary)
+            .await;
+        // The redirect target must never be contacted — proves the token doesn't follow the 3xx.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [], "cursor": null
+            })))
+            .mount(&redirect_target)
+            .await;
+
+        let err = client(&primary.uri())
+            .list_catalogs(None, None)
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::BadRequest(msg) => {
+                assert!(msg.contains("redirect"), "{msg}");
+                assert!(msg.contains("ENGRAM_API_URL"), "{msg}");
+            }
+            other => panic!("expected redirect error, got {other:?}"),
+        }
+
+        let redirect_target_requests = redirect_target.received_requests().await.unwrap();
+        assert_eq!(
+            redirect_target_requests.len(),
+            0,
+            "the redirect target must never receive a request — X-Api-Key must not follow a \
+            3xx to another host"
+        );
     }
 
     #[tokio::test]
