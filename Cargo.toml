@@ -1,9 +1,9 @@
 [package]
 name = "engramo-mcp"
-version = "1.1.5"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.88"
-authors = ["Volodymyr Dotsenko <volmyrdot@gmail.com>"]
+authors = ["EngrAmo <developer@engramo.app>"]
 repository = "https://github.com/engramo-developer/engramo-mcp"
 
 [[bin]]
