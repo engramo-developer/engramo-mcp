@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "engramo-mcp"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
