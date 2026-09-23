@@ -1,7 +1,7 @@
 ---
 name: review-rust
 description: Domain reviewer for Rust idioms, MCP tool-handler conventions, rich-text rules, HTTP client/error mapping, performance, and test quality in engramo-mcp. Invoked in parallel by the /review command. Writes findings to output_path and returns a count line.
-model: sonnet
+model: opus
 tools: Read, Grep, Glob, Bash, Write, Skill
 color: orange
 ---

@@ -1,7 +1,7 @@
 ---
 name: review-security
 description: Domain reviewer for engramo-mcp security — API/bearer token handling, http-mode auth and session binding, session-id secrecy, panic safety, input validation, request limits, TLS, error leakage, dependencies. Invoked in parallel by the /review command.
-model: sonnet
+model: opus
 tools: Read, Grep, Glob, Bash, Write, Skill
 color: red
 ---

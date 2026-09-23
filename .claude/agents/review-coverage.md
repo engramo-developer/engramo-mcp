@@ -1,7 +1,7 @@
 ---
 name: review-coverage
 description: Domain reviewer for test coverage gaps in engramo-mcp — untested tool-handler error branches, ApiError mappings, rich-text rules, config, http auth, resources and prompts. Invoked in parallel by the /review command. Skipped on the final regression pass.
-model: sonnet
+model: opus
 tools: Read, Grep, Glob, Bash, Write, Skill
 color: green
 ---
