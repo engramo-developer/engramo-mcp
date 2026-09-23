@@ -30,7 +30,8 @@ src/
 │                       opened it — rmcp authorizes later requests on the session id alone)
 ├── dto.rs           — lightweight DTOs mirroring API JSON shapes
 ├── server.rs        — EngramMcpServer: ServerHandler impl + always-on tool handlers; `new()`
-│                       conditionally sums in `Self::paid_ai_tools_router()` when the flag is on
+│                       conditionally sums in `Self::paid_ai_tools_router()` when the flag is on;
+│                       `with_tts()` separately sums in the local-TTS router (see `tts/` below)
 ├── tools/
 │   ├── mod.rs
 │   ├── catalogs.rs  — ListCatalogsParams, GetCatalogParams, … + ok_json/err_result helpers
@@ -41,9 +42,19 @@ src/
 │   ├── media.rs     — ListMediaParams
 │   ├── generate.rs  — GenerateCardParams, GenerateCatalogWithCardsParams, GenerateCardsParams
 │   │                   (bring-your-own-AI — always on, no server-side generation cost)
-│   └── ai.rs        — feature-flagged paid-AI tools (TTS, translate, dictionary, AI-agent chat,
-│                       translate_batch_import) — own `#[tool_router(router = paid_ai_tools_router)]`
-│                       impl block on `EngramMcpServer`, only registered when ENGRAM_ENABLE_PAID_AI is on
+│   ├── ai.rs        — feature-flagged paid-AI tools (TTS, translate, dictionary, AI-agent chat,
+│   │                   translate_batch_import) — own `#[tool_router(router = paid_ai_tools_router)]`
+│   │                   impl block on `EngramMcpServer`, only registered when ENGRAM_ENABLE_PAID_AI is on
+│   └── tts.rs       — local, bring-your-own-key TTS tools (list_tts_voices, generate_card_audio);
+│                       own `#[tool_router(router = local_tts_tools_router)]` impl block, only
+│                       registered by `EngramMcpServer::with_tts()` — stdio only, see `tts/` below
+├── tts/             — engine-agnostic local TTS layer, **stdio-only** (see the Transport invariant
+│                       below); never wired into `http` mode
+│   ├── mod.rs       — TtsEngine trait, TtsConfig::from_env()/from_lookup(), env var names/defaults
+│   ├── gemini.rs    — GeminiTts: key rotation across ENGRAM_TTS_GEMINI_API_KEYS, voice catalog,
+│   │                   per-key error classification, upstream-text scrubbing
+│   └── mp3.rs       — AudioEncoder seam + pcm16_mono_to_mp3 (statically linked LAME, LGPL-2.0 —
+│                       see THIRD_PARTY_LICENSES)
 ├── resources/
 │   └── mod.rs       — MCP Resources: engram://catalogs, due, stats, learning-paths, subscription, card-schema
 └── prompts/
@@ -78,6 +89,12 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   - `ENGRAM_API_TOKEN` — user's API token (required for `stdio`; unused in `http` mode)
   - `ENGRAM_ENABLE_PAID_AI` — `true`/`1`/`yes`/`on` to register the paid-AI tools (default off)
   - `MCP_BIND_ADDR` — bind address for `http` mode (default `0.0.0.0:8080`)
+  - `ENGRAM_TTS_GEMINI_API_KEYS` — one key or comma-separated list; **stdio only** (see `tts/mod.rs`,
+    read only by `run_stdio`). Unset/blank → both local-TTS tools absent. The generic `GEMINI_API_KEY`
+    is deliberately never read.
+  - `ENGRAM_TTS_PROVIDER` — engine selector, default `gemini` (only value accepted today)
+  - `ENGRAM_TTS_MODEL` — Gemini TTS model id, default `gemini-2.5-flash-preview-tts`
+  - `ENGRAM_TTS_VOICE` — default voice for `generate_card_audio`, default `Puck`
 
 ### Transport
 - **stdio** (default): `cargo run -- stdio` (or no subcommand). One process = one user, `EngramClient` built
@@ -99,6 +116,9 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   `DefaultBodyLimit` does not reach a `fallback_service`.
 - **Never log a session id.** It is credential-equivalent; the default `RUST_LOG` filter silences rmcp's
   session manager and `error_reporting` redacts `session_id` fields.
+- **Local TTS is stdio-only (security):** `tts::from_env()` is called only from `run_stdio`;
+  `build_session_server` has no TTS input; keys are `Redacted` and scrubbed from upstream error text.
+  Never add a code path from http mode to a TTS engine.
 
 ---
 

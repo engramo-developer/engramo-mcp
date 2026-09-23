@@ -121,6 +121,21 @@ jobs:
 
       - name: Build (Linux, zigbuild)
         if: matrix.use_zigbuild
+        # mp3lame-sys vendors LAME and builds it with autotools+cc. cargo-zigbuild
+        # points the C compiler (CC_<target>) at a zig-cc wrapper whose filename
+        # doesn't end in "-cc"/"-gcc", so the `autotools` crate's own heuristic for
+        # inferring `--host` from the compiler's file name never fires and
+        # `./configure` silently runs as a *native* build (assumes CC produces code
+        # for the runner's own arch) while CC actually cross-compiles — breaking
+        # the musl targets. mp3lame-sys reads MP3LAME_SYS_OVERRIDE_HOST and passes
+        # it straight through as `--host=`, bypassing that heuristic entirely; the
+        # Rust target triple is itself a valid GNU host triple here (verified
+        # against the vendored LAME's own config.sub, which recognizes both
+        # "*-unknown-linux-musl" triples unmodified). Not needed for the macOS
+        # targets below: mp3lame-sys's build.rs already special-cases
+        # `target.contains("apple")` and derives the right `--host` itself.
+        env:
+          MP3LAME_SYS_OVERRIDE_HOST: ${{ matrix.target }}
         run: cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Build (macOS)
@@ -265,6 +280,10 @@ jobs:
             # Copy binary and make executable
             cp "$artifact" "$pkg_dir/engramo-mcp"
             chmod +x "$pkg_dir/engramo-mcp"
+
+            # LGPL-2.0 notice for LAME, statically linked into this binary
+            # (see THIRD_PARTY_LICENSES at the repo root).
+            cp THIRD_PARTY_LICENSES "$pkg_dir/THIRD_PARTY_LICENSES"
 
             npm publish "$pkg_dir" $NPM_PUBLISH_FLAGS
           done

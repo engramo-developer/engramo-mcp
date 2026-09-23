@@ -28,8 +28,9 @@ environment's Settings → API Tokens page.
 
 **`ENGRAM_API_URL` vs the MCP server URL — these are not interchangeable.** `ENGRAM_API_URL` is the plain
 EngrAmo backend; it's never something a client connects to directly. In `stdio` config (Claude Desktop,
-Gemini CLI, Cursor below), the client sets `ENGRAM_API_URL` **together with** `ENGRAM_API_TOKEN`, since the
-locally-launched binary calls the backend itself. In `http`/remote config (Antigravity remote, ChatGPT), the
+Claude Code, Codex, VS Code, Cursor, Windsurf, Gemini CLI, Antigravity stdio below), the client sets
+`ENGRAM_API_URL` **together with** `ENGRAM_API_TOKEN`, since the locally-launched binary calls the backend
+itself. In `http`/remote config (Antigravity remote, ChatGPT), the
 client instead points `serverUrl` at the MCP server's own URL (`mcp.engramo.app` / `mcp-engramo.volmyr.com`
 above) and authenticates separately per session — via OAuth by default, or a static `Authorization: Bearer`
 header if you'd rather skip the login prompt. `ENGRAM_API_URL` still matters in `http` mode, but only as an
@@ -51,9 +52,27 @@ engramo-mcp --version
 
 > Alternatively, skip installation entirely and use `npx -y @engramo/mcp` in your client config — npm will download the binary automatically on first use.
 
+## Choosing a client
+
+Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key) needs a `stdio`
+(locally launched) connection, so remote-only clients never get it.
+
+| Client | Models | Local TTS | Setup |
+|---|---|---|---|
+| Claude Desktop | Claude | ✅ | [Claude Desktop](#claude-desktop) — recommended for non-technical users: the free plan supports local MCP servers, and setup is one JSON file (Settings → Developer → Edit Config) |
+| Claude Code | Claude | ✅ | [Claude Code](#claude-code) |
+| Codex (CLI / IDE extension) | OpenAI models — sign in with your ChatGPT account | ✅ | [Codex](#codex) |
+| VS Code (GitHub Copilot) | GPT / Claude / Gemini | ✅ | [VS Code](#vs-code-github-copilot-agent-mode) |
+| Cursor | GPT / Claude / Gemini | ✅ | [Cursor](#cursor) |
+| Windsurf | GPT / Claude / Gemini | ✅ | [Windsurf](#windsurf) |
+| Gemini CLI | Gemini | ✅ | [Gemini CLI](#gemini-cli) |
+| Antigravity | Gemini / Claude / GPT | ✅ stdio / ❌ remote | [Antigravity](#antigravity) |
+| ChatGPT | OpenAI models | ❌ — remote connector only; local TTS intentionally unavailable | [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http) |
+
 ## Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
+Open **Settings → Developer → Edit Config**, or edit the file directly:
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
 `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 **Using npx** (no prior installation needed):
@@ -65,12 +84,174 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
       "args": ["-y", "@engramo/mcp"],
       "env": {
         "ENGRAM_API_URL": "https://api.engramo.app",
+        "ENGRAM_API_TOKEN": "your-token",
+        "ENGRAM_TTS_GEMINI_API_KEYS": "your-gemini-key"
+      }
+    }
+  }
+}
+```
+
+`ENGRAM_TTS_GEMINI_API_KEYS` is optional — it enables `list_tts_voices`/`generate_card_audio` using your own
+Gemini quota; omit the line to disable. See [Text-to-speech](#text-to-speech-bring-your-own-key).
+
+**Using a global install** (`npm install -g @engramo/mcp`):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engramo-mcp",
+      "env": {
+        "ENGRAM_API_URL": "https://api.engramo.app",
         "ENGRAM_API_TOKEN": "your-token"
       }
     }
   }
 }
 ```
+
+After editing, fully quit Claude Desktop (⌘Q on macOS — closing the window isn't enough) and reopen it.
+If the server doesn't show up, check the logs at `~/Library/Logs/Claude/mcp-server-engram.log` (macOS) or
+`%APPDATA%\Claude\logs\` (Windows). The Gemini key is never logged.
+
+## Claude Code
+
+Register the server once for all your projects (`--scope user`):
+
+```bash
+claude mcp add engram --scope user \
+  -e ENGRAM_API_URL=https://api.engramo.app \
+  -e ENGRAM_API_TOKEN=your-token \
+  -e ENGRAM_TTS_GEMINI_API_KEYS=your-gemini-key \
+  -- npx -y @engramo/mcp
+```
+
+`ENGRAM_TTS_GEMINI_API_KEYS` is optional — it enables `list_tts_voices`/`generate_card_audio` using your own
+Gemini quota; omit the `-e ENGRAM_TTS_GEMINI_API_KEYS=…` line to disable. See
+[Text-to-speech](#text-to-speech-bring-your-own-key).
+
+With a global install, replace `npx -y @engramo/mcp` with `engramo-mcp`.
+
+## Codex
+
+The OpenAI Codex CLI and the Codex IDE extension share one config file, `~/.codex/config.toml`. This is the
+way to use your ChatGPT account's models **with** local TTS (the ChatGPT app's remote connector can't have it):
+
+**Using npx** (no prior installation needed):
+```toml
+[mcp_servers.engram]
+command = "npx"
+args = ["-y", "@engramo/mcp"]
+tool_timeout_sec = 300  # default 60s; a 20-card generate_card_audio batch can take longer
+env = { ENGRAM_API_URL = "https://api.engramo.app", ENGRAM_API_TOKEN = "your-token", ENGRAM_TTS_GEMINI_API_KEYS = "your-gemini-key" }
+```
+
+`ENGRAM_TTS_GEMINI_API_KEYS` is optional — it enables `list_tts_voices`/`generate_card_audio` using your own
+Gemini quota; omit it from `env` to disable. See [Text-to-speech](#text-to-speech-bring-your-own-key).
+
+**Using a global install** (`npm install -g @engramo/mcp`):
+```toml
+[mcp_servers.engram]
+command = "engramo-mcp"
+env = { ENGRAM_API_URL = "https://api.engramo.app", ENGRAM_API_TOKEN = "your-token" }
+```
+
+## VS Code (GitHub Copilot agent mode)
+
+Add to `.vscode/mcp.json` (workspace), or run **MCP: Open User Configuration** from the Command Palette for a
+user-wide config. Use `inputs` with `"password": true` so VS Code prompts for the secrets and stores them
+itself instead of you writing them into the file. Note the top-level key is `servers` (not `mcpServers`):
+
+**Using npx** (no prior installation needed):
+```json
+{
+  "inputs": [
+    { "type": "promptString", "id": "engramo-token", "description": "EngrAmo API token", "password": true },
+    { "type": "promptString", "id": "gemini-key", "description": "Gemini API key (for TTS)", "password": true }
+  ],
+  "servers": {
+    "engram": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@engramo/mcp"],
+      "env": {
+        "ENGRAM_API_URL": "https://api.engramo.app",
+        "ENGRAM_API_TOKEN": "${input:engramo-token}",
+        "ENGRAM_TTS_GEMINI_API_KEYS": "${input:gemini-key}"
+      }
+    }
+  }
+}
+```
+
+`ENGRAM_TTS_GEMINI_API_KEYS` is optional — it enables `list_tts_voices`/`generate_card_audio` using your own
+Gemini quota; omit the line (and the `gemini-key` input) to disable. See
+[Text-to-speech](#text-to-speech-bring-your-own-key).
+
+With a global install, use `"command": "engramo-mcp"` and drop `args`.
+
+## Cursor
+
+Add to `~/.cursor/mcp.json`:
+
+**Using npx** (no prior installation needed):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "npx",
+      "args": ["-y", "@engramo/mcp"],
+      "env": {
+        "ENGRAM_API_URL": "https://api.engramo.app",
+        "ENGRAM_API_TOKEN": "your-token",
+        "ENGRAM_TTS_GEMINI_API_KEYS": "your-gemini-key"
+      }
+    }
+  }
+}
+```
+
+`ENGRAM_TTS_GEMINI_API_KEYS` is optional — it enables `list_tts_voices`/`generate_card_audio` using your own
+Gemini quota; omit the line to disable. See [Text-to-speech](#text-to-speech-bring-your-own-key).
+
+**Using a global install** (`npm install -g @engramo/mcp`):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engramo-mcp",
+      "env": {
+        "ENGRAM_API_URL": "https://api.engramo.app",
+        "ENGRAM_API_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+## Windsurf
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+**Using npx** (no prior installation needed):
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "npx",
+      "args": ["-y", "@engramo/mcp"],
+      "env": {
+        "ENGRAM_API_URL": "https://api.engramo.app",
+        "ENGRAM_API_TOKEN": "your-token",
+        "ENGRAM_TTS_GEMINI_API_KEYS": "your-gemini-key"
+      }
+    }
+  }
+}
+```
+
+`ENGRAM_TTS_GEMINI_API_KEYS` is optional — it enables `list_tts_voices`/`generate_card_audio` using your own
+Gemini quota; omit the line to disable. See [Text-to-speech](#text-to-speech-bring-your-own-key).
 
 **Using a global install** (`npm install -g @engramo/mcp`):
 ```json
@@ -100,47 +281,16 @@ Add to `~/.gemini/settings.json`:
       "args": ["-y", "@engramo/mcp"],
       "env": {
         "ENGRAM_API_URL": "https://api.engramo.app",
-        "ENGRAM_API_TOKEN": "your-token"
+        "ENGRAM_API_TOKEN": "your-token",
+        "ENGRAM_TTS_GEMINI_API_KEYS": "your-gemini-key"
       }
     }
   }
 }
 ```
 
-**Using a global install** (`npm install -g @engramo/mcp`):
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "command": "engramo-mcp",
-      "env": {
-        "ENGRAM_API_URL": "https://api.engramo.app",
-        "ENGRAM_API_TOKEN": "your-token"
-      }
-    }
-  }
-}
-```
-
-## Cursor
-
-Add to `~/.cursor/mcp.json`:
-
-**Using npx** (no prior installation needed):
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "command": "npx",
-      "args": ["-y", "@engramo/mcp"],
-      "env": {
-        "ENGRAM_API_URL": "https://api.engramo.app",
-        "ENGRAM_API_TOKEN": "your-token"
-      }
-    }
-  }
-}
-```
+`ENGRAM_TTS_GEMINI_API_KEYS` is optional — it enables `list_tts_voices`/`generate_card_audio` using your own
+Gemini quota; omit the line to disable. See [Text-to-speech](#text-to-speech-bring-your-own-key).
 
 **Using a global install** (`npm install -g @engramo/mcp`):
 ```json
@@ -206,6 +356,9 @@ If you'd rather use a static token instead (no OAuth login prompt), add `headers
 }
 ```
 
+Text-to-speech is unavailable over the remote transport — use the stdio config above if you want
+`generate_card_audio`.
+
 ## Use in ChatGPT (remote MCP over Streamable HTTP)
 
 `engramo-mcp` also runs as a **remote** server, so it can be added to ChatGPT as a custom connector (developer
@@ -233,6 +386,10 @@ bearer token. Once connected, prompts like *"Make me a 10-card Spanish restauran
 conversation into flashcards"* call `generate_catalog_with_cards` directly; open the result at
 `https://study.engramo.app/catalog/<shortId>` to study it.
 
+> `generate_card_audio` is never available through a ChatGPT connector — it's a remote connection, and local
+> [text-to-speech](#text-to-speech-bring-your-own-key) is `stdio`-only by design. To use your ChatGPT
+> account's models with local TTS, use [Codex](#codex) instead.
+
 > A published, one-click ChatGPT App (OAuth login instead of a pasted token) is planned but not yet available
 > — see the project tracker for status.
 
@@ -252,6 +409,10 @@ storage quotas, and needs no paid EngrAmo plan.
 | `MCP_BIND_ADDR` | `0.0.0.0:8080` | Bind address for `http` mode |
 | `MCP_PUBLIC_URL` | *(unset)* | `http` mode only — this deployment's own public URL (bare origin, no path — the endpoint is served at `/`), e.g. `https://mcp.engramo.app`. Also allowlists that host for inbound requests; without it, every request is rejected (see `MCP_ALLOWED_HOSTS`). |
 | `MCP_ALLOWED_HOSTS` | *(unset)* | `http` mode only — extra comma-separated hostnames/`host:port` values to permit, on top of the one derived from `MCP_PUBLIC_URL`. Only needed for extra entry points (e.g. a Cloud Run service's own `*.run.app` fallback URL alongside its custom domain). |
+| `ENGRAM_TTS_GEMINI_API_KEYS` | *(unset → TTS tools absent)* | **`stdio` only.** Your own Gemini API key, or a comma-separated list. Enables `list_tts_voices`/`generate_card_audio`. Ignored (with a startup warning) in `http` mode — see [Text-to-speech](#text-to-speech-bring-your-own-key) below. |
+| `ENGRAM_TTS_PROVIDER` | `gemini` | **`stdio` only.** TTS engine selector. Only `gemini` is supported today; an unrecognized value fails startup. |
+| `ENGRAM_TTS_MODEL` | `gemini-2.5-flash-preview-tts` | **`stdio` only.** Gemini TTS model id. |
+| `ENGRAM_TTS_VOICE` | `Puck` | **`stdio` only.** Default voice used when a `generate_card_audio` call doesn't specify one. |
 
 ## Available tools
 
@@ -312,6 +473,15 @@ storage quotas, and needs no paid EngrAmo plan.
 | `generate_catalog_with_cards` | Create a catalog with cards in one call — same bring-your-own-AI model |
 | `generate_cards` | Add multiple cards to an existing catalog — same bring-your-own-AI model |
 
+### Text-to-speech (stdio, opt-in)
+Only present when `ENGRAM_TTS_GEMINI_API_KEYS` is set (`stdio` mode only) — see
+[Text-to-speech](#text-to-speech-bring-your-own-key) below.
+
+| Tool | Description |
+|---|---|
+| `list_tts_voices` | List the configured TTS engine, model, default voice, and available voices. No network call. |
+| `generate_card_audio` | Synthesize speech for the FACE side of up to 20 cards, upload it to your own media, and attach it — using your own Gemini key/quota |
+
 ## Rich cards: dictionary, styling, images, audio
 
 Beyond plain text, a card's `face`/`back` can carry:
@@ -321,19 +491,79 @@ Beyond plain text, a card's `face`/`back` can carry:
 | `dictionary` | Word → translation map, rendered as clickable highlights in the app |
 | `rich_text` | Styled spans (bold, color, monospace) within the text |
 | `style` | Font/color/background/alignment for the whole face or back |
-| `audio_id` | Your own audio (a recording, a clip from your own TTS) — upload it with `upload_media` first |
+| `audio_id` | Your own audio (a recording, a clip from your own TTS) — upload it with `upload_media` first, or set it automatically by calling `generate_card_audio` (`stdio` only, see below) |
 | `visual_id` + `visual_type` | Your own image/video, same pattern as `audio_id` |
 
 A catalog can also have `image_id` (cover image) set the same way. None of this needs a paid EngrAmo
-plan — dictionary/translation are done by the calling model, and audio/images are entirely
-bring-your-own via `upload_media` (max ~10MB per file). See `engram://card-schema` for the full
-schema and four worked examples, and [`docs/prompt-examples.md`](docs/prompt-examples.md) for
-ready-to-paste prompts covering all of this end to end.
+plan — dictionary/translation are done by the calling model, images are entirely bring-your-own via
+`upload_media` (max ~10MB per file), and face audio is either bring-your-own the same way or
+generated locally with your own TTS key via `generate_card_audio`. See `engram://card-schema` for
+the full schema and four worked examples, and [`docs/prompt-examples.md`](docs/prompt-examples.md)
+for ready-to-paste prompts covering all of this end to end.
 
 **Adding a lot of cards/media at once?** `upload_media` is one file per call, fine for a handful of
 files through a chat client. For bulk imports (many cards, many audio files, in one request) see
 [`docs/bulk-import.md`](docs/bulk-import.md) — a direct API recipe for CLI/scripted use (Claude
 Code, a terminal, a script), not a chat-driven MCP tool.
+
+## Text-to-speech (bring your own key)
+
+Set `ENGRAM_TTS_GEMINI_API_KEYS` and two extra tools appear: `list_tts_voices` and
+`generate_card_audio`. Given a list of card ids, `generate_card_audio` synthesizes speech for each
+card's **face** text with Gemini TTS, encodes it to MP3, uploads it to your own EngrAmo media, and
+attaches it as that card's `audio_id` — the same place a manually recorded `upload_media` file would
+go, just done for you.
+
+**`stdio` only, and on purpose.** The key is read once, locally, from your own machine's
+environment and is never sent to EngrAmo or logged. In `http` mode the server is a shared,
+multi-tenant deployment — there is no per-session place to put a secret key that stays on the
+caller's machine — so `ENGRAM_TTS_GEMINI_API_KEYS` is read only by `stdio`; in `http` mode it is
+ignored entirely (with a startup warning naming the variable, never its value) and neither tool is
+registered.
+
+**Why a namespaced variable instead of the standard `GEMINI_API_KEY`?** `GEMINI_API_KEY` is the
+de-facto standard name set by the Gemini CLI, Google's own SDKs, and many developers' shell
+profiles. If `engramo-mcp` read it too, a key already sitting in your environment for an unrelated
+tool could silently start spending itself the moment you ran `engramo-mcp stdio`. `engramo-mcp`
+**never reads `GEMINI_API_KEY`** — only the explicit, namespaced `ENGRAM_TTS_GEMINI_API_KEYS` opts
+you in.
+
+**Whose quota does this spend?** Yours, not EngrAmo's. This is a different mechanism from the paid
+`generate_tts_for_cards` tool (`ENGRAM_ENABLE_PAID_AI`), which spends EngrAmo's own metered TTS
+quota — `generate_card_audio` spends only your own Gemini API quota/billing, same as if you'd called
+Gemini directly.
+
+**Multiple keys / rotation.** `ENGRAM_TTS_GEMINI_API_KEYS` accepts a comma-separated list. On each
+synthesis call the keys are tried in a random order; a key that's rate-limited, rejected (invalid or
+revoked), or hits a transient error is skipped in favor of the next one, so one bad key in the list
+doesn't fail the whole call.
+
+**Limits.** Up to 20 cards per `generate_card_audio` call, up to 500 characters of face text per
+card (longer cards are skipped, not truncated). Cards that already have face audio are skipped
+unless you pass `overwrite: true`, in which case the previous audio becomes unreferenced and is
+cleaned up server-side. Call `list_tts_voices` first to see the configured model and voice catalog.
+
+**Getting a key.** Create one for free at [Google AI Studio](https://aistudio.google.com/apikey).
+
+**Where the key goes.** Every `stdio` client section above shows the exact place for
+`ENGRAM_TTS_GEMINI_API_KEYS` — see [Choosing a client](#choosing-a-client). It's always one more entry
+next to `ENGRAM_API_TOKEN` in the server's `env`:
+```json
+"env": {
+  "ENGRAM_API_URL": "https://api.engramo.app",
+  "ENGRAM_API_TOKEN": "your-token",
+  "ENGRAM_TTS_GEMINI_API_KEYS": "your-gemini-key"
+}
+```
+
+**Quick check.** Ask the assistant to call `list_tts_voices`. If the tool is missing, the key isn't set
+(or the client wasn't restarted) or the client is using a remote connection.
+
+## Third-party licenses
+
+The prebuilt binaries distributed via npm statically link [LAME](https://lame.sourceforge.io/)
+(LGPL-2.0) for the MP3 encoding `generate_card_audio` uses. See
+[`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) for the full notice and source-availability terms.
 
 ## Resources and Prompts
 

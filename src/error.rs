@@ -63,10 +63,39 @@ impl ApiError {
     /// This is the single place that converts HTTP semantics into typed errors.
     pub async fn from_response(response: reqwest::Response) -> Self {
         let status = response.status();
+        // Must be read before `response.text()` consumes the response body below.
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let body = response.text().await.unwrap_or_default();
 
         match status.as_u16() {
             401 => Self::Unauthorized,
+            300..=399 => {
+                // The client hardcodes `redirect::Policy::none()` (see
+                // `EngramClient::build_http_client`) so the API key is never forwarded to an
+                // arbitrary `Location`. A 3xx here is a routine config mistake (e.g.
+                // `ENGRAM_API_URL=http://…` being redirected to `https://…`), not a backend
+                // failure — log at WARN, not ERROR, so it doesn't page as an incident.
+                //
+                // Redact once and reuse the same value for the log and the client-facing
+                // message: the raw `Location` can carry userinfo or a query string (e.g. a
+                // signed URL, `?token=…`) that must never reach stderr/Cloud Logging or the
+                // MCP client.
+                let location = location.as_deref().map(redact_location);
+                tracing::warn!(status = %status, location = ?location, "Engram API responded with a redirect (not followed)");
+                Self::BadRequest(format!(
+                    "Engram API responded with a redirect (HTTP {status}{}); redirects are not \
+                     followed so the API key is never forwarded. Check ENGRAM_API_URL (e.g. use \
+                     https:// or the final host directly).",
+                    location
+                        .as_deref()
+                        .map(|l| format!(" to {l}"))
+                        .unwrap_or_default()
+                ))
+            }
             403 => Self::PermissionDenied(extract_error_message(&body)),
             404 => Self::NotFound(extract_error_message(&body)),
             409 => Self::Conflict(
@@ -116,6 +145,41 @@ impl ApiError {
             }
         }
     }
+}
+
+/// Redacts a redirect `Location` before it is echoed to the caller or written to logs — a
+/// redirect target can embed userinfo (`user:pass@host`) or a sensitive query string (e.g. a
+/// signed URL's `?token=…`), and this value is both logged (WARN) and surfaced to the MCP
+/// client. Strips userinfo, drops the query string and fragment, and caps the result length
+/// so a maliciously long `Location` can't bloat logs or the tool response.
+fn redact_location(location: &str) -> String {
+    const MAX_LOCATION_LEN: usize = 256;
+    const DUMMY_HOST: &str = "redacted.invalid";
+    fn scrub(mut u: reqwest::Url) -> reqwest::Url {
+        let _ = u.set_username("");
+        let _ = u.set_password(None);
+        u.set_query(None);
+        u.set_fragment(None);
+        u
+    }
+    let redacted = match reqwest::Url::parse(location) {
+        Ok(u) => scrub(u).to_string(),
+        // Relative reference: let the WHATWG parser (which strips tab/newline and treats
+        // '\' as '/') decide whether there is an authority — never a string heuristic. A
+        // hand-rolled check on the raw string can be bypassed by characters the parser
+        // strips (e.g. a tab) before it ever sees an authority.
+        Err(_) => {
+            match reqwest::Url::parse("https://redacted.invalid/").and_then(|b| b.join(location)) {
+                // Path-only reference: no authority, so echo just the parsed path — never the
+                // raw input, since the parser may have normalized tabs/backslashes in it.
+                Ok(u) if u.host_str() == Some(DUMMY_HOST) => u.path().to_string(),
+                // Network-path reference: authority parsed, userinfo stripped.
+                Ok(u) => scrub(u).to_string(),
+                Err(_) => "<unparseable Location>".to_string(),
+            }
+        }
+    };
+    redacted.chars().take(MAX_LOCATION_LEN).collect()
 }
 
 /// Extract a human-readable message from a JSON `{ "error": "..." }` body.
@@ -304,6 +368,171 @@ mod tests {
         let err = ApiError::from_response(resp).await;
 
         assert!(matches!(err, ApiError::Internal));
+    }
+
+    #[tokio::test]
+    async fn test_from_response_redirect_is_bad_request_with_actionable_message() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("Location", "https://api.example.com/catalogs?token=secret"),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let err = ApiError::from_response(resp).await;
+
+        match err {
+            ApiError::BadRequest(msg) => {
+                assert!(msg.contains("redirect"), "{msg}");
+                assert!(msg.contains("ENGRAM_API_URL"), "{msg}");
+                assert!(msg.contains("https://api.example.com/catalogs"), "{msg}");
+                assert!(!msg.contains("token=secret"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_redact_location_strips_query_and_fragment() {
+        assert_eq!(
+            redact_location("https://x.example.com/path?token=abc"),
+            "https://x.example.com/path"
+        );
+        assert_eq!(
+            redact_location("https://x.example.com/path#frag"),
+            "https://x.example.com/path"
+        );
+        assert_eq!(
+            redact_location("https://x.example.com/path"),
+            "https://x.example.com/path"
+        );
+    }
+
+    #[test]
+    fn test_redact_location_strips_userinfo() {
+        assert_eq!(
+            redact_location("https://user:pass@h/p?token=s#f"),
+            "https://h/p"
+        );
+    }
+
+    #[test]
+    fn test_redact_location_relative_falls_back_to_cutting_at_query_or_fragment() {
+        assert_eq!(redact_location("/catalogs?token=secret"), "/catalogs");
+        assert_eq!(redact_location("/catalogs#frag"), "/catalogs");
+        assert_eq!(redact_location("/catalogs"), "/catalogs");
+    }
+
+    #[test]
+    fn test_redact_location_network_path_reference_strips_userinfo() {
+        assert_eq!(redact_location("//user:pass@h/p?t=s"), "https://h/p");
+    }
+
+    #[test]
+    fn test_redact_location_backslash_network_path_strips_userinfo() {
+        assert_eq!(redact_location("\\\\user:pass@h/p"), "https://h/p");
+    }
+
+    #[test]
+    fn test_redact_location_invalid_port_strips_userinfo() {
+        assert_eq!(
+            redact_location("https://user:pass@h:99999/p"),
+            "<unparseable Location>"
+        );
+    }
+
+    #[test]
+    fn test_redact_location_tab_bypass_still_strips_userinfo() {
+        let redacted = redact_location("/\t/user:pass@h/p?t=1");
+        assert!(!redacted.contains("user:pass"), "{redacted}");
+        assert_eq!(redacted, "https://h/p");
+    }
+
+    #[test]
+    fn test_redact_location_relative_path_without_leading_slash() {
+        assert_eq!(redact_location("catalogs?token=x"), "/catalogs");
+    }
+
+    #[test]
+    fn test_redact_location_caps_length() {
+        let long = format!("https://h/{}", "a".repeat(1000));
+        let redacted = redact_location(&long);
+        assert_eq!(redacted.chars().count(), 256);
+    }
+
+    #[tokio::test]
+    async fn test_from_response_redirect_logs_redacted_location_without_token() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Minimal in-memory tracing writer so we can assert on what the WARN log actually
+        // contains, without pulling in a new dev-dependency for this one test.
+        #[derive(Clone, Default)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for BufWriter {
+            type Writer = Self;
+            fn make_writer(&'w self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(301).insert_header(
+                "Location",
+                "https://user:pass@api.example.com/catalogs?token=secret",
+            ))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let _ = ApiError::from_response(resp).await;
+
+        drop(_guard);
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("token=secret"), "{logged}");
+        assert!(!logged.contains("user:pass"), "{logged}");
+        assert!(
+            logged.contains("https://api.example.com/catalogs"),
+            "{logged}"
+        );
     }
 
     #[tokio::test]

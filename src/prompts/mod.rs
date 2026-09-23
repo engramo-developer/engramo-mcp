@@ -241,8 +241,12 @@ fn create_language_deck(
              `audio_id`/`visual_id` (cards) or `image_id` (catalog) to the returned `media_id` \
              before your final generate call — never fabricate a UUID. If they don't have media \
              yet, create the deck now and offer to add it afterward once they do (via `update_card` \
-             for audio/images on existing cards). More worked examples, including a full deck \
-             walkthrough, are in `docs/prompt-examples.md` in the engramo-mcp repo."
+             for audio/images on existing cards). If generate_card_audio is available (the user has \
+             configured their own TTS key), you can instead voice the face side of the newly \
+             created cards after the deck exists, by calling generate_card_audio with their ids — \
+             still no paid AI, since that spends only the user's own Gemini quota. More worked \
+             examples, including a full deck walkthrough, are in `docs/prompt-examples.md` in the \
+             engramo-mcp repo."
     ))])
 }
 
@@ -484,6 +488,7 @@ mod tests {
         if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("upload_media"), "{text}");
             assert!(text.contains("No paid AI"), "{text}");
+            assert!(text.contains("generate_card_audio"), "{text}");
             assert!(
                 !text.to_lowercase().contains("generate_tts_for_cards"),
                 "{text}"

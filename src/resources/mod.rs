@@ -128,6 +128,9 @@ The user already recorded their own voice for this card's face and gave you the 
 `upload_media` first (content_base64 of the recording, content_type=\"audio/mpeg\") and got back
 media_id \"3fa85f64-5717-4562-b3fc-2c963f66afa6\" — use that value for `audio_id` below. Never
 invent a UUID; only use one actually returned by `upload_media`.
+(A face's `audioId` can also be set this same way by the generate_card_audio tool, when it's
+available — it synthesizes speech locally with the user's own TTS key, uploads it, and attaches it
+for you, so you don't need to call upload_media yourself in that case.)
 
 {
   \"face\": {

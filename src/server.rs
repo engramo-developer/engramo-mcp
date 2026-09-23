@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -35,10 +37,17 @@ use crate::tools::media::{
     ListMediaParams, MAX_UPLOAD_BASE64_LEN, MAX_UPLOAD_BYTES, UploadMediaParams,
 };
 use crate::tools::search::SearchParams;
+use crate::tts::TtsEngine;
 use uuid::Uuid;
 
 pub struct EngramMcpServer {
     pub(crate) client: EngramClient,
+    /// Local, bring-your-own-key TTS engine (`tools/tts.rs`). `None` unless `with_tts` was
+    /// called — which only `run_stdio` (`main.rs`) ever does. `http` mode's session factory
+    /// (`build_session_server`, below) never calls it, so a session built there can never
+    /// reach a TTS engine or the user's Gemini key, regardless of what's in the process
+    /// environment. See `tts` module doc comment for the full structural argument.
+    pub(crate) tts: Option<Arc<dyn TtsEngine>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -47,6 +56,11 @@ impl EngramMcpServer {
     /// dictionary, AI-agent chat — see `tools/ai.rs`) is registered at all. When
     /// `false`, those tools are entirely absent from `tools/list` — the public,
     /// bring-your-own-AI deployment default (`ENGRAM_ENABLE_PAID_AI` unset).
+    ///
+    /// Local TTS (`tools/tts.rs`) is never registered here — call [`Self::with_tts`]
+    /// afterwards to add it. This signature is unchanged on purpose: `http` mode's session
+    /// factory calls this (via [`build_session_server`]) and must have no way to end up with
+    /// a TTS engine.
     pub fn new(client: EngramClient, paid_ai_enabled: bool) -> Self {
         let mut tool_router = Self::server_info_tools_router()
             + Self::catalog_tools_router()
@@ -62,8 +76,34 @@ impl EngramMcpServer {
         Self {
             tool_router,
             client,
+            tts: None,
         }
     }
+
+    /// Registers the local TTS tools (`list_tts_voices`, `generate_card_audio`) and stores
+    /// `engine` for their handlers to use. Only ever called from `attach_tts` (`main.rs`,
+    /// reached only via `run_stdio`) — see the `tts` module doc comment for why that's a
+    /// structural guarantee, not just a convention.
+    pub fn with_tts(mut self, engine: Arc<dyn TtsEngine>) -> Self {
+        self.tool_router += Self::local_tts_tools_router();
+        self.tts = Some(engine);
+        self
+    }
+}
+
+/// Builds the `EngramMcpServer` for one `http`-mode session from that session's own bearer
+/// token. Extracted out of the session factory closure in `build_app` (`main.rs`) so it can be unit
+/// tested directly without going through axum/rmcp plumbing (rollout plan R8). Deliberately
+/// has **no** TTS parameter and never calls [`EngramMcpServer::with_tts`] — see the `tts`
+/// module doc comment. Behaviour is otherwise identical to what the closure did before.
+pub fn build_session_server(
+    http: &crate::client::HardenedClient,
+    api_url: &str,
+    token: &str,
+    paid_ai_enabled: bool,
+) -> EngramMcpServer {
+    let client = EngramClient::with_http(http.clone(), api_url, token);
+    EngramMcpServer::new(client, paid_ai_enabled)
 }
 
 // ── Server info tools ─────────────────────────────────────────────────────────
@@ -529,7 +569,9 @@ impl EngramMcpServer {
         `audio_id`/`visual_id` on a card's face/back, or as `image_id` for a catalog cover, via \
         generate_card/generate_catalog_with_cards/generate_cards/update_card. This does NOT \
         generate audio or images itself — EngrAmo has no server-side TTS/image generation in this \
-        flow; the caller must already have the file. Max ~10MB after decoding. \
+        flow; the caller must already have the file. For generated speech, use \
+        generate_card_audio instead if it's available (stdio mode with your own TTS key). \
+        Max ~10MB after decoding. \
         If you use a shell/code tool to prepare content_base64: prefer standard line-wrapped \
         `base64` output over `-w 0`/`--wrap=0` (a single unbroken multi-KB line can break some \
         tool-output pipelines), and encode directly to stdout in one step rather than writing to \
@@ -574,6 +616,31 @@ impl EngramMcpServer {
 
 impl ServerHandler for EngramMcpServer {
     fn get_info(&self) -> ServerInfo {
+        let mut instructions = String::from(
+            "Engram flashcard assistant. Use catalog and card tools to manage flashcards, \
+             learning tools to track spaced-repetition progress, and search to find content. \
+             Cards can carry more than plain text — a dictionary (word translations), rich_text/style \
+             (font, color, per-side styling), and your own audio/images via upload_media (bring your \
+             own recording or picture; no paid AI is used for any of this, ever). \
+             Every tool taking a catalog_id needs the real UUID, never the ~8-character short ID \
+             shown in the app/URL (e.g. \"A7KX9QM2\") — if the user gives you a short ID, resolve it \
+             first with search_catalogs/search_global (it's indexed, so this is fast and usually \
+             returns one exact match), don't page through list_catalogs guessing. \
+             Resources expose live data (catalogs, due cards, stats) and engram://card-schema documents \
+             all of the above with worked examples. \
+             Prompts guide you through review sessions, flashcard creation (including \
+             create_language_deck for styled, translated, dictionary-annotated decks), and study planning.",
+        );
+        if self.tts.is_some() {
+            // Only true when the user configured their own TTS key (ENGRAM_TTS_GEMINI_API_KEYS,
+            // stdio-only — see `with_tts`/`tts` module doc comment): still no paid AI, since this
+            // spends the user's own Gemini quota, never EngrAmo's.
+            instructions.push_str(
+                " You also have your own TTS key configured: generate_card_audio can voice a \
+                 card's face side (use list_tts_voices first to see the configured model and \
+                 voice catalog) — this still spends only your own Gemini quota, not EngrAmo's.",
+            );
+        }
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -592,21 +659,7 @@ impl ServerHandler for EngramMcpServer {
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(
-            "Engram flashcard assistant. Use catalog and card tools to manage flashcards, \
-             learning tools to track spaced-repetition progress, and search to find content. \
-             Cards can carry more than plain text — a dictionary (word translations), rich_text/style \
-             (font, color, per-side styling), and your own audio/images via upload_media (bring your \
-             own recording or picture; no paid AI is used for any of this, ever). \
-             Every tool taking a catalog_id needs the real UUID, never the ~8-character short ID \
-             shown in the app/URL (e.g. \"A7KX9QM2\") — if the user gives you a short ID, resolve it \
-             first with search_catalogs/search_global (it's indexed, so this is fast and usually \
-             returns one exact match), don't page through list_catalogs guessing. \
-             Resources expose live data (catalogs, due cards, stats) and engram://card-schema documents \
-             all of the above with worked examples. \
-             Prompts guide you through review sessions, flashcard creation (including \
-             create_language_deck for styled, translated, dictionary-annotated decks), and study planning.",
-        )
+        .with_instructions(instructions)
     }
 
     fn list_tools(
@@ -668,7 +721,10 @@ impl ServerHandler for EngramMcpServer {
 /// Strip characters the LLM should not embed in card text:
 /// - Control characters (tabs, carriage returns, …) — newline is kept intentionally.
 /// - Emoji Unicode blocks.
-fn sanitize_text(s: &str) -> String {
+///
+/// `pub(crate)` so `tools/tts.rs`'s `generate_card_audio` can sanitize `face.text` before
+/// synthesis, the same way `normalize_card_content` does for card creation/update.
+pub(crate) fn sanitize_text(s: &str) -> String {
     s.chars()
         .filter(|&c| (!c.is_control() || c == '\n') && !is_emoji_char(c))
         .collect()
@@ -982,6 +1038,18 @@ mod tests {
         "translate_batch_import",
     ];
 
+    // Local, bring-your-own-key TTS tools (`tools/tts.rs`) — gated purely by whether
+    // `with_tts` was called, never by `ENGRAM_ENABLE_PAID_AI`.
+    const LOCAL_TTS_TOOL_NAMES: [&str; 2] = ["list_tts_voices", "generate_card_audio"];
+
+    fn fake_tts_engine() -> std::sync::Arc<dyn crate::tts::TtsEngine> {
+        std::sync::Arc::new(crate::tts::gemini::GeminiTts::new(
+            "gemini-2.5-flash-preview-tts".to_string(),
+            "Puck".to_string(),
+            vec![crate::config::Redacted::new("test-key".to_string())],
+        ))
+    }
+
     fn tool_names(server: &EngramMcpServer) -> Vec<String> {
         server
             .tool_router
@@ -1007,6 +1075,43 @@ mod tests {
             "{instructions}"
         );
         assert!(instructions.contains("card-schema"), "{instructions}");
+    }
+
+    #[test]
+    fn test_get_info_instructions_omit_tts_mention_without_tts_engine() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(
+            !instructions.contains("generate_card_audio"),
+            "{instructions}"
+        );
+        // The blanket "no paid AI" guarantee must still hold regardless of TTS configuration.
+        assert!(
+            instructions.contains("no paid AI is used for any of this, ever"),
+            "{instructions}"
+        );
+    }
+
+    #[test]
+    fn test_get_info_instructions_mention_tts_when_engine_configured() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false).with_tts(fake_tts_engine());
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("generate_card_audio"),
+            "{instructions}"
+        );
+        assert!(instructions.contains("list_tts_voices"), "{instructions}");
+        assert!(
+            instructions.contains("no paid AI is used for any of this, ever"),
+            "{instructions}"
+        );
+        // Still true and worth restating: local TTS spends the user's own Gemini quota.
+        assert!(
+            instructions.contains("your own Gemini quota"),
+            "{instructions}"
+        );
     }
 
     #[test]
@@ -1122,6 +1227,62 @@ mod tests {
                 "expected {tool} to be registered when ENGRAM_ENABLE_PAID_AI is on"
             );
         }
+    }
+
+    #[test]
+    fn test_local_tts_tools_absent_by_default() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false);
+        let names = tool_names(&server);
+        for tool in LOCAL_TTS_TOOL_NAMES {
+            assert!(
+                !names.contains(&tool.to_string()),
+                "expected {tool} to be ABSENT until with_tts is called"
+            );
+        }
+        assert!(server.tts.is_none());
+    }
+
+    #[test]
+    fn test_local_tts_tools_present_after_with_tts() {
+        let client = EngramClient::new("http://localhost", "engram_test");
+        let server = EngramMcpServer::new(client, false).with_tts(fake_tts_engine());
+        let names = tool_names(&server);
+        for tool in LOCAL_TTS_TOOL_NAMES {
+            assert!(
+                names.contains(&tool.to_string()),
+                "expected {tool} to be registered after with_tts"
+            );
+        }
+        assert!(server.tts.is_some());
+    }
+
+    #[test]
+    fn test_local_tts_tools_absent_via_build_session_server_paid_ai_off() {
+        let http = EngramClient::build_http_client();
+        let server = build_session_server(&http, "http://localhost", "session-token", false);
+        let names = tool_names(&server);
+        for tool in LOCAL_TTS_TOOL_NAMES {
+            assert!(
+                !names.contains(&tool.to_string()),
+                "http-mode session must never see {tool}, regardless of process env"
+            );
+        }
+        assert!(server.tts.is_none());
+    }
+
+    #[test]
+    fn test_local_tts_tools_absent_via_build_session_server_paid_ai_on() {
+        let http = EngramClient::build_http_client();
+        let server = build_session_server(&http, "http://localhost", "session-token", true);
+        let names = tool_names(&server);
+        for tool in LOCAL_TTS_TOOL_NAMES {
+            assert!(
+                !names.contains(&tool.to_string()),
+                "http-mode session must never see {tool}, even with paid_ai_enabled on"
+            );
+        }
+        assert!(server.tts.is_none());
     }
 
     #[test]

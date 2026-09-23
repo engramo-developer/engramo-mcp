@@ -86,7 +86,9 @@ impl MediaTools {
         `audio_id`/`visual_id` on a card's face/back, or as `image_id` for a catalog cover, via \
         generate_card/generate_catalog_with_cards/generate_cards/update_card. This does NOT \
         generate audio or images itself — EngrAmo has no server-side TTS/image generation in this \
-        flow; the caller must already have the file. Max ~10MB after decoding. \
+        flow; the caller must already have the file. For generated speech, use \
+        generate_card_audio instead if it's available (stdio mode with your own TTS key). \
+        Max ~10MB after decoding. \
         If you use a shell/code tool to prepare content_base64: prefer standard line-wrapped \
         `base64` output over `-w 0`/`--wrap=0` (a single unbroken multi-KB line can break some \
         tool-output pipelines), and encode directly to stdout in one step rather than writing to \
