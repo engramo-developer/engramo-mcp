@@ -30,16 +30,16 @@ impl std::ops::Deref for Redacted<String> {
 
 #[derive(Debug, Clone)]
 pub struct McpConfig {
-    /// Base URL of the Engram REST API (e.g. "https://api.engram.dev")
+    /// Base URL of the Engramo REST API (e.g. "https://api.engram.dev")
     pub api_url: String,
-    /// User's API token (starts with "engram_"). Required for `stdio` mode
+    /// User's API token (starts with "engramo_"). Required for `stdio` mode
     /// (one server process = one user). `None` in `http` mode, where each
     /// session supplies its own bearer token — see `require_token`. Wrapped in
     /// [`Redacted`] so it can never reach a log line through a `?`-sigil
     /// tracing field or a `{:?}` format — see `error_reporting::ErrorReportingLayer`.
     pub api_token: Option<Redacted<String>>,
     /// Whether the paid-AI tool router (TTS, translation, dictionary, AI-agent
-    /// chat) is registered. Loaded from `ENGRAM_ENABLE_PAID_AI` (default `false`).
+    /// chat) is registered. Loaded from `ENGRAMO_ENABLE_PAID_AI` (default `false`).
     pub paid_ai_enabled: bool,
     /// This server's own canonical public URL (e.g. `https://mcp.engramo.app`),
     /// used only by `http` mode's `.well-known/oauth-protected-resource` route
@@ -66,12 +66,12 @@ impl McpConfig {
         let api_url = api_url.into();
 
         if api_url.is_empty() {
-            return Err(ConfigError::EmptyVar("ENGRAM_API_URL"));
+            return Err(ConfigError::EmptyVar("ENGRAMO_API_URL"));
         }
         if let Some(ref token) = api_token
             && token.is_empty()
         {
-            return Err(ConfigError::EmptyVar("ENGRAM_API_TOKEN"));
+            return Err(ConfigError::EmptyVar("ENGRAMO_API_TOKEN"));
         }
 
         let api_url = api_url.trim_end_matches('/').to_string();
@@ -125,12 +125,12 @@ impl McpConfig {
     /// Load configuration from environment variables.
     ///
     /// Required:
-    /// - `ENGRAM_API_URL`
+    /// - `ENGRAMO_API_URL`
     ///
     /// Optional:
-    /// - `ENGRAM_API_TOKEN` — required by `stdio` mode only (see `require_token`);
+    /// - `ENGRAMO_API_TOKEN` — required by `stdio` mode only (see `require_token`);
     ///   ignored by `http` mode, which derives a client token per session.
-    /// - `ENGRAM_ENABLE_PAID_AI` — `true`/`1`/`yes`/`on` to enable the paid-AI
+    /// - `ENGRAMO_ENABLE_PAID_AI` — `true`/`1`/`yes`/`on` to enable the paid-AI
     ///   tools; defaults to `false`.
     /// - `MCP_PUBLIC_URL` — this server's own canonical public URL; only read by
     ///   `http` mode's OAuth protected-resource metadata route.
@@ -138,9 +138,9 @@ impl McpConfig {
     ///   for the `http` mode inbound `Host`-header allowlist (see `allowed_hosts`).
     pub fn from_env() -> Result<Self, ConfigError> {
         let api_url =
-            env::var("ENGRAM_API_URL").map_err(|_| ConfigError::MissingVar("ENGRAM_API_URL"))?;
-        let api_token = env::var("ENGRAM_API_TOKEN").ok();
-        let paid_ai_enabled = env::var("ENGRAM_ENABLE_PAID_AI")
+            env_or_legacy("ENGRAMO_API_URL").ok_or(ConfigError::MissingVar("ENGRAMO_API_URL"))?;
+        let api_token = env_or_legacy("ENGRAMO_API_TOKEN");
+        let paid_ai_enabled = env_or_legacy("ENGRAMO_ENABLE_PAID_AI")
             .map(|v| parse_bool_flag(&v))
             .unwrap_or(false);
         let cfg = Self::new(api_url, api_token, paid_ai_enabled)?;
@@ -165,7 +165,7 @@ impl McpConfig {
     pub fn require_token(&self) -> Result<&str, ConfigError> {
         self.api_token
             .as_deref()
-            .ok_or(ConfigError::MissingVar("ENGRAM_API_TOKEN"))
+            .ok_or(ConfigError::MissingVar("ENGRAMO_API_TOKEN"))
     }
 }
 
@@ -181,6 +181,22 @@ fn authority_from_url(url: &str) -> Option<String> {
     } else {
         Some(authority.to_string())
     }
+}
+
+/// Reads `new` (an `ENGRAMO_*` var), falling back to its pre-rebrand `ENGRAM_*` name when `new`
+/// is unset — so an existing deployment's config doesn't silently break on upgrade. Emits a
+/// `warn!` naming only the variable, never its value, when the legacy fallback is used.
+///
+/// `pub(crate)` and taking `&str` (not `&'static str`) so `tts::from_env` (`tts/mod.rs`) can
+/// reuse it as the `from_lookup` callback instead of duplicating this fallback logic — the two
+/// callers must never derive the legacy name or word the `warn!` differently.
+pub(crate) fn env_or_legacy(new: &str) -> Option<String> {
+    env::var(new).ok().or_else(|| {
+        let legacy = new.replacen("ENGRAMO_", "ENGRAM_", 1);
+        let v = env::var(&legacy).ok()?;
+        tracing::warn!(legacy, new, "deprecated env var in use; rename it");
+        Some(v)
+    })
 }
 
 /// Parses a truthy env-var string (`"1"`, `"true"`, `"yes"`, `"on"`, case-insensitive,
@@ -209,12 +225,12 @@ mod tests {
     fn test_new_success() {
         let cfg = McpConfig::new(
             "https://api.engram.dev",
-            Some("engram_abc123".to_string()),
+            Some("engramo_abc123".to_string()),
             false,
         )
         .unwrap();
         assert_eq!(cfg.api_url, "https://api.engram.dev");
-        assert_eq!(cfg.api_token.as_deref(), Some("engram_abc123"));
+        assert_eq!(cfg.api_token.as_deref(), Some("engramo_abc123"));
         assert!(!cfg.paid_ai_enabled);
     }
 
@@ -222,7 +238,7 @@ mod tests {
     fn test_new_trailing_slash_stripped() {
         let cfg = McpConfig::new(
             "https://api.engram.dev/",
-            Some("engram_abc123".to_string()),
+            Some("engramo_abc123".to_string()),
             false,
         )
         .unwrap();
@@ -233,7 +249,7 @@ mod tests {
     fn test_new_multiple_trailing_slashes_stripped() {
         let cfg = McpConfig::new(
             "https://api.engram.dev///",
-            Some("engram_abc123".to_string()),
+            Some("engramo_abc123".to_string()),
             false,
         )
         .unwrap();
@@ -242,16 +258,16 @@ mod tests {
 
     #[test]
     fn test_new_empty_url() {
-        let err = McpConfig::new("", Some("engram_abc123".to_string()), false).unwrap_err();
-        assert!(matches!(err, ConfigError::EmptyVar("ENGRAM_API_URL")));
-        assert!(err.to_string().contains("ENGRAM_API_URL"));
+        let err = McpConfig::new("", Some("engramo_abc123".to_string()), false).unwrap_err();
+        assert!(matches!(err, ConfigError::EmptyVar("ENGRAMO_API_URL")));
+        assert!(err.to_string().contains("ENGRAMO_API_URL"));
     }
 
     #[test]
     fn test_new_empty_token() {
         let err = McpConfig::new("https://api.engram.dev", Some(String::new()), false).unwrap_err();
-        assert!(matches!(err, ConfigError::EmptyVar("ENGRAM_API_TOKEN")));
-        assert!(err.to_string().contains("ENGRAM_API_TOKEN"));
+        assert!(matches!(err, ConfigError::EmptyVar("ENGRAMO_API_TOKEN")));
+        assert!(err.to_string().contains("ENGRAMO_API_TOKEN"));
     }
 
     #[test]
@@ -264,31 +280,31 @@ mod tests {
     fn test_require_token_present() {
         let cfg = McpConfig::new(
             "https://api.engram.dev",
-            Some("engram_abc123".to_string()),
+            Some("engramo_abc123".to_string()),
             false,
         )
         .unwrap();
-        assert_eq!(cfg.require_token().unwrap(), "engram_abc123");
+        assert_eq!(cfg.require_token().unwrap(), "engramo_abc123");
     }
 
     #[test]
     fn test_require_token_missing() {
         let cfg = McpConfig::new("https://api.engram.dev", None, false).unwrap();
         let err = cfg.require_token().unwrap_err();
-        assert!(matches!(err, ConfigError::MissingVar("ENGRAM_API_TOKEN")));
+        assert!(matches!(err, ConfigError::MissingVar("ENGRAMO_API_TOKEN")));
     }
 
     #[test]
     fn test_missing_var_display() {
-        let err = ConfigError::MissingVar("ENGRAM_API_URL");
-        assert!(err.to_string().contains("ENGRAM_API_URL"));
+        let err = ConfigError::MissingVar("ENGRAMO_API_URL");
+        assert!(err.to_string().contains("ENGRAMO_API_URL"));
         assert!(err.to_string().contains("not set"));
     }
 
     #[test]
     fn test_empty_var_display() {
-        let err = ConfigError::EmptyVar("ENGRAM_API_TOKEN");
-        assert!(err.to_string().contains("ENGRAM_API_TOKEN"));
+        let err = ConfigError::EmptyVar("ENGRAMO_API_TOKEN");
+        assert!(err.to_string().contains("ENGRAMO_API_TOKEN"));
         assert!(err.to_string().contains("empty"));
     }
 
@@ -393,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_redacted_debug_never_prints_the_wrapped_value() {
-        let r = Redacted::new("engram_super_secret".to_string());
+        let r = Redacted::new("engramo_super_secret".to_string());
         let rendered = format!("{r:?}");
         assert_eq!(rendered, "[REDACTED]");
     }
@@ -402,12 +418,12 @@ mod tests {
     fn test_debug_redacts_api_token() {
         let cfg = McpConfig::new(
             "https://api.engram.dev",
-            Some("engram_super_secret".to_string()),
+            Some("engramo_super_secret".to_string()),
             false,
         )
         .unwrap();
         let rendered = format!("{cfg:?}");
-        assert!(!rendered.contains("engram_super_secret"), "{rendered}");
+        assert!(!rendered.contains("engramo_super_secret"), "{rendered}");
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
 
@@ -419,22 +435,57 @@ mod tests {
 
     #[test]
     fn test_from_env_parses_mcp_allowed_hosts() {
-        // SAFETY: test-only env mutation, serialized by the process-wide env lock
-        // pattern already used by other from_env tests in this module... this is
-        // the first one that needs MCP_ALLOWED_HOSTS specifically, set/cleared
-        // within the same test to avoid leaking into others.
+        // SAFETY: test-only env mutation, serialized by `ENV_LOCK` — this module's other
+        // `from_env` test also mutates `ENGRAMO_API_URL`.
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe {
-            std::env::set_var("ENGRAM_API_URL", "https://api.engram.dev");
+            std::env::set_var("ENGRAMO_API_URL", "https://api.engram.dev");
             std::env::set_var("MCP_ALLOWED_HOSTS", "example.com, foo.example.com:9000 ,,");
         }
         let cfg = McpConfig::from_env().unwrap();
         unsafe {
-            std::env::remove_var("ENGRAM_API_URL");
+            std::env::remove_var("ENGRAMO_API_URL");
             std::env::remove_var("MCP_ALLOWED_HOSTS");
         }
         assert_eq!(
             cfg.extra_allowed_hosts,
             vec!["example.com", "foo.example.com:9000"]
         );
+    }
+
+    /// Serializes this module's `from_env` tests, which mutate process-wide env vars
+    /// (`std::env::set_var`/`remove_var`) and would otherwise race under `cargo test`'s
+    /// default multi-threaded runner.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_from_env_reads_renamed_engramo_vars_and_missing_url() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("ENGRAMO_API_URL");
+            std::env::remove_var("ENGRAMO_API_TOKEN");
+            std::env::remove_var("ENGRAMO_ENABLE_PAID_AI");
+            std::env::remove_var("ENGRAM_API_URL");
+            std::env::remove_var("ENGRAM_API_TOKEN");
+            std::env::remove_var("ENGRAM_ENABLE_PAID_AI");
+        }
+        let err = McpConfig::from_env().unwrap_err();
+        assert!(matches!(err, ConfigError::MissingVar("ENGRAMO_API_URL")));
+
+        unsafe {
+            std::env::set_var("ENGRAMO_API_URL", "https://api.engram.dev/");
+            std::env::set_var("ENGRAMO_API_TOKEN", "engramo_tok");
+            std::env::set_var("ENGRAMO_ENABLE_PAID_AI", "yes");
+        }
+        let cfg = McpConfig::from_env();
+        unsafe {
+            std::env::remove_var("ENGRAMO_API_URL");
+            std::env::remove_var("ENGRAMO_API_TOKEN");
+            std::env::remove_var("ENGRAMO_ENABLE_PAID_AI");
+        }
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.api_url, "https://api.engram.dev");
+        assert_eq!(cfg.require_token().unwrap(), "engramo_tok");
+        assert!(cfg.paid_ai_enabled);
     }
 }

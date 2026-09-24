@@ -1,4 +1,4 @@
-/// Lightweight DTOs for the Engram API responses.
+/// Lightweight DTOs for the Engramo API responses.
 /// These mirror the API's JSON shapes but only include fields the MCP server actually uses.
 /// They have NO dependency on the `db` crate.
 use serde::{Deserialize, Serialize};

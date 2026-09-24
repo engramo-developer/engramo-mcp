@@ -1,9 +1,9 @@
 //! Local, bring-your-own-key TTS tools — `stdio` mode only (see `tts::from_env`'s doc
 //! comment and `server::build_session_server`, which never wires this router in). This is a
 //! **separate** router from `tools/ai.rs`'s `paid_ai_tools_router`: that one spends
-//! EngrAmo's own paid quota and is gated by `ENGRAM_ENABLE_PAID_AI`; this one spends the
-//! user's own Gemini quota and is gated purely by whether `EngramMcpServer::with_tts` was
-//! called (i.e. whether `ENGRAM_TTS_GEMINI_API_KEYS` was set at startup).
+//! EngrAmo's own paid quota and is gated by `ENGRAMO_ENABLE_PAID_AI`; this one spends the
+//! user's own Gemini quota and is gated purely by whether `EngramoMcpServer::with_tts` was
+//! called (i.e. whether `ENGRAMO_TTS_GEMINI_API_KEYS` was set at startup).
 //!
 //! `list_tts_voices` is a cheap, no-network way for the calling model to see the configured
 //! engine/model/voice before a synthesis batch. `generate_card_audio` does the real work:
@@ -19,9 +19,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::client::EngramClient;
+use crate::client::EngramoClient;
 use crate::error::ApiError;
-use crate::server::{EngramMcpServer, sanitize_text};
+use crate::server::{EngramoMcpServer, sanitize_text};
 use crate::tools::catalogs::{err_result, ok_json, parse_uuid};
 use crate::tts::mp3::{AudioEncoder, Mp3Encoder};
 use crate::tts::{TtsEngine, TtsRequest, check_lang, check_voice};
@@ -266,7 +266,7 @@ fn short_id(id: Uuid) -> String {
 /// re-fetched face text no longer matches it, a concurrent edit changed the sentence out from
 /// under the synthesized audio, so the stale audio is refused rather than attached.
 async fn attach_media(
-    client: &EngramClient,
+    client: &EngramoClient,
     card_id: Uuid,
     parsed: ParsedCard,
     synthesized_text: &str,
@@ -374,7 +374,7 @@ async fn attach_media(
 /// this function, but the same discipline is kept here so a panic never has to cross a
 /// `spawn`ed task boundary).
 async fn process_card(
-    client: EngramClient,
+    client: EngramoClient,
     engine: Arc<dyn TtsEngine>,
     card_id: Uuid,
     voice: String,
@@ -471,17 +471,17 @@ async fn process_card(
 }
 
 #[tool_router(router = local_tts_tools_router, vis = "pub(crate)")]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(
         description = "List the voices available for generate_card_audio, along with the \
         currently configured TTS engine, model, and default voice. No network call. Only \
-        available when the user has configured their own TTS key (ENGRAM_TTS_GEMINI_API_KEYS) \
+        available when the user has configured their own TTS key (ENGRAMO_TTS_GEMINI_API_KEYS) \
         — this uses the user's own Gemini quota, never EngrAmo's."
     )]
     pub async fn list_tts_voices(&self) -> Result<CallToolResult, ErrorData> {
         let Some(engine) = self.tts.as_ref() else {
             return Ok(err_result(
-                "TTS is not configured — set ENGRAM_TTS_GEMINI_API_KEYS (stdio mode only) to \
+                "TTS is not configured — set ENGRAMO_TTS_GEMINI_API_KEYS (stdio mode only) to \
                 enable generate_card_audio and list_tts_voices.",
             ));
         };
@@ -504,7 +504,7 @@ impl EngramMcpServer {
     #[tool(
         description = "Generate spoken audio for the FACE side of up to 20 flashcards, upload \
         it to your EngrAmo media, and attach it to each card. Uses YOUR OWN locally-configured \
-        TTS key (ENGRAM_TTS_GEMINI_API_KEYS) — this spends your own Gemini quota, never \
+        TTS key (ENGRAMO_TTS_GEMINI_API_KEYS) — this spends your own Gemini quota, never \
         EngrAmo's paid AI. Cards that already have face audio are skipped unless overwrite is \
         true, in which case the previous audio asset becomes unused and is cleaned up \
         server-side. Cards with empty face text, face text over 500 characters, or no catalog \
@@ -519,7 +519,7 @@ impl EngramMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let Some(engine) = self.tts.clone() else {
             return Ok(err_result(
-                "TTS is not configured — set ENGRAM_TTS_GEMINI_API_KEYS (stdio mode only) to \
+                "TTS is not configured — set ENGRAMO_TTS_GEMINI_API_KEYS (stdio mode only) to \
                 enable generate_card_audio and list_tts_voices.",
             ));
         };
@@ -670,19 +670,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_tts_voices_without_engine_returns_error() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let result = server.list_tts_voices().await.unwrap();
         assert!(result.is_error.unwrap_or(false));
         let text = result_text(&result);
         assert!(text.contains("TTS is not configured"), "{text}");
-        assert!(text.contains("ENGRAM_TTS_GEMINI_API_KEYS"), "{text}");
+        assert!(text.contains("ENGRAMO_TTS_GEMINI_API_KEYS"), "{text}");
     }
 
     #[tokio::test]
     async fn test_list_tts_voices_returns_catalog() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false).with_tts(fake_engine());
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false).with_tts(fake_engine());
         let result = server.list_tts_voices().await.unwrap();
         assert!(!result.is_error.unwrap_or(false));
         let text = result_text(&result);
@@ -809,8 +809,8 @@ mod tests {
         }
     }
 
-    fn server_with_engine(base_url: &str, engine: Arc<dyn TtsEngine>) -> EngramMcpServer {
-        EngramMcpServer::new(EngramClient::new(base_url, "engram_test"), false).with_tts(engine)
+    fn server_with_engine(base_url: &str, engine: Arc<dyn TtsEngine>) -> EngramoMcpServer {
+        EngramoMcpServer::new(EngramoClient::new(base_url, "engramo_test"), false).with_tts(engine)
     }
 
     fn card_json(
@@ -2048,7 +2048,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_card_audio_no_engine_is_error_no_requests() {
         let server = MockServer::start().await;
-        let srv = EngramMcpServer::new(EngramClient::new(server.uri(), "t"), false);
+        let srv = EngramoMcpServer::new(EngramoClient::new(server.uri(), "t"), false);
         let result = srv
             .generate_card_audio(Parameters(GenerateCardAudioParams {
                 card_ids: vec![Uuid::new_v4().to_string()],

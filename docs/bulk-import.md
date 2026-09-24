@@ -58,7 +58,7 @@ A JSON array of cards, referencing media by filename (which must exist inside th
 
 Each `face`/`back` side supports: `text` (required), `audioFileName`, `imageFileName`,
 `videoFileName` (all reference files by name inside the zip), `dictionary`, `style` — same fields
-as a regular card, per `engram://card-schema` in the MCP server. No server-side translation or TTS
+as a regular card, per `engramo://card-schema` in the MCP server. No server-side translation or TTS
 happens on this endpoint; every piece of content must already be provided. (For a smaller batch —
 up to 20 cards, face side only — the MCP server's own `generate_card_audio` tool can synthesize
 audio locally with your own TTS key instead of pre-generating files for this endpoint; see the
@@ -71,7 +71,7 @@ README's "Text-to-speech" section.)
 zip -j deck.zip index.json card1_face.mp3 card1_back.mp3 card2_face.mp3 card2_back.mp3
 
 curl -X POST https://api.engramo.app/catalogs/batch-import \
-  -H "Authorization: Bearer $ENGRAM_API_TOKEN" \
+  -H "Authorization: Bearer $ENGRAMO_API_TOKEN" \
   -F 'catalog_metadata={"name":"Ordering Coffee","tags":["spanish"]};type=application/json' \
   -F "content_file=@deck.zip;type=application/zip"
 ```

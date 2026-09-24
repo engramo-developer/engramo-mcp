@@ -7,7 +7,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use crate::client::EngramClient;
+use crate::client::EngramoClient;
 use crate::dto::CreateLearningPathRequest;
 use crate::tools::catalogs::{err_result, ok_json, ok_text, parse_uuid};
 
@@ -41,14 +41,14 @@ pub struct ActivateLearningPathParams {
 
 #[derive(Clone)]
 pub struct LearningPathTools {
-    pub client: EngramClient,
+    pub client: EngramoClient,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl LearningPathTools {
-    pub fn new(client: EngramClient) -> Self {
+    pub fn new(client: EngramoClient) -> Self {
         Self {
             client,
             tool_router: Self::tool_router(),
@@ -152,7 +152,7 @@ mod tests {
     }
 
     fn make_tools(base_url: &str) -> LearningPathTools {
-        LearningPathTools::new(EngramClient::new(base_url, "engram_test"))
+        LearningPathTools::new(EngramoClient::new(base_url, "engramo_test"))
     }
 
     #[tokio::test]

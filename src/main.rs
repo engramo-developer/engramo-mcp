@@ -3,10 +3,10 @@ use std::sync::Arc;
 use axum::middleware;
 use clap::{Parser, Subcommand};
 use engramo_mcp::{
-    client::{EngramClient, HardenedClient},
+    client::{EngramoClient, HardenedClient},
     config::McpConfig,
     http_auth::{SessionTokens, bearer_auth_middleware, current_bearer_token},
-    server::{EngramMcpServer, build_session_server},
+    server::{EngramoMcpServer, build_session_server},
     tts, well_known,
 };
 use rmcp::{
@@ -30,11 +30,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run over stdio (default, for Claude Desktop / Cursor). One process serves one
-    /// user, authenticated via the ENGRAM_API_TOKEN env var.
+    /// user, authenticated via the ENGRAMO_API_TOKEN env var.
     Stdio,
     /// Run over Streamable HTTP at `/` (for remote clients such as ChatGPT). Each
     /// session authenticates with its own `Authorization: Bearer <token>` header —
-    /// no global ENGRAM_API_TOKEN is used. Binds `MCP_BIND_ADDR` (default `0.0.0.0:8080`).
+    /// no global ENGRAMO_API_TOKEN is used. Binds `MCP_BIND_ADDR` (default `0.0.0.0:8080`).
     Http,
 }
 
@@ -116,8 +116,8 @@ fn init_logging() {
     }
 }
 
-/// One process = one user. Reads `ENGRAM_API_TOKEN` from the environment and holds a
-/// single `EngramClient` for the lifetime of the stdio connection (Claude Desktop, Cursor).
+/// One process = one user. Reads `ENGRAMO_API_TOKEN` from the environment and holds a
+/// single `EngramoClient` for the lifetime of the stdio connection (Claude Desktop, Cursor).
 ///
 /// Also the **only** place [`tts::from_env`] is ever called — see the `tts` module's doc
 /// comment for why that's a structural, grep-provable guarantee that a Gemini key can never
@@ -126,11 +126,11 @@ async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = McpConfig::from_env().map_err(config_help)?;
     let token = cfg.require_token().map_err(config_help)?;
 
-    let client = EngramClient::new(&cfg.api_url, token);
-    let server = EngramMcpServer::new(client, cfg.paid_ai_enabled);
+    let client = EngramoClient::new(&cfg.api_url, token);
+    let server = EngramoMcpServer::new(client, cfg.paid_ai_enabled);
     let server = attach_tts(server, tts::from_env())?;
 
-    tracing::info!("Starting Engram MCP server over stdio");
+    tracing::info!("Starting Engramo MCP server over stdio");
 
     let running = server.serve_with_ct(stdio(), Default::default()).await?;
     running.waiting().await?;
@@ -141,8 +141,8 @@ async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
 fn config_help(e: engramo_mcp::config::ConfigError) -> String {
     format!(
         "{e}\n\nSet the required environment variables before running:\n  \
-         ENGRAM_API_URL=https://api.engramo.app\n  \
-         ENGRAM_API_TOKEN=<your-token>\n\n\
+         ENGRAMO_API_URL=https://api.engramo.app\n  \
+         ENGRAMO_API_TOKEN=<your-token>\n\n\
          Generate a token from your EngrAmo account settings."
     )
 }
@@ -151,9 +151,9 @@ fn config_help(e: engramo_mcp::config::ConfigError) -> String {
 /// the result of [`tts::from_env`]. Pulled out of `run_stdio` (a pure move, no behavior
 /// change) so the three arms — enabled, disabled, misconfigured — are directly testable.
 fn attach_tts(
-    server: EngramMcpServer,
+    server: EngramoMcpServer,
     tts_cfg: Result<Option<tts::TtsConfig>, tts::TtsConfigError>,
-) -> Result<EngramMcpServer, String> {
+) -> Result<EngramoMcpServer, String> {
     match tts_cfg {
         Ok(Some(tts_cfg)) => {
             let provider = tts_cfg.provider.name();
@@ -161,7 +161,7 @@ fn attach_tts(
             let default_voice = tts_cfg.default_voice.clone();
             let key_count = tts_cfg.keys.len();
             // `build_engine` builds its own hardened client (a longer request timeout than
-            // the main EngramClient's, since Gemini synthesis is slower than a typical
+            // the main EngramoClient's, since Gemini synthesis is slower than a typical
             // EngrAmo API call) — see its doc comment for why callers can no longer supply
             // one themselves.
             let engine = tts::build_engine(tts_cfg);
@@ -182,8 +182,8 @@ fn attach_tts(
         Err(e) => {
             // A misconfigured TTS setup (bad provider/model/voice) should be loud, not
             // silently disable the feature — the user explicitly opted in by setting
-            // ENGRAM_TTS_GEMINI_API_KEYS, so a typo elsewhere in their TTS config deserves
-            // the same startup-failure treatment as a bad ENGRAM_API_TOKEN.
+            // ENGRAMO_TTS_GEMINI_API_KEYS, so a typo elsewhere in their TTS config deserves
+            // the same startup-failure treatment as a bad ENGRAMO_API_TOKEN.
             Err(format!(
                 "{e}\n\nCheck your TTS environment variables ({}, {}, {}, {}).",
                 tts::ENV_KEYS,
@@ -196,11 +196,11 @@ fn attach_tts(
 }
 
 /// Remote entry point: serves the MCP over Streamable HTTP at `/`, deriving a fresh
-/// `EngramClient` per session from the caller's own `Authorization: Bearer <token>` —
-/// there is no global `ENGRAM_API_TOKEN` in this mode (`McpConfig.api_token` is unused).
+/// `EngramoClient` per session from the caller's own `Authorization: Bearer <token>` —
+/// there is no global `ENGRAMO_API_TOKEN` in this mode (`McpConfig.api_token` is unused).
 async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = McpConfig::from_env()
-        .map_err(|e| format!("{e}\n\nSet ENGRAM_API_URL before running `engramo-mcp http`."))?;
+        .map_err(|e| format!("{e}\n\nSet ENGRAMO_API_URL before running `engramo-mcp http`."))?;
 
     // Local TTS is stdio-only (see `tts` module doc comment) — this reads only the env var's
     // *name*, never its value, and never builds a TtsConfig/engine. This is the only place
@@ -214,19 +214,19 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Shared across every session's `EngramClient` (see `EngramClient::with_http`) so
+    // Shared across every session's `EngramoClient` (see `EngramoClient::with_http`) so
     // concurrent users reuse one connection pool instead of each paying for its own TLS
-    // handshakes. Built by `EngramClient::build_http_client` (not by hand here) so the
+    // handshakes. Built by `EngramoClient::build_http_client` (not by hand here) so the
     // no-redirect policy that keeps a session's bearer token from following a 3xx to
     // another host can't be dropped by a future edit to this function.
-    let http = EngramClient::build_http_client();
+    let http = EngramoClient::build_http_client();
     let app = build_app(&cfg, http);
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(
         addr = %bind_addr,
-        "Starting Engram MCP server over Streamable HTTP at / — this binds plain HTTP; \
+        "Starting Engramo MCP server over Streamable HTTP at / — this binds plain HTTP; \
          bearer tokens are only protected in transit if a TLS-terminating proxy (e.g. \
          Cloud Run) sits in front of this listener"
     );
@@ -343,7 +343,7 @@ mod tests {
         // "length limit exceeded" message rather than 413. This pins that real, current
         // behavior so a regression that instead buffers/accepts the oversized body (e.g. a
         // layer reordered or dropped) still fails this test.
-        let app = build_app(&test_cfg(), EngramClient::build_http_client());
+        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
         let body = vec![b'a'; MAX_BODY_BYTES + 1];
         let req = Request::post("/")
             .header("authorization", "Bearer t")
@@ -363,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_app_version_is_unauthenticated_but_root_requires_bearer() {
-        let app = build_app(&test_cfg(), EngramClient::build_http_client());
+        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
         let v = app
             .clone()
             .oneshot(
@@ -388,9 +388,9 @@ mod tests {
         assert_eq!(root.status(), StatusCode::UNAUTHORIZED);
     }
 
-    fn test_server() -> EngramMcpServer {
-        let client = EngramClient::new("http://localhost", "engram_test_token");
-        EngramMcpServer::new(client, false)
+    fn test_server() -> EngramoMcpServer {
+        let client = EngramoClient::new("http://localhost", "engramo_test_token");
+        EngramoMcpServer::new(client, false)
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Feature-flagged tools that call EngrAmo's **paid, server-side AI** (TTS, translation,
-//! dictionary generation, AI-agent chat). Only registered when `ENGRAM_ENABLE_PAID_AI`
-//! is on — see `EngramMcpServer::new`. The always-on `generate_*` tools in
+//! dictionary generation, AI-agent chat). Only registered when `ENGRAMO_ENABLE_PAID_AI`
+//! is on — see `EngramoMcpServer::new`. The always-on `generate_*` tools in
 //! `tools/generate.rs` are bring-your-own-AI: the *caller* model does the generation and
 //! only persists the result, incurring no cost to EngrAmo.
 
@@ -12,7 +12,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::dto::{AiChatRequest, CardAiRequest, CreateCatalogRequest};
-use crate::server::EngramMcpServer;
+use crate::server::EngramoMcpServer;
 use crate::tools::catalogs::{err_result, ok_json, parse_uuid};
 use crate::tools::media::MAX_UPLOAD_BASE64_LEN;
 
@@ -67,7 +67,7 @@ fn parse_optional_uuid(s: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
 }
 
 #[tool_router(router = paid_ai_tools_router, vis = "pub(crate)")]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(
         description = "Generate server-side TTS audio for cards that have no face audio yet. \
         USES ENGRAMO'S PAID AI — this consumes the account's TTS quota. \
@@ -228,7 +228,7 @@ impl EngramMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::EngramClient;
+    use crate::client::EngramoClient;
     use rmcp::handler::server::wrapper::Parameters;
     use serde_json::json;
     use uuid::Uuid;
@@ -239,8 +239,8 @@ mod tests {
         Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
     }
 
-    fn make_server(base_url: &str) -> EngramMcpServer {
-        EngramMcpServer::new(EngramClient::new(base_url, "engram_test"), true)
+    fn make_server(base_url: &str) -> EngramoMcpServer {
+        EngramoMcpServer::new(EngramoClient::new(base_url, "engramo_test"), true)
     }
 
     #[tokio::test]
@@ -403,7 +403,7 @@ mod tests {
     async fn test_translate_batch_import_rejects_oversized_file_without_network_call() {
         // No MockServer mounted: an oversized payload must be refused before the
         // request is built, let alone sent.
-        let tools = EngramMcpServer::new(EngramClient::new("http://127.0.0.1:1", "t"), true);
+        let tools = EngramoMcpServer::new(EngramoClient::new("http://127.0.0.1:1", "t"), true);
         let result = tools
             .translate_batch_import(Parameters(TranslateBatchImportParams {
                 target_lang: "es".to_string(),

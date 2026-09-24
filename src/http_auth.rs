@@ -7,7 +7,7 @@
 //! rmcp's `StreamableHttpService` authorizes every request *after* `initialize`
 //! on the `Mcp-Session-Id` header alone — it re-checks nothing else (see
 //! `handle_post` in `rmcp::transport::streamable_http_server::tower`). Since a
-//! session owns one `EngramClient` built from the token presented at
+//! session owns one `EngramoClient` built from the token presented at
 //! `initialize`, anyone replaying a live session id with *any* bearer token
 //! would otherwise act as that session's owner, with their EngrAmo token, and
 //! would keep doing so after the owner rotated it. [`SessionTokens`] closes that
@@ -260,8 +260,8 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    const VICTIM: &str = "engram_victim_token";
-    const ATTACKER: &str = "engram_attacker_token";
+    const VICTIM: &str = "engramo_victim_token";
+    const ATTACKER: &str = "engramo_attacker_token";
     const SESSION: &str = "6ea7c668-e947-446f-9e8f-7977869284b7";
 
     /// A stand-in for rmcp's service: echoes the token it saw via the
@@ -350,7 +350,7 @@ mod tests {
         // A space inside the token would break the `X-Api-Key` header it is
         // forwarded as; anything non-graphic is refused.
         let resp = app(SessionTokens::new())
-            .oneshot(request(Some("Bearer engram tok"), None))
+            .oneshot(request(Some("Bearer engramo tok"), None))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -507,9 +507,9 @@ mod tests {
 
     #[test]
     fn test_constant_time_eq() {
-        assert!(constant_time_eq("engram_abc", "engram_abc"));
-        assert!(!constant_time_eq("engram_abc", "engram_abd"));
-        assert!(!constant_time_eq("engram_abc", "engram_abcd"));
+        assert!(constant_time_eq("engramo_abc", "engramo_abc"));
+        assert!(!constant_time_eq("engramo_abc", "engramo_abd"));
+        assert!(!constant_time_eq("engramo_abc", "engramo_abcd"));
         assert!(!constant_time_eq("", "x"));
         assert!(constant_time_eq("", ""));
     }

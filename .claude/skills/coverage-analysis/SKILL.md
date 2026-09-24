@@ -43,10 +43,10 @@ For each tool, is there a test for:
 - GET skipped when neither face nor back changes; GET failure → error, no PATCH
 
 ### Config (`src/config.rs`)
-- missing / empty `ENGRAM_API_URL` → `MissingVar` / `EmptyVar`
-- `ENGRAM_API_TOKEN` is optional at load: empty → `EmptyVar`; absent → `require_token()` returns `MissingVar`
+- missing / empty `ENGRAMO_API_URL` → `MissingVar` / `EmptyVar`
+- `ENGRAMO_API_TOKEN` is optional at load: empty → `EmptyVar`; absent → `require_token()` returns `MissingVar`
 - trailing slash(es) stripped from the URL
-- `ENGRAM_ENABLE_PAID_AI` truthy values (`true`/`1`/`yes`/`on`) vs default off
+- `ENGRAMO_ENABLE_PAID_AI` truthy values (`true`/`1`/`yes`/`on`) vs default off
 
 ### http mode (`src/http_auth.rs`, `src/main.rs`)
 - missing, empty, and non-`Bearer` authorization → 401; oversized bearer rejected

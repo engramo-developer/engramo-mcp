@@ -28,19 +28,19 @@ use crate::config::Redacted;
 /// R2): the generic `GEMINI_API_KEY` — the de-facto standard name set by the Gemini CLI,
 /// Google SDKs, and many users' shell profiles — is **never read** by this module, so a key
 /// already sitting in a user's environment can't silently opt them into spending it.
-pub const ENV_KEYS: &str = "ENGRAM_TTS_GEMINI_API_KEYS";
+pub const ENV_KEYS: &str = "ENGRAMO_TTS_GEMINI_API_KEYS";
 /// Engine selector. Only `"gemini"` (case-insensitive) is accepted today.
-pub const ENV_PROVIDER: &str = "ENGRAM_TTS_PROVIDER";
+pub const ENV_PROVIDER: &str = "ENGRAMO_TTS_PROVIDER";
 /// Gemini TTS model id override.
-pub const ENV_MODEL: &str = "ENGRAM_TTS_MODEL";
+pub const ENV_MODEL: &str = "ENGRAMO_TTS_MODEL";
 /// Default voice override.
-pub const ENV_VOICE: &str = "ENGRAM_TTS_VOICE";
+pub const ENV_VOICE: &str = "ENGRAMO_TTS_VOICE";
 
 const DEFAULT_PROVIDER: TtsProvider = TtsProvider::Gemini;
-const DEFAULT_MODEL: &str = "gemini-2.5-flash-preview-tts";
+const DEFAULT_MODEL: &str = "gemini-3.8-flash-tts";
 const DEFAULT_VOICE: &str = "Puck";
 
-/// Longest accepted `ENGRAM_TTS_MODEL` value — it is interpolated directly into a Gemini URL
+/// Longest accepted `ENGRAMO_TTS_MODEL` value — it is interpolated directly into a Gemini URL
 /// path (`gemini.rs::call_gemini`), so it is restricted to a conservative, URL-path-safe
 /// character set rather than trusted verbatim.
 const MAX_MODEL_LEN: usize = 64;
@@ -233,8 +233,15 @@ fn validate_voice(provider: TtsProvider, voice: &str) -> Result<(), TtsConfigErr
 
 /// One-line wrapper over [`from_lookup`] reading real process env vars. Call this from
 /// exactly one place: `run_stdio` in `main.rs` — see the module-level doc comment.
+///
+/// Falls back to each var's pre-rebrand `ENGRAM_TTS_*` name when its `ENGRAMO_TTS_*`
+/// counterpart is unset, so an existing local-TTS deployment doesn't silently lose its Gemini
+/// keys on upgrade, via the shared [`crate::config::env_or_legacy`] helper — the one place that
+/// derives the legacy name and words the `warn!`, so this module and `config.rs` can't drift
+/// apart. The [`from_lookup`] seam itself stays untouched so it remains fully unit-testable
+/// without process-env mutation.
 pub fn from_env() -> Result<Option<TtsConfig>, TtsConfigError> {
-    from_lookup(|k| std::env::var(k).ok())
+    from_lookup(crate::config::env_or_legacy)
 }
 
 /// Builds the engine matching `cfg.provider`. Always builds its own hardened client (see
@@ -289,9 +296,10 @@ pub enum TtsError {
     #[error("{0}")]
     Fatal(String),
 
-    /// The first key tried returned a successful response with no audio payload — a
-    /// content/model issue, not a key problem, so rotation stops and it is reported directly
-    /// rather than wrapped in [`Self::AllKeysExhausted`].
+    /// The engine produced no audio for this text (e.g. the model answered the transcript with
+    /// text instead of reading it) even after a bounded same-key retry — a content/model issue,
+    /// not a key problem, so rotation stops and it is reported directly rather than wrapped in
+    /// [`Self::AllKeysExhausted`].
     #[error(
         "The TTS engine returned no audio for this text. Try shortening it, rephrasing it, \
         or using a different voice."
@@ -330,7 +338,7 @@ pub trait TtsEngine: Send + Sync {
     /// The voice used when a caller's request doesn't specify one.
     fn default_voice(&self) -> &str;
 
-    /// The underlying model id (e.g. `"gemini-2.5-flash-preview-tts"`).
+    /// The underlying model id (e.g. `"gemini-3.8-flash-tts"`).
     fn model(&self) -> &str;
 
     /// Short engine identifier, e.g. `"gemini"`.
@@ -567,6 +575,16 @@ mod tests {
         assert!(check_lang("en-US").is_ok());
         assert!(check_lang("").is_err());
         assert!(check_lang("en US").is_err());
+    }
+
+    #[test]
+    fn test_env_var_names_and_default_model_are_the_documented_values() {
+        assert_eq!(ENV_KEYS, "ENGRAMO_TTS_GEMINI_API_KEYS");
+        assert_eq!(ENV_PROVIDER, "ENGRAMO_TTS_PROVIDER");
+        assert_eq!(ENV_MODEL, "ENGRAMO_TTS_MODEL");
+        assert_eq!(ENV_VOICE, "ENGRAMO_TTS_VOICE");
+        assert_eq!(DEFAULT_MODEL, "gemini-3.8-flash-tts");
+        assert_eq!(DEFAULT_VOICE, "Puck");
     }
 
     #[test]

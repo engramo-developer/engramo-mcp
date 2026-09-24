@@ -318,7 +318,7 @@ mod tests {
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(sub, || {
-            tracing::error!(target: "engramo_mcp::client", "network error calling Engram API");
+            tracing::error!(target: "engramo_mcp::client", "network error calling Engramo API");
         });
         // capture_layer's spy records every event unconditionally (it exercises
         // EventVisitor's formatting, not ErrorReportingLayer's gating — see its
@@ -328,7 +328,7 @@ mod tests {
         // assumes elsewhere.
         let msgs = captured.lock().unwrap();
         assert_eq!(msgs.len(), 1);
-        assert!(msgs[0].contains("network error calling Engram API"));
+        assert!(msgs[0].contains("network error calling Engramo API"));
     }
 
     // is_sensitive helper

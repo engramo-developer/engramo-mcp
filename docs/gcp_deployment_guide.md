@@ -3,7 +3,7 @@
 This deploys `engramo-mcp http` — the Streamable HTTP transport used by ChatGPT and other remote
 MCP clients — to Cloud Run, using Cloud Build manual triggers. This mirrors `../engram-api/docs/gcp_deployment_guide.md`
 exactly (same project/region, same manual-trigger pattern), simplified because `engramo-mcp` has
-**no database and no secrets**: `ENGRAM_API_URL` and `MCP_PUBLIC_URL` are plain per-environment
+**no database and no secrets**: `ENGRAMO_API_URL` and `MCP_PUBLIC_URL` are plain per-environment
 values (see `src/config.rs`), and `http` mode takes each caller's own bearer token per request
 rather than holding a server-side credential. The `stdio` transport (Claude Desktop / Cursor) is
 **not** deployed here — see the root `README.md`'s npm install instructions for that.
@@ -115,20 +115,20 @@ environment, just plain env vars passed straight to Cloud Run:
 ```yaml
 substitutions:
   _SERVICE_NAME: 'engramo-mcp'
-  _ENGRAM_API_URL: 'https://api-engram.volmyr.com'
+  _ENGRAMO_API_URL: 'https://api-engram.volmyr.com'
   _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com'
-  _ENGRAM_ENABLE_PAID_AI: 'false'
+  _ENGRAMO_ENABLE_PAID_AI: 'false'
   _APP_ENV: 'dev'
 ```
 
-The defaults above are **dev** values. The prod trigger (Section 5) overrides `_ENGRAM_API_URL`,
-`_MCP_PUBLIC_URL`, and `_APP_ENV` — leave `_ENGRAM_ENABLE_PAID_AI` as `'false'` on both unless
+The defaults above are **dev** values. The prod trigger (Section 5) overrides `_ENGRAMO_API_URL`,
+`_MCP_PUBLIC_URL`, and `_APP_ENV` — leave `_ENGRAMO_ENABLE_PAID_AI` as `'false'` on both unless
 you're deliberately testing the paid-AI path (see root `README.md`).
 
 `_APP_ENV` controls logging only (`src/main.rs`'s `init_logging()`): `'local'` (the binary's own
 default when unset, e.g. running it directly) gets human-readable output, anything else — `'dev'`
 or `'prod'` — switches to GCP Cloud Logging-shaped structured JSON plus Error Reporting for `ERROR`-level
-events. It has no effect on which backend is called; that's entirely `_ENGRAM_API_URL`.
+events. It has no effect on which backend is called; that's entirely `_ENGRAMO_API_URL`.
 
 `_MCP_PUBLIC_URL` should be a bare origin, no path (the MCP endpoint is served at `/`, root — it
 becomes the `resource` value in `.well-known/oauth-protected-resource`, see `src/well_known.rs`).
@@ -146,7 +146,7 @@ Via console (**Cloud Build → Triggers → Create Trigger**), once per project:
    Section 1.
 7. Advanced → Substitution variables — **dev**: leave all defaults as-is (they already point at
    dev). **prod**: override
-   - `_ENGRAM_API_URL` = `https://api.engramo.app`
+   - `_ENGRAMO_API_URL` = `https://api.engramo.app`
    - `_MCP_PUBLIC_URL` = `https://mcp.engramo.app`
    - `_APP_ENV` = `prod`
 8. Create.
