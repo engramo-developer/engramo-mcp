@@ -28,18 +28,18 @@ fn is_unicode_format_char(c: char) -> bool {
     )
 }
 
-/// Typed HTTP client for the Engram REST API.
+/// Typed HTTP client for the Engramo REST API.
 /// Every request automatically attaches the user's API token via `X-Api-Key`.
 /// All methods return `Result<T, ApiError>` — callers convert errors to `CallToolResult`
 /// with `is_error: true` (never propagate as raw `Err()`).
 #[derive(Clone)]
-pub struct EngramClient {
+pub struct EngramoClient {
     http: Client,
     base_url: String,
     api_token: String,
 }
 
-/// Connect timeout for requests to the Engram REST API. Kept shorter than the overall
+/// Connect timeout for requests to the Engramo REST API. Kept shorter than the overall
 /// request timeout so a dead/unreachable host fails fast instead of tying up the
 /// connection budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,8 +48,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// session task and its connection until the client gives up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A `reqwest::Client` built by [`EngramClient::build_http_client`] — the only way to
-/// construct one outside this module, so [`EngramClient::with_http`] can never be handed a
+/// A `reqwest::Client` built by [`EngramoClient::build_http_client`] — the only way to
+/// construct one outside this module, so [`EngramoClient::with_http`] can never be handed a
 /// client that's missing `redirect::Policy::none()`. Without this wrapper, the no-redirect
 /// guarantee for the `X-Api-Key` header (see `build_http_client`'s doc comment) would only be
 /// kept by convention at each call site, and a future refactor could quietly pass
@@ -58,14 +58,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct HardenedClient(Client);
 
-impl EngramClient {
-    /// Builds the `reqwest::Client` every `EngramClient` — stdio's own instance
+impl EngramoClient {
+    /// Builds the `reqwest::Client` every `EngramoClient` — stdio's own instance
     /// ([`Self::new`]) and `http` mode's shared instance (`main.rs::run_http`) — is built
     /// from. Hardcodes `redirect::Policy::none()`: reqwest's default policy follows up to 10
     /// redirects and only strips `Authorization`/`Cookie`/`Proxy-Authorization`/
     /// `WWW-Authenticate` on a cross-host redirect — the custom `X-Api-Key` header used here
     /// is **not** stripped and would be forwarded verbatim to whatever host a 3xx `Location`
-    /// names (e.g. a misconfigured proxy/CDN, or an open redirect on `ENGRAM_API_URL`). One
+    /// names (e.g. a misconfigured proxy/CDN, or an open redirect on `ENGRAMO_API_URL`). One
     /// function so both call sites can't drift apart — mirrors
     /// `tts::gemini::build_http_client`'s reasoning for the Gemini key. Returns a
     /// [`HardenedClient`], not a plain `Client`, so [`Self::with_http`] can't be handed a
@@ -81,7 +81,7 @@ impl EngramClient {
         )
     }
 
-    /// Builds an `EngramClient` with its own dedicated `reqwest::Client`. Prefer
+    /// Builds an `EngramoClient` with its own dedicated `reqwest::Client`. Prefer
     /// [`Self::with_http`] when serving multiple sessions from one process (`http`
     /// mode) so they share a single connection pool instead of each paying for its
     /// own TLS handshakes.
@@ -89,7 +89,7 @@ impl EngramClient {
         Self::with_http(Self::build_http_client(), base_url, api_token)
     }
 
-    /// Builds an `EngramClient` from a pre-built, shared, hardened `reqwest::Client` — used by
+    /// Builds an `EngramoClient` from a pre-built, shared, hardened `reqwest::Client` — used by
     /// `http` mode so every session's requests flow through one connection pool. Takes a
     /// [`HardenedClient`] (only buildable via [`Self::build_http_client`]) rather than a plain
     /// `reqwest::Client`, so a caller can't accidentally pass one without the no-redirect
@@ -503,7 +503,7 @@ impl EngramClient {
     // ── Paid AI (feature-flagged) ────────────────────────────────────────────
 
     /// Fires server-side TTS generation for cards missing face audio.
-    /// Uses EngrAmo's paid AI — only registered when `ENGRAM_ENABLE_PAID_AI` is on.
+    /// Uses EngrAmo's paid AI — only registered when `ENGRAMO_ENABLE_PAID_AI` is on.
     /// The API accepts the request (202) and delivers audio asynchronously via
     /// callback; the response only confirms which cards were queued.
     pub async fn generate_tts_for_cards(
@@ -588,8 +588,8 @@ mod tests {
         Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
     }
 
-    fn client(base_url: &str) -> EngramClient {
-        EngramClient::new(base_url, "engram_test_token")
+    fn client(base_url: &str) -> EngramoClient {
+        EngramoClient::new(base_url, "engramo_test_token")
     }
 
     async fn assert_auth_header(server: &MockServer) {
@@ -604,7 +604,7 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             assert_eq!(
-                val, "engram_test_token",
+                val, "engramo_test_token",
                 "X-Api-Key header missing or wrong"
             );
         }
@@ -617,7 +617,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/catalogs"))
-            .and(header("x-api-key", "engram_test_token"))
+            .and(header("x-api-key", "engramo_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"id": mock_id(), "name": "Rust", "version": 1}],
                 "cursor": null
@@ -1114,7 +1114,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!("/cards/{}", mock_id())))
-            .and(header("x-api-key", "engram_test_token"))
+            .and(header("x-api-key", "engramo_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": mock_id(),
                 "version": 3,
@@ -1155,7 +1155,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path(format!("/cards/{}", mock_id())))
-            .and(header("x-api-key", "engram_test_token"))
+            .and(header("x-api-key", "engramo_test_token"))
             .and(wiremock::matchers::body_json(json!({
                 "catalogIds": [mock_id()],
                 "orderNumber": 5,
@@ -1592,15 +1592,15 @@ mod tests {
         // A CR/LF in the name reaches the multipart Content-Disposition header;
         // reqwest only backslash-escapes it, leaving the raw byte in place.
         assert_eq!(
-            EngramClient::sanitize_filename("a.mp3\r\nContent-Type: text/html"),
+            EngramoClient::sanitize_filename("a.mp3\r\nContent-Type: text/html"),
             "a.mp3Content-Type: texthtml"
         );
         assert_eq!(
-            EngramClient::sanitize_filename("../../etc/passwd"),
+            EngramoClient::sanitize_filename("../../etc/passwd"),
             "etcpasswd"
         );
         assert_eq!(
-            EngramClient::sanitize_filename("say\"hi\".mp3"),
+            EngramoClient::sanitize_filename("say\"hi\".mp3"),
             "sayhi.mp3"
         );
     }
@@ -1612,12 +1612,12 @@ mod tests {
         // display as "cod.mp3exe" in a lenient file picker. Not caught by
         // `is_control()` since it isn't a C0 control byte.
         assert_eq!(
-            EngramClient::sanitize_filename("safe\u{202E}exe.mp3"),
+            EngramoClient::sanitize_filename("safe\u{202E}exe.mp3"),
             "safeexe.mp3"
         );
         // Zero-width space / BOM: invisible but can hide extra characters.
         assert_eq!(
-            EngramClient::sanitize_filename("a\u{200B}b\u{FEFF}.mp3"),
+            EngramoClient::sanitize_filename("a\u{200B}b\u{FEFF}.mp3"),
             "ab.mp3"
         );
     }
@@ -1625,26 +1625,26 @@ mod tests {
     #[test]
     fn test_sanitize_filename_keeps_ordinary_names() {
         assert_eq!(
-            EngramClient::sanitize_filename("card1_face.mp3"),
+            EngramoClient::sanitize_filename("card1_face.mp3"),
             "card1_face.mp3"
         );
         assert_eq!(
-            EngramClient::sanitize_filename("ñandú — foto.png"),
+            EngramoClient::sanitize_filename("ñandú — foto.png"),
             "ñandú — foto.png"
         );
     }
 
     #[test]
     fn test_sanitize_filename_falls_back_when_nothing_survives() {
-        assert_eq!(EngramClient::sanitize_filename(""), "upload");
-        assert_eq!(EngramClient::sanitize_filename("///"), "upload");
-        assert_eq!(EngramClient::sanitize_filename("\r\n"), "upload");
+        assert_eq!(EngramoClient::sanitize_filename(""), "upload");
+        assert_eq!(EngramoClient::sanitize_filename("///"), "upload");
+        assert_eq!(EngramoClient::sanitize_filename("\r\n"), "upload");
     }
 
     #[test]
     fn test_sanitize_filename_caps_length() {
         let long = "a".repeat(5000);
-        assert_eq!(EngramClient::sanitize_filename(&long).chars().count(), 200);
+        assert_eq!(EngramoClient::sanitize_filename(&long).chars().count(), 200);
     }
 
     #[tokio::test]
@@ -1735,7 +1735,7 @@ mod tests {
         match err {
             ApiError::BadRequest(msg) => {
                 assert!(msg.contains("redirect"), "{msg}");
-                assert!(msg.contains("ENGRAM_API_URL"), "{msg}");
+                assert!(msg.contains("ENGRAMO_API_URL"), "{msg}");
             }
             other => panic!("expected redirect error, got {other:?}"),
         }

@@ -8,7 +8,7 @@ user-invocable: false
 
 Apply this audit to the target. Be aggressive on Critical/High.
 
-Threat model in one paragraph: in **stdio** mode one process holds one user's `ENGRAM_API_TOKEN`. In **http** mode
+Threat model in one paragraph: in **stdio** mode one process holds one user's `ENGRAMO_API_TOKEN`. In **http** mode
 one process serves many users; each MCP session is bound to the bearer token that opened it, and a session id is
 credential-equivalent — anyone holding it could act as that user if the binding check were missing. Tool arguments
 come from an LLM and are untrusted input.
@@ -16,11 +16,11 @@ come from an LLM and are untrusted input.
 ## Audit scope
 
 ### 1. Token handling (CRITICAL)
-- [ ] `ENGRAM_API_TOKEN` and per-session bearer tokens never logged, including via `{:?}` — `McpConfig.api_token` stays
+- [ ] `ENGRAMO_API_TOKEN` and per-session bearer tokens never logged, including via `{:?}` — `McpConfig.api_token` stays
       `Option<Redacted<String>>`
 - [ ] Tokens never echoed in `CallToolResult` content, resource/prompt output, or error messages
 - [ ] stdio requires the token via `McpConfig::require_token()`; http mode never falls back to a global token
-- [ ] Token forwarded upstream only as `X-Api-Key` to `ENGRAM_API_URL`, never to any other host
+- [ ] Token forwarded upstream only as `X-Api-Key` to `ENGRAMO_API_URL`, never to any other host
 
 ### 2. http-mode auth and sessions (CRITICAL)
 - [ ] `bearer_auth_middleware` rejects missing, empty, and non-`Bearer` authorization with `401` **before** a session is
@@ -60,7 +60,7 @@ come from an LLM and are untrusted input.
 - [ ] Error text does not leak upstream response bodies containing internals, stack traces, or tokens
 
 ### 8. Feature gating
-- [ ] Paid-AI tools unreachable when `ENGRAM_ENABLE_PAID_AI` is off — not just hidden from `list_tools` but not callable
+- [ ] Paid-AI tools unreachable when `ENGRAMO_ENABLE_PAID_AI` is off — not just hidden from `list_tools` but not callable
 
 ### 9. Dependencies (only when `Cargo.toml` / `Cargo.lock` is in scope)
 - [ ] `cargo audit` clean (CI enforces `--deny warnings`)

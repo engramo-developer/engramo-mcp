@@ -1,37 +1,37 @@
-//! MCP Resources — static URI handles that expose live Engram data as context.
+//! MCP Resources — static URI handles that expose live Engramo data as context.
 //!
 //! Resources are read by URI; the server fetches the relevant data from the API
 //! and returns it as plain JSON text so the LLM can inject it into context.
 //!
 //! Available resources:
-//!   engram://card-schema           — CardContent JSON schema, validation rules, 4 examples
-//!   engram://catalogs              — all catalogs (id, name, card_count)
-//!   engram://learning/due          — due cards for today (card_id, face_text)
-//!   engram://learning/stats        — learning stats (due_count, total_count)
-//!   engram://learning-paths        — all learning paths (id, name)
-//!   engram://subscription          — user subscription / plan info
+//!   engramo://card-schema           — CardContent JSON schema, validation rules, 4 examples
+//!   engramo://catalogs              — all catalogs (id, name, card_count)
+//!   engramo://learning/due          — due cards for today (card_id, face_text)
+//!   engramo://learning/stats        — learning stats (due_count, total_count)
+//!   engramo://learning-paths        — all learning paths (id, name)
+//!   engramo://subscription          — user subscription / plan info
 
 use rmcp::model::{
     ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
 };
 
-use crate::client::EngramClient;
+use crate::client::EngramoClient;
 use crate::dto::{CatalogSummary, DueCardSummary, LearningPathSummary, LearningStats};
 use crate::error::ApiError;
 
 // ── URI constants ─────────────────────────────────────────────────────────────
 
-pub const URI_CARD_SCHEMA: &str = "engram://card-schema";
-pub const URI_CATALOGS: &str = "engram://catalogs";
-pub const URI_DUE: &str = "engram://learning/due";
-pub const URI_STATS: &str = "engram://learning/stats";
-pub const URI_LEARNING_PATHS: &str = "engram://learning-paths";
-pub const URI_SUBSCRIPTION: &str = "engram://subscription";
+pub const URI_CARD_SCHEMA: &str = "engramo://card-schema";
+pub const URI_CATALOGS: &str = "engramo://catalogs";
+pub const URI_DUE: &str = "engramo://learning/due";
+pub const URI_STATS: &str = "engramo://learning/stats";
+pub const URI_LEARNING_PATHS: &str = "engramo://learning-paths";
+pub const URI_SUBSCRIPTION: &str = "engramo://subscription";
 
 // ── Card schema document ──────────────────────────────────────────────────────
 
 const CARD_SCHEMA_DOC: &str = "\
-=== Engram CardContent — Schema & Examples ===
+=== Engramo CardContent — Schema & Examples ===
 
 CardContent fields:
   text         String     REQUIRED. The full plain text. This is the validation anchor.
@@ -195,7 +195,7 @@ pub fn list_all() -> ListResourcesResult {
 // ── Read dispatch ─────────────────────────────────────────────────────────────
 
 pub async fn read(
-    client: &EngramClient,
+    client: &EngramoClient,
     params: ReadResourceRequestParams,
 ) -> Result<ReadResourceResult, rmcp::model::ErrorData> {
     match params.uri.as_str() {
@@ -224,19 +224,19 @@ fn fetch_as_result(
 
 // ── Per-resource fetchers ─────────────────────────────────────────────────────
 
-async fn read_catalogs(client: &EngramClient) -> Result<String, ApiError> {
+async fn read_catalogs(client: &EngramoClient) -> Result<String, ApiError> {
     let resp = client.list_catalogs(Some(100), None).await?;
     let summaries: Vec<CatalogSummary> = resp.data.into_iter().map(Into::into).collect();
     Ok(serde_json::to_string(&summaries).unwrap_or_default())
 }
 
-async fn read_due(client: &EngramClient) -> Result<String, ApiError> {
+async fn read_due(client: &EngramoClient) -> Result<String, ApiError> {
     let resp = client.get_due_cards(Some(50), None).await?;
     let summaries: Vec<DueCardSummary> = resp.data.into_iter().map(Into::into).collect();
     Ok(serde_json::to_string(&summaries).unwrap_or_default())
 }
 
-async fn read_stats(client: &EngramClient) -> Result<String, ApiError> {
+async fn read_stats(client: &EngramoClient) -> Result<String, ApiError> {
     let (due, total) =
         tokio::try_join!(client.learning_cards_count(), client.learning_cards_total())?;
     let stats = LearningStats {
@@ -246,13 +246,13 @@ async fn read_stats(client: &EngramClient) -> Result<String, ApiError> {
     Ok(serde_json::to_string(&stats).unwrap_or_default())
 }
 
-async fn read_learning_paths(client: &EngramClient) -> Result<String, ApiError> {
+async fn read_learning_paths(client: &EngramoClient) -> Result<String, ApiError> {
     let resp = client.list_learning_paths(Some(100), None).await?;
     let summaries: Vec<LearningPathSummary> = resp.data.into_iter().map(Into::into).collect();
     Ok(serde_json::to_string(&summaries).unwrap_or_default())
 }
 
-async fn read_subscription(client: &EngramClient) -> Result<String, ApiError> {
+async fn read_subscription(client: &EngramoClient) -> Result<String, ApiError> {
     let sub = client.get_subscription().await?;
     Ok(serde_json::to_string(&sub).unwrap_or_default())
 }
@@ -303,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_card_schema_contains_examples() {
-        let client = EngramClient::new("http://localhost:9999", "tok");
+        let client = EngramoClient::new("http://localhost:9999", "tok");
         let result = read(&client, ReadResourceRequestParams::new(URI_CARD_SCHEMA))
             .await
             .unwrap();
@@ -322,8 +322,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_unknown_uri_returns_invalid_params() {
-        let client = EngramClient::new("http://localhost:9999", "tok");
-        let params = ReadResourceRequestParams::new("engram://unknown");
+        let client = EngramoClient::new("http://localhost:9999", "tok");
+        let params = ReadResourceRequestParams::new("engramo://unknown");
         let err = read(&client, params).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
@@ -344,7 +344,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EngramClient::new(server.uri(), "tok");
+        let client = EngramoClient::new(server.uri(), "tok");
         let result = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
             .await
             .unwrap();
@@ -374,7 +374,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EngramClient::new(server.uri(), "tok");
+        let client = EngramoClient::new(server.uri(), "tok");
         let result = read(&client, ReadResourceRequestParams::new(URI_STATS))
             .await
             .unwrap();
@@ -398,7 +398,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EngramClient::new(server.uri(), "tok");
+        let client = EngramoClient::new(server.uri(), "tok");
         let err = read(&client, ReadResourceRequestParams::new(URI_DUE))
             .await
             .unwrap_err();

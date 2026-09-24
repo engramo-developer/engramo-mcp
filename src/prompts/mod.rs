@@ -1,4 +1,4 @@
-//! MCP Prompts — canned instructions that guide the LLM through Engram workflows.
+//! MCP Prompts — canned instructions that guide the LLM through Engramo workflows.
 //!
 //! Available prompts:
 //!   review_session      — guided spaced-repetition review (show card → wait → reveal → grade)
@@ -162,7 +162,7 @@ fn review_session(limit: Option<String>) -> GetPromptResult {
                 c. Reveal the back (answer).\n\
                 d. Ask me to rate my recall: again / hard / good / easy, and note it down.\n\
              3. After all cards are reviewed, show a summary with your recall ratings.\n\
-                Submit your grades via the Engram app after the session.\n\
+                Submit your grades via the Engramo app after the session.\n\
              \n\
              Start now — show the first card."
         )),
@@ -183,7 +183,7 @@ fn create_flashcard(topic: &str, catalog_id: Option<&str>) -> GetPromptResult {
              \n\
              **Topic:** {topic}\n\
              \n\
-             Before drafting the card, read the `engram://card-schema` resource for the complete \
+             Before drafting the card, read the `engramo://card-schema` resource for the complete \
              format guide (validation rules, concrete examples, color codes).\n\
              \n\
              Guidelines:\n\
@@ -217,7 +217,7 @@ fn create_language_deck(
              **Source language (face):** {source_lang}\n\
              **Target language (back + dictionary):** {target_lang}\n\
              \n\
-             Before drafting, read the `engram://card-schema` resource — Example 4 shows the \
+             Before drafting, read the `engramo://card-schema` resource — Example 4 shows the \
              user-supplied-audio pattern referenced below.\n\
              \n\
              For EACH card:\n\
@@ -321,7 +321,7 @@ mod tests {
         assert!(matches!(result.messages[1].role, Role::Assistant));
         if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("get_due_cards"), "{text}");
-            assert!(text.contains("Engram app"), "{text}");
+            assert!(text.contains("Engramo app"), "{text}");
         } else {
             panic!("expected text content");
         }
@@ -347,7 +347,7 @@ mod tests {
         if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("Rust ownership"), "{text}");
             assert!(text.contains("generate_card"), "{text}");
-            assert!(text.contains("engram://card-schema"), "{text}");
+            assert!(text.contains("engramo://card-schema"), "{text}");
         } else {
             panic!("expected text content");
         }
@@ -468,7 +468,7 @@ mod tests {
             ]));
         let result = get(params).unwrap();
         if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
-            assert!(text.contains("engram://card-schema"), "{text}");
+            assert!(text.contains("engramo://card-schema"), "{text}");
             assert!(text.contains("dictionary"), "{text}");
             assert!(text.contains("CardStyle"), "{text}");
         } else {

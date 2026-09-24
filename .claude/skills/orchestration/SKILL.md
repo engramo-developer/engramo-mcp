@@ -99,12 +99,12 @@ grep -E 'test result:' "$LOG" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | p
   this and strips LLM-injected marker characters — a phase that adds a card-writing path must route
   through it.
 - **Paid-AI tools** (`src/tools/ai.rs`) live in their own `#[tool_router(router = paid_ai_tools_router)]`
-  block and are only summed into `EngramMcpServer::new()` when `ENGRAM_ENABLE_PAID_AI` is on. A new tool
+  block and are only summed into `EngramoMcpServer::new()` when `ENGRAMO_ENABLE_PAID_AI` is on. A new tool
   that costs the user money belongs there, not in the always-on router.
 - **Never log an MCP session id** — it is credential-equivalent. `error_reporting` redacts `session_id`
   and the default `RUST_LOG` filter silences rmcp's session manager; keep it that way. Same for
-  `ENGRAM_API_TOKEN` / bearer tokens.
-- **http mode auth invariants**: bearer → `CURRENT_BEARER_TOKEN` task-local → one `EngramClient` per
+  `ENGRAMO_API_TOKEN` / bearer tokens.
+- **http mode auth invariants**: bearer → `CURRENT_BEARER_TOKEN` task-local → one `EngramoClient` per
   session, and `SessionTokens` rejects a request presenting a different token than the one that opened
   the session. A phase touching `http_auth.rs` or `main.rs` must keep both halves.
 - **Tests use `wiremock`**, not a live API. A phase must not introduce a test that needs the network.

@@ -14,7 +14,7 @@ pub struct GenerateCardParams {
 
     /// Front of the card.
     ///
-    /// Read `engram://card-schema` for the complete schema, validation rules, and 4 annotated examples.
+    /// Read `engramo://card-schema` for the complete schema, validation rules, and 4 annotated examples.
     ///
     /// Rich-text span rules (IMPORTANT):
     /// - Each span.text must be a VERBATIM contiguous slice of the original sentence.
@@ -37,7 +37,7 @@ pub struct GenerateCardParams {
 
     /// Back of the card (answer / explanation).
     ///
-    /// Read `engram://card-schema` for the complete schema, validation rules, and 4 annotated examples.
+    /// Read `engramo://card-schema` for the complete schema, validation rules, and 4 annotated examples.
     ///
     /// Same rich-text rules as `face`: always set `text`; spans must match it exactly.
     /// For language-learning cards, translate `face.text` yourself and set `back.text` —
@@ -48,11 +48,11 @@ pub struct GenerateCardParams {
 /// A single card entry inside [`GenerateCatalogWithCardsParams`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardInputParams {
-    /// Front of the card. Read `engram://card-schema` for the complete schema, validation rules,
+    /// Front of the card. Read `engramo://card-schema` for the complete schema, validation rules,
     /// and 4 annotated examples. Always set `text` to the full sentence; spans must concatenate
     /// to match `text` exactly.
     pub face: CardContent,
-    /// Back of the card. Read `engram://card-schema` for the complete schema, validation rules,
+    /// Back of the card. Read `engramo://card-schema` for the complete schema, validation rules,
     /// and 4 annotated examples. Same rich-text rules as `face`.
     pub back: CardContent,
 }
@@ -96,8 +96,8 @@ pub struct GenerateCardsParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::EngramClient;
-    use crate::server::EngramMcpServer;
+    use crate::client::EngramoClient;
+    use crate::server::EngramoMcpServer;
     use rmcp::handler::server::wrapper::Parameters;
     use serde_json::json;
     use uuid::Uuid;
@@ -108,8 +108,8 @@ mod tests {
         Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
     }
 
-    fn make_server(base_url: &str) -> EngramMcpServer {
-        EngramMcpServer::new(EngramClient::new(base_url, "engram_test"), false)
+    fn make_server(base_url: &str) -> EngramoMcpServer {
+        EngramoMcpServer::new(EngramoClient::new(base_url, "engramo_test"), false)
     }
 
     fn card_dto_json() -> serde_json::Value {

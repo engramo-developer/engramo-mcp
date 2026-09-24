@@ -37,6 +37,15 @@ const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 /// generous headroom over a base64-encoded few-hundred-KB PCM clip.
 const MAX_AUDIO_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Total attempts (per key) for a [`CallError::NoAudio`] outcome. Gemini TTS models sometimes
+/// read a very short transcript (e.g. `你好`) as a chat turn and try to *answer* it — a 400
+/// "Model tried to generate text" or an empty candidate (`finishReason: OTHER`). It's
+/// nondeterministic, so one identical retry often succeeds; each attempt spends the user's
+/// quota, so keep this small. (The `gemini-2.5-*-preview-tts` models do this far more often
+/// than the 3.x ones — see issue #32. Prefixing the transcript with a read-aloud instruction
+/// doesn't help reliably and gets *spoken* by the 3.x models, so the text is sent bare.)
+const NO_AUDIO_ATTEMPTS: u32 = 2;
+
 /// Reads at most `cap` bytes of `resp`'s body. Used on every path that reads a Gemini response
 /// into memory (§R9/size-limit note in the rollout plan) so an oversized or slow-drip upstream
 /// response can't grow unbounded in this process before it's scrubbed/parsed.
@@ -96,10 +105,17 @@ pub const VOICES: &[Voice] = &[
 /// the next key. Message text carried here has already been through [`scrub`].
 #[derive(Debug)]
 enum CallError {
-    RateLimited { retry_after: Option<Duration> },
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
     Transient(String),
     KeyRejected(String),
-    NoAudio,
+    /// `retryable` is `false` for a deterministic content block (a `finishReason` other than
+    /// absent/`"OTHER"`/`"STOP"`, e.g. `"SAFETY"`) — [`GeminiTts::call_with_no_audio_retry`]
+    /// must not spend a same-key retry on an outcome guaranteed to repeat.
+    NoAudio {
+        retryable: bool,
+    },
     Fatal(String),
 }
 
@@ -113,7 +129,7 @@ impl CallError {
             CallError::RateLimited { .. } => "rate limited",
             CallError::Transient(_) => "transient error",
             CallError::KeyRejected(_) => "rejected",
-            CallError::NoAudio => "no audio",
+            CallError::NoAudio { .. } => "no audio",
             CallError::Fatal(_) => "fatal error",
         }
     }
@@ -122,7 +138,7 @@ impl CallError {
     fn detail(&self) -> Option<&str> {
         match self {
             CallError::Transient(msg) | CallError::KeyRejected(msg) => Some(msg),
-            CallError::RateLimited { .. } | CallError::NoAudio | CallError::Fatal(_) => None,
+            CallError::RateLimited { .. } | CallError::NoAudio { .. } | CallError::Fatal(_) => None,
         }
     }
 
@@ -191,6 +207,13 @@ struct GenerateContentResponse {
 #[derive(Debug, Deserialize)]
 struct Candidate {
     content: Option<ResponseContent>,
+    /// Why generation stopped, e.g. `"STOP"`, `"OTHER"`, `"SAFETY"`, `"PROHIBITED_CONTENT"`,
+    /// `"BLOCKLIST"`. Absent or `"OTHER"`/`"STOP"` alongside no `inlineData` is the
+    /// nondeterministic "model answered as chat" case a same-key retry can fix (see
+    /// [`NO_AUDIO_ATTEMPTS`]); anything else names a deterministic content block that an
+    /// identical retry is guaranteed to repeat, so it must not be retried.
+    #[serde(rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +229,8 @@ struct ResponsePart {
 
 #[derive(Debug, Deserialize)]
 struct InlineData {
+    #[serde(rename = "mimeType", default)]
+    mime_type: Option<String>,
     data: String,
 }
 
@@ -313,7 +338,7 @@ impl GeminiTts {
         text: &str,
         voice: &str,
         lang: Option<&str>,
-    ) -> Result<Vec<u8>, CallError> {
+    ) -> Result<(Vec<u8>, Option<String>), CallError> {
         let url = format!("{}/{}:generateContent", self.api_base, self.model);
         let body = GenerateContentRequest {
             contents: vec![Content {
@@ -373,8 +398,12 @@ impl GeminiTts {
             if is_api_key_invalid(&body_text) {
                 return Err(CallError::KeyRejected(self.scrub(&body_text)));
             }
+            if is_model_generated_text(&body_text) {
+                // Nondeterministic "answered as chat" case — a same-key retry can fix it.
+                return Err(CallError::NoAudio { retryable: true });
+            }
             return Err(CallError::Fatal(format!(
-                "Gemini rejected the request (HTTP 400) — check ENGRAM_TTS_MODEL and the \
+                "Gemini rejected the request (HTTP 400) — check ENGRAMO_TTS_MODEL and the \
                 voice name: {}",
                 self.scrub(&body_text)
             )));
@@ -401,32 +430,62 @@ impl GeminiTts {
         let parsed: GenerateContentResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| CallError::Fatal(self.scrub(&format!("malformed response: {e}"))))?;
 
-        let data = parsed
+        let inline_data = parsed
             .candidates
             .first()
             .and_then(|c| c.content.as_ref())
             .and_then(|c| c.parts.as_ref())
-            .and_then(|parts| parts.iter().find_map(|p| p.inline_data.as_ref()))
-            .map(|d| d.data.as_str());
+            .and_then(|parts| parts.iter().find_map(|p| p.inline_data.as_ref()));
 
-        let Some(data) = data else {
-            return Err(CallError::NoAudio);
+        let Some(inline_data) = inline_data else {
+            // No audio part at all: retry only when the candidate's `finishReason` doesn't
+            // name a deterministic content block — see `CallError::NoAudio`'s doc comment.
+            let finish_reason = parsed
+                .candidates
+                .first()
+                .and_then(|c| c.finish_reason.as_deref());
+            let retryable = matches!(finish_reason, None | Some("OTHER") | Some("STOP"));
+            return Err(CallError::NoAudio { retryable });
         };
 
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| CallError::Fatal(self.scrub(&format!("invalid base64 audio data: {e}"))))
+        let pcm = base64::engine::general_purpose::STANDARD
+            .decode(&inline_data.data)
+            .map_err(|e| {
+                CallError::Fatal(self.scrub(&format!("invalid base64 audio data: {e}")))
+            })?;
+        Ok((pcm, inline_data.mime_type.clone()))
+    }
+
+    /// [`Self::call_gemini`], retried on the same key up to [`NO_AUDIO_ATTEMPTS`] times while
+    /// the outcome is [`CallError::NoAudio`] — the model's text-vs-audio choice is
+    /// nondeterministic, so an identical retry can succeed. Every other outcome returns as-is.
+    async fn call_with_no_audio_retry(
+        &self,
+        key: &str,
+        req: &TtsRequest<'_>,
+    ) -> Result<(Vec<u8>, Option<String>), CallError> {
+        let mut attempt = 1;
+        loop {
+            match self.call_gemini(key, req.text, req.voice, req.lang).await {
+                Err(CallError::NoAudio { retryable: true }) if attempt < NO_AUDIO_ATTEMPTS => {
+                    debug!(attempt, "Gemini returned no audio, retrying");
+                    attempt += 1;
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     /// Key rotation (§2 of the rollout plan): shuffles a clone of the key indices, tries each
     /// once, never sleeps. `Fatal` and `NoAudio` abort rotation immediately — retrying with
-    /// another key would fail identically. On exhaustion, outcomes are re-sorted back into
+    /// another key would fail identically (`NoAudio` gets a bounded same-key retry first, see
+    /// [`Self::call_with_no_audio_retry`]). On exhaustion, outcomes are re-sorted back into
     /// configured order so the summary always reads "key #1: ...; key #2: ..." regardless of
     /// the random try order.
-    async fn rotate(&self, req: &TtsRequest<'_>) -> Result<Vec<u8>, TtsError> {
+    async fn rotate(&self, req: &TtsRequest<'_>) -> Result<(Vec<u8>, Option<String>), TtsError> {
         if self.keys.is_empty() {
             return Err(TtsError::AllKeysExhausted {
-                summary: "no Gemini API keys configured — set ENGRAM_TTS_GEMINI_API_KEYS"
+                summary: "no Gemini API keys configured — set ENGRAMO_TTS_GEMINI_API_KEYS"
                     .to_string(),
                 all_rejected: false,
             });
@@ -438,14 +497,14 @@ impl GeminiTts {
         let mut outcomes: Vec<(usize, CallError)> = Vec::new();
         for idx in order {
             let key: &str = &self.keys[idx];
-            match self.call_gemini(key, req.text, req.voice, req.lang).await {
-                Ok(pcm) => {
+            match self.call_with_no_audio_retry(key, req).await {
+                Ok((pcm, mime_type)) => {
                     debug!(
                         voice = req.voice,
                         chars = req.text.chars().count(),
                         "Gemini synthesis succeeded"
                     );
-                    return Ok(pcm);
+                    return Ok((pcm, mime_type));
                 }
                 Err(CallError::Fatal(msg)) => {
                     warn!(
@@ -454,7 +513,7 @@ impl GeminiTts {
                     );
                     return Err(TtsError::Fatal(msg));
                 }
-                Err(CallError::NoAudio) => {
+                Err(CallError::NoAudio { .. }) => {
                     // A content/model issue, not a key problem (see `TtsError::NoAudio`'s
                     // doc comment) — rotating to another key would just spend more of the
                     // user's Gemini quota on the same text for the same result.
@@ -497,7 +556,7 @@ impl GeminiTts {
         let summary = if all_rejected {
             format!(
                 "all configured Gemini API keys were rejected — check \
-                ENGRAM_TTS_GEMINI_API_KEYS: {per_key}"
+                ENGRAMO_TTS_GEMINI_API_KEYS: {per_key}"
             )
         } else {
             format!("all Gemini API keys were exhausted: {per_key}")
@@ -511,11 +570,8 @@ impl GeminiTts {
 
     async fn do_synthesize(&self, req: TtsRequest<'_>) -> Result<TtsPcm, TtsError> {
         self.validate(&req)?;
-        let pcm = self.rotate(&req).await?;
-        Ok(TtsPcm {
-            pcm,
-            sample_rate: GEMINI_PCM_SAMPLE_RATE,
-        })
+        let (audio, mime_type) = self.rotate(&req).await?;
+        pcm_from_payload(audio, mime_type.as_deref()).map_err(|e| TtsError::Fatal(self.scrub(&e)))
     }
 
     /// Replaces every configured key with `[REDACTED]`, then truncates to
@@ -557,7 +613,7 @@ impl TtsEngine for GeminiTts {
 /// [`TtsError`] or a `tracing` call.
 fn scrub(text: &str, keys: &[Redacted<String>]) -> String {
     // Longest key first: if one configured key is a substring/prefix of another (e.g. a user
-    // accidentally duplicates or overlaps entries in ENGRAM_TTS_GEMINI_API_KEYS), replacing
+    // accidentally duplicates or overlaps entries in ENGRAMO_TTS_GEMINI_API_KEYS), replacing
     // the shorter one first would leave a fragment of the longer key un-redacted.
     let mut sorted: Vec<&str> = keys
         .iter()
@@ -619,6 +675,130 @@ fn is_api_key_invalid(body: &str) -> bool {
     status_is_invalid_argument && message_mentions_api_key
 }
 
+/// Sample rates the MP3 encoder config (`tts::mp3::pcm16_mono_to_mp3` — CBR 128 kbps) is known
+/// to accept. Validated here, against the WAV header, so a mismatched rate fails with a message
+/// that points at the Gemini payload rather than surfacing later as an opaque LAME
+/// `set_sample_rate`/`build` error.
+const SUPPORTED_RATES: &[u32] = &[16_000, 22_050, 24_000, 32_000, 44_100, 48_000];
+
+/// Turns Gemini's decoded `inlineData` payload into raw PCM, dispatching on the `mimeType` that
+/// accompanied it (see [`InlineData`]). The `gemini-2.5-*-preview-tts` models return bare
+/// 16-bit mono PCM at [`GEMINI_PCM_SAMPLE_RATE`] (`audio/L16`); the 3.x models wrap the same
+/// samples in a WAV container (`audio/wav`), whose header would otherwise be encoded as an
+/// audible click. Only 16-bit mono PCM WAV, or raw L16/PCM at a rate the encoder supports, is
+/// accepted — anything else is an error rather than garbage or mispitched audio.
+fn pcm_from_payload(audio: Vec<u8>, mime_type: Option<&str>) -> Result<TtsPcm, String> {
+    let Some(mime_type) = mime_type else {
+        // No MIME type reported: fall back to sniffing, the only signal available.
+        return if audio.starts_with(b"RIFF") {
+            parse_wav(&audio)
+        } else {
+            Ok(TtsPcm {
+                pcm: audio,
+                sample_rate: GEMINI_PCM_SAMPLE_RATE,
+            })
+        };
+    };
+
+    let base_type = mime_type.split(';').next().unwrap_or("").trim();
+    if base_type.eq_ignore_ascii_case("audio/wav") || base_type.eq_ignore_ascii_case("audio/x-wav")
+    {
+        return parse_wav(&audio);
+    }
+    if base_type.eq_ignore_ascii_case("audio/l16") || base_type.eq_ignore_ascii_case("audio/pcm") {
+        let rate = match mime_param(mime_type, "rate") {
+            None => GEMINI_PCM_SAMPLE_RATE,
+            Some(v) => v
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|r| SUPPORTED_RATES.contains(r))
+                .ok_or_else(|| format!("unsupported PCM sample rate from Gemini: {v}"))?,
+        };
+        return Ok(TtsPcm {
+            pcm: audio,
+            sample_rate: rate,
+        });
+    }
+    Err(format!(
+        "unsupported audio MIME type from Gemini: {mime_type}"
+    ))
+}
+
+/// Extracts a `key=value` parameter from a `;`-separated MIME type string, e.g.
+/// `mime_param("audio/L16;codec=pcm;rate=24000", "rate") == Some("24000")`.
+fn mime_param<'a>(mime_type: &'a str, key: &str) -> Option<&'a str> {
+    mime_type.split(';').skip(1).find_map(|part| {
+        let (k, v) = part.trim().split_once('=')?;
+        k.eq_ignore_ascii_case(key).then_some(v)
+    })
+}
+
+/// Parses a WAV container and returns its `data` chunk as [`TtsPcm`]. Only 16-bit mono PCM at
+/// one of [`SUPPORTED_RATES`] is accepted.
+fn parse_wav(audio: &[u8]) -> Result<TtsPcm, String> {
+    let bad = |why: &str| format!("unsupported WAV audio from Gemini: {why}");
+    if audio.get(8..12) != Some(b"WAVE".as_slice()) {
+        return Err(bad("missing WAVE header"));
+    }
+
+    let mut sample_rate = None;
+    let mut pos = 12;
+    while let Some(header) = audio.get(pos..pos + 8) {
+        let id = &header[..4];
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let body_start = pos + 8;
+        // Streamed WAVs may carry a placeholder size; clamp to what's actually there.
+        let body_end = body_start.saturating_add(size).min(audio.len());
+        let body = &audio[body_start..body_end];
+        match id {
+            b"fmt " => {
+                if body.len() < 16 {
+                    return Err(bad("truncated fmt chunk"));
+                }
+                let format = u16::from_le_bytes([body[0], body[1]]);
+                let channels = u16::from_le_bytes([body[2], body[3]]);
+                let rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let bits = u16::from_le_bytes([body[14], body[15]]);
+                if format != 1 || channels != 1 || bits != 16 || !SUPPORTED_RATES.contains(&rate) {
+                    return Err(bad(&format!(
+                        "format {format}, {channels} channel(s), {bits}-bit, {rate} Hz \
+                        (need 16-bit mono PCM at one of {SUPPORTED_RATES:?} Hz)"
+                    )));
+                }
+                sample_rate = Some(rate);
+            }
+            b"data" => {
+                let sample_rate = sample_rate.ok_or_else(|| bad("data chunk before fmt chunk"))?;
+                return Ok(TtsPcm {
+                    pcm: body.to_vec(),
+                    sample_rate,
+                });
+            }
+            _ => {}
+        }
+        // Chunks are word-aligned: an odd-sized body is followed by one pad byte.
+        pos = body_end + (size & 1);
+    }
+    Err(bad("no data chunk"))
+}
+
+/// True when a Gemini 400 body says the model produced text instead of audio ("Model tried to
+/// generate text, but it should only be used for TTS…") — the model read the transcript as a
+/// prompt to answer. That's the same content/model problem as an empty-audio 200, not a
+/// request-shape one, so it maps to [`CallError::NoAudio`] rather than `Fatal`.
+fn is_model_generated_text(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")?
+                .get("message")?
+                .as_str()
+                .map(|m| m.contains("Model tried to generate text"))
+        })
+        .unwrap_or(false)
+}
+
 /// Parses the server `retryDelay` field out of a Gemini 429 error body. Expects a Google API
 /// `RetryInfo` detail with a duration string like `"12s"`.
 fn parse_retry_delay(body: &str) -> Option<Duration> {
@@ -656,6 +836,16 @@ mod tests {
 
     fn req<'a>(text: &'a str, voice: &'a str, lang: Option<&'a str>) -> TtsRequest<'a> {
         TtsRequest { text, voice, lang }
+    }
+
+    fn audio_response_body_with_mime(pcm_b64: &str, mime_type: &str) -> serde_json::Value {
+        json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "inlineData": { "mimeType": mime_type, "data": pcm_b64 } }]
+                }
+            }]
+        })
     }
 
     fn audio_response_body(pcm_b64: &str) -> serde_json::Value {
@@ -993,7 +1183,7 @@ mod tests {
                 all_rejected,
             } => {
                 assert!(all_rejected);
-                assert!(summary.contains("ENGRAM_TTS_GEMINI_API_KEYS"), "{summary}");
+                assert!(summary.contains("ENGRAMO_TTS_GEMINI_API_KEYS"), "{summary}");
                 assert!(!summary.to_lowercase().contains("quota"), "{summary}");
             }
             other => panic!("expected AllKeysExhausted, got {other:?}"),
@@ -1071,11 +1261,11 @@ mod tests {
         // `NoAudio` is a content/model issue, not a key problem (see `TtsError::NoAudio`'s
         // doc comment), so it must short-circuit rotation exactly like `Fatal` does — the
         // second key is mocked identically but must never be called, regardless of which key
-        // the random shuffle tries first.
+        // the random shuffle tries first. The first key does get its bounded same-key retry.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"candidates": []})))
-            .expect(1)
+            .expect(u64::from(NO_AUDIO_ATTEMPTS))
             .mount(&server)
             .await;
 
@@ -1089,9 +1279,425 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
             requests.len(),
-            1,
+            NO_AUDIO_ATTEMPTS as usize,
             "a NoAudio outcome must short-circuit rotation after exactly one key"
         );
+        let keys: std::collections::HashSet<_> = requests
+            .iter()
+            .map(|r| r.headers.get("x-goog-api-key").unwrap().clone())
+            .collect();
+        assert_eq!(keys.len(), 1, "the NoAudio retry must reuse the same key");
+    }
+
+    #[tokio::test]
+    async fn test_no_audio_then_audio_on_retry_succeeds() {
+        let server = MockServer::start().await;
+        let pcm_b64 = base64::engine::general_purpose::STANDARD.encode(b"pcm");
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{"finishReason": "OTHER"}]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(audio_response_body(&pcm_b64)))
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["key1"]);
+        let pcm = client
+            .do_synthesize(req("再见", "Puck", Some("zh")))
+            .await
+            .unwrap();
+        assert_eq!(pcm.pcm, b"pcm");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_model_generated_text_400_is_no_audio_not_fatal() {
+        // Issue #32: Gemini 400s when the model answers the transcript instead of reading it.
+        // That's a content outcome (retry, then NoAudio), not a model/voice config error.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "code": 400,
+                    "message": "Model tried to generate text, but it should only be used for \
+                        TTS. Make sure your instructions are clear to only generate audio from \
+                        a given text transcript.",
+                    "status": "INVALID_ARGUMENT"
+                }
+            })))
+            .expect(u64::from(NO_AUDIO_ATTEMPTS))
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["keyA", "keyB"]);
+        let err = client
+            .do_synthesize(req("你好", "Puck", Some("zh")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TtsError::NoAudio), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_safety_finish_reason_is_no_audio_without_a_retry() {
+        // A deterministic content block (`finishReason: "SAFETY"`) must not spend a same-key
+        // retry — an identical retry is guaranteed to fail again.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{"finishReason": "SAFETY"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["keyA", "keyB"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TtsError::NoAudio), "got {err:?}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a SAFETY finishReason must short-circuit both the same-key retry and rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_audio_then_rate_limited_on_retry_rotates_to_next_key() {
+        let server = MockServer::start().await;
+        let pcm_b64 = base64::engine::general_purpose::STANDARD.encode(b"pcm");
+        // 1st request: empty candidate -> NoAudio (triggers same-key retry).
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"candidates": []})))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // 2nd request (same key's retry): 429 -> RateLimited -> rotate.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": {}})))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // 3rd request (other key): audio.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(audio_response_body(&pcm_b64)))
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["keyA", "keyB"]);
+        let pcm = client
+            .do_synthesize(req("你好", "Puck", Some("zh")))
+            .await
+            .unwrap();
+        assert_eq!(pcm.pcm, b"pcm");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 3);
+        let k = |i: usize| reqs[i].headers.get("x-goog-api-key").unwrap().clone();
+        assert_eq!(k(0), k(1), "retry must reuse the same key");
+        assert_ne!(
+            k(1),
+            k(2),
+            "after a non-NoAudio retry outcome, rotation moves to the other key"
+        );
+    }
+
+    fn wav(fmt: &[u8], extra_chunk: bool, data: &[u8]) -> Vec<u8> {
+        let mut out = b"RIFF\0\0\0\0WAVE".to_vec();
+        if extra_chunk {
+            // Odd-sized chunk → exercises the pad byte.
+            out.extend_from_slice(b"LIST\x03\0\0\0abc\0");
+        }
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(fmt);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn fmt_chunk(format: u16, channels: u16, rate: u32, bits: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&format.to_le_bytes());
+        f.extend_from_slice(&channels.to_le_bytes());
+        f.extend_from_slice(&rate.to_le_bytes());
+        f.extend_from_slice(&(rate * u32::from(channels) * u32::from(bits) / 8).to_le_bytes());
+        f.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+        f.extend_from_slice(&bits.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn test_pcm_from_payload_raw_pcm_passes_through() {
+        let pcm = pcm_from_payload(b"\x01\x02\x03\x04".to_vec(), None).unwrap();
+        assert_eq!(pcm.pcm, b"\x01\x02\x03\x04");
+        assert_eq!(pcm.sample_rate, GEMINI_PCM_SAMPLE_RATE);
+    }
+
+    #[test]
+    fn test_pcm_from_payload_strips_wav_header() {
+        // Shape returned by gemini-3.x TTS models (`audio/wav`).
+        for extra in [false, true] {
+            let payload = wav(&fmt_chunk(1, 1, 24_000, 16), extra, b"\x10\x20\x30\x40");
+            let pcm = pcm_from_payload(payload, None).unwrap();
+            assert_eq!(pcm.pcm, b"\x10\x20\x30\x40", "extra_chunk={extra}");
+            assert_eq!(pcm.sample_rate, 24_000);
+        }
+        let pcm = pcm_from_payload(wav(&fmt_chunk(1, 1, 16_000, 16), false, b"ab"), None).unwrap();
+        assert_eq!(pcm.sample_rate, 16_000);
+    }
+
+    #[test]
+    fn test_pcm_from_payload_clamps_oversized_data_chunk() {
+        let mut payload = wav(&fmt_chunk(1, 1, 24_000, 16), false, b"abcd");
+        let len = payload.len();
+        payload[len - 8..len - 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(pcm_from_payload(payload, None).unwrap().pcm, b"abcd");
+    }
+
+    #[test]
+    fn test_pcm_from_payload_rejects_unsupported_wav() {
+        for (fmt, why) in [
+            (fmt_chunk(1, 2, 24_000, 16), "stereo"),
+            (fmt_chunk(1, 1, 24_000, 8), "8-bit"),
+            (fmt_chunk(3, 1, 24_000, 16), "float"),
+            (fmt_chunk(1, 1, 8_000, 16), "8 kHz"),
+            (fmt_chunk(1, 1, 24_000, 16)[..10].to_vec(), "truncated fmt"),
+        ] {
+            let err = pcm_from_payload(wav(&fmt, false, b"ab"), None).unwrap_err();
+            assert!(err.contains("unsupported WAV"), "{why}: {err}");
+        }
+        assert!(pcm_from_payload(b"RIFF\0\0\0\0AVI ".to_vec(), None).is_err());
+        assert!(pcm_from_payload(b"RIFF\0\0\0\0WAVE".to_vec(), None).is_err()); // no data
+        let mut data_first = b"RIFF\0\0\0\0WAVEdata\x02\0\0\0ab".to_vec();
+        data_first.extend_from_slice(b"fmt ");
+        assert!(pcm_from_payload(data_first, None).is_err());
+    }
+
+    #[test]
+    fn test_pcm_from_payload_unsupported_mime_type_is_err() {
+        let err = pcm_from_payload(b"whatever".to_vec(), Some("audio/mpeg")).unwrap_err();
+        assert!(err.contains("unsupported audio MIME type"), "{err}");
+        assert!(err.contains("audio/mpeg"), "{err}");
+    }
+
+    #[test]
+    fn test_pcm_from_payload_l16_mime_with_explicit_rate() {
+        let pcm = pcm_from_payload(
+            b"\x01\x02\x03\x04".to_vec(),
+            Some("audio/L16;codec=pcm;rate=16000"),
+        )
+        .unwrap();
+        assert_eq!(pcm.pcm, b"\x01\x02\x03\x04");
+        assert_eq!(pcm.sample_rate, 16_000);
+    }
+
+    #[test]
+    fn test_pcm_from_payload_l16_mime_rejects_unsupported_or_unparseable_rate() {
+        for mime in [
+            "audio/L16;rate=0",
+            "audio/L16;rate=8000",
+            "audio/L16;rate=96000",
+            "audio/L16;rate=abc",
+        ] {
+            let err = pcm_from_payload(b"\x01\x02".to_vec(), Some(mime)).unwrap_err();
+            assert!(err.contains("unsupported PCM sample rate"), "{mime}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_pcm_from_payload_l16_mime_without_rate_defaults_to_gemini_rate() {
+        let pcm = pcm_from_payload(b"\x01\x02".to_vec(), Some("audio/L16")).unwrap();
+        assert_eq!(pcm.sample_rate, GEMINI_PCM_SAMPLE_RATE);
+    }
+
+    #[test]
+    fn test_pcm_from_payload_wav_mime_type_dispatches_to_wav_parser() {
+        let payload = wav(&fmt_chunk(1, 1, 44_100, 16), false, b"wavd");
+        let pcm = pcm_from_payload(payload, Some("audio/wav")).unwrap();
+        assert_eq!(pcm.pcm, b"wavd");
+        assert_eq!(pcm.sample_rate, 44_100);
+    }
+
+    #[tokio::test]
+    async fn test_wav_payload_is_unwrapped_end_to_end() {
+        let server = MockServer::start().await;
+        let payload = wav(&fmt_chunk(1, 1, 24_000, 16), false, b"pcmdata!");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(audio_response_body(&b64)))
+            .mount(&server)
+            .await;
+        let client = make_client(&server, vec!["key1"]);
+        let pcm = client.do_synthesize(req("hi", "Puck", None)).await.unwrap();
+        assert_eq!(pcm.pcm, b"pcmdata!");
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_wav_payload_is_fatal_end_to_end() {
+        let server = MockServer::start().await;
+        let payload = wav(&fmt_chunk(1, 2, 24_000, 16), false, b"abcd"); // stereo
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(audio_response_body(&b64)))
+            .expect(1) // decode failure happens after rotation; no second key / retry
+            .mount(&server)
+            .await;
+        let client = make_client(&server, vec!["keyA", "keyB"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        match err {
+            TtsError::Fatal(msg) => assert!(msg.contains("unsupported WAV"), "{msg}"),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_mime_type_error_is_scrubbed_of_configured_key_end_to_end() {
+        // F3: `pcm_from_payload`'s error text is upstream-derived (the success-body
+        // `mimeType`), so `do_synthesize` must scrub it exactly like every other
+        // upstream-derived `Fatal` in this file before it can reach the tool result or a log.
+        let server = MockServer::start().await;
+        let pcm_b64 = base64::engine::general_purpose::STANDARD.encode(b"whatever");
+        let mime_with_key = "audio/mpeg;codec=keyA-should-never-leak";
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(audio_response_body_with_mime(&pcm_b64, mime_with_key)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["keyA-should-never-leak"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        match err {
+            TtsError::Fatal(msg) => {
+                assert!(
+                    !msg.contains("keyA-should-never-leak"),
+                    "the configured key must never appear verbatim: {msg}"
+                );
+                assert!(msg.contains("[REDACTED]"), "{msg}");
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_mime_type_error_is_truncated_end_to_end() {
+        // F3: the `mimeType` field is only capped by `MAX_AUDIO_RESPONSE_BYTES`, so an
+        // oversized upstream value must still come back bounded by `MAX_SCRUBBED_LEN` once it
+        // reaches a `TtsError::Fatal`.
+        let server = MockServer::start().await;
+        let pcm_b64 = base64::engine::general_purpose::STANDARD.encode(b"whatever");
+        let huge_mime = format!("audio/mpeg;junk={}", "x".repeat(100 * 1024));
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(audio_response_body_with_mime(&pcm_b64, &huge_mime)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["key1"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        match err {
+            TtsError::Fatal(msg) => {
+                assert!(
+                    msg.len() < 100 * 1024,
+                    "error text must be truncated, got {} bytes",
+                    msg.len()
+                );
+                assert!(msg.contains("...[truncated]"), "{msg}");
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_key_spanning_truncation_boundary_is_still_scrubbed_end_to_end() {
+        // F1 (iter-2 regression): `pcm_from_payload` must not truncate the upstream `mimeType`
+        // itself before `do_synthesize` scrubs it — otherwise a configured key that straddles
+        // the internal cut point survives as an un-redacted fragment. Place a 64-byte key so it
+        // spans byte 512 of the raw `mimeType` value (the old internal truncation boundary) and
+        // assert the fix (redact the full string, then truncate once at the call site) still
+        // removes it completely.
+        let server = MockServer::start().await;
+        let pcm_b64 = base64::engine::general_purpose::STANDARD.encode(b"whatever");
+        // A 64-byte key placed at mime-relative offset 455: it crosses the old internal
+        // truncation point (byte 512 of the raw `mimeType`) at offset 519, while its first 16
+        // bytes still sit before the outer scrub-truncation point (full-message byte 512, i.e.
+        // mime-relative byte 471) — exactly the window the old code leaked a key prefix from.
+        let key = "0123456789ABCDEF".repeat(4);
+        let mime_with_key = format!("audio/mpeg;x={}{key}", "x".repeat(442));
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(audio_response_body_with_mime(&pcm_b64, &mime_with_key)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec![key.as_str()]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        match err {
+            TtsError::Fatal(msg) => {
+                assert!(
+                    !msg.contains(&key),
+                    "the configured key must never appear verbatim: {msg}"
+                );
+                assert!(
+                    !msg.contains(&key[..16]),
+                    "no fragment of the configured key may survive: {msg}"
+                );
+                assert!(msg.contains("[REDACTED]"), "{msg}");
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wav_payload_sample_rate_propagates_end_to_end() {
+        let server = MockServer::start().await;
+        let payload = wav(&fmt_chunk(1, 1, 16_000, 16), true, b"pcm!");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(audio_response_body(&b64)))
+            .mount(&server)
+            .await;
+        let client = make_client(&server, vec!["key1"]);
+        let pcm = client.do_synthesize(req("hi", "Puck", None)).await.unwrap();
+        assert_eq!(pcm.pcm, b"pcm!");
+        assert_eq!(pcm.sample_rate, 16_000);
+    }
+
+    #[test]
+    fn test_is_model_generated_text() {
+        assert!(is_model_generated_text(
+            r#"{"error":{"message":"Model tried to generate text, but it should only be used for TTS."}}"#
+        ));
+        assert!(!is_model_generated_text(
+            r#"{"error":{"message":"Invalid voice name"}}"#
+        ));
+        assert!(!is_model_generated_text("Model tried to generate text")); // not JSON
     }
 
     #[tokio::test]

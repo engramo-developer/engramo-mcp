@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Structured error body returned by the Engram API for quota exceeded (HTTP 429).
+/// Structured error body returned by the Engramo API for quota exceeded (HTTP 429).
 #[derive(Debug, Deserialize)]
 pub struct QuotaExceededBody {
     pub resource_type: Option<String>,
@@ -9,7 +9,7 @@ pub struct QuotaExceededBody {
     pub limit: Option<i64>,
 }
 
-/// Errors produced by the Engram HTTP client.
+/// Errors produced by the Engramo HTTP client.
 /// These are always converted to `Ok(CallToolResult { is_error: true })` at the tool level —
 /// never returned as a raw Rust `Err()`, which would crash the AI's tool-calling loop.
 #[derive(Debug, Error)]
@@ -36,11 +36,11 @@ pub enum ApiError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
-    #[error("Unauthorized: API token is invalid or expired. Check your ENGRAM_API_TOKEN.")]
+    #[error("Unauthorized: API token is invalid or expired. Check your ENGRAMO_API_TOKEN.")]
     Unauthorized,
 
     #[error(
-        "Server error: the Engram API returned an internal error. Please try again in a moment."
+        "Server error: the Engramo API returned an internal error. Please try again in a moment."
     )]
     Internal,
 
@@ -49,11 +49,11 @@ pub enum ApiError {
 }
 
 impl From<reqwest::Error> for ApiError {
-    /// Connectivity failures to the Engram API (DNS, TLS, timeout, connection
+    /// Connectivity failures to the Engramo API (DNS, TLS, timeout, connection
     /// refused) are a genuine system failure, not a routine tool-call outcome —
     /// log at ERROR here so it reaches GCP Error Reporting (see `error_reporting`).
     fn from(e: reqwest::Error) -> Self {
-        tracing::error!(error = %e, "network error calling Engram API");
+        tracing::error!(error = %e, "network error calling Engramo API");
         Self::Network(e)
     }
 }
@@ -75,9 +75,9 @@ impl ApiError {
             401 => Self::Unauthorized,
             300..=399 => {
                 // The client hardcodes `redirect::Policy::none()` (see
-                // `EngramClient::build_http_client`) so the API key is never forwarded to an
+                // `EngramoClient::build_http_client`) so the API key is never forwarded to an
                 // arbitrary `Location`. A 3xx here is a routine config mistake (e.g.
-                // `ENGRAM_API_URL=http://…` being redirected to `https://…`), not a backend
+                // `ENGRAMO_API_URL=http://…` being redirected to `https://…`), not a backend
                 // failure — log at WARN, not ERROR, so it doesn't page as an incident.
                 //
                 // Redact once and reuse the same value for the log and the client-facing
@@ -85,10 +85,10 @@ impl ApiError {
                 // signed URL, `?token=…`) that must never reach stderr/Cloud Logging or the
                 // MCP client.
                 let location = location.as_deref().map(redact_location);
-                tracing::warn!(status = %status, location = ?location, "Engram API responded with a redirect (not followed)");
+                tracing::warn!(status = %status, location = ?location, "Engramo API responded with a redirect (not followed)");
                 Self::BadRequest(format!(
-                    "Engram API responded with a redirect (HTTP {status}{}); redirects are not \
-                     followed so the API key is never forwarded. Check ENGRAM_API_URL (e.g. use \
+                    "Engramo API responded with a redirect (HTTP {status}{}); redirects are not \
+                     followed so the API key is never forwarded. Check ENGRAMO_API_URL (e.g. use \
                      https:// or the final host directly).",
                     location
                         .as_deref()
@@ -139,7 +139,7 @@ impl ApiError {
                 tracing::error!(
                     status = %status,
                     body = %truncated_body,
-                    "Engram API returned an unexpected status"
+                    "Engramo API returned an unexpected status"
                 );
                 Self::Internal
             }
@@ -397,7 +397,7 @@ mod tests {
         match err {
             ApiError::BadRequest(msg) => {
                 assert!(msg.contains("redirect"), "{msg}");
-                assert!(msg.contains("ENGRAM_API_URL"), "{msg}");
+                assert!(msg.contains("ENGRAMO_API_URL"), "{msg}");
                 assert!(msg.contains("https://api.example.com/catalogs"), "{msg}");
                 assert!(!msg.contains("token=secret"), "{msg}");
             }

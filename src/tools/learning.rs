@@ -7,7 +7,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use crate::client::EngramClient;
+use crate::client::EngramoClient;
 use crate::tools::catalogs::{err_result, ok_json, ok_text, parse_uuid};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -32,14 +32,14 @@ pub struct AddCatalogToLearningParams {
 
 #[derive(Clone)]
 pub struct LearningTools {
-    pub client: EngramClient,
+    pub client: EngramoClient,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl LearningTools {
-    pub fn new(client: EngramClient) -> Self {
+    pub fn new(client: EngramoClient) -> Self {
         Self {
             client,
             tool_router: Self::tool_router(),
@@ -128,7 +128,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_tools(base_url: &str) -> LearningTools {
-        LearningTools::new(EngramClient::new(base_url, "engram_test"))
+        LearningTools::new(EngramoClient::new(base_url, "engramo_test"))
     }
 
     #[tokio::test]

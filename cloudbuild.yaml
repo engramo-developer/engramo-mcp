@@ -8,7 +8,7 @@ steps:
     args: ['push', 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA']
 
   # 3. Deploy to Cloud Run. No Secret Manager binding needed — engramo-mcp has no
-  # database and no server-side credentials (see src/config.rs): ENGRAM_API_URL and
+  # database and no server-side credentials (see src/config.rs): ENGRAMO_API_URL and
   # MCP_PUBLIC_URL are plain per-environment values, and http mode takes each caller's
   # own bearer token per-request rather than holding one of its own.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -37,16 +37,16 @@ steps:
       # URL, since only MCP_PUBLIC_URL's host is allowed automatically.
       # APP_ENV=dev/prod switches src/main.rs's init_logging() from human-readable
       # local output to GCP Cloud Logging JSON + Error Reporting (see error_reporting.rs).
-      - 'ENGRAM_API_URL=${_ENGRAM_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAM_ENABLE_PAID_AI=${_ENGRAM_ENABLE_PAID_AI},MCP_ALLOWED_HOSTS=${_SERVICE_NAME}-$PROJECT_NUMBER.europe-west1.run.app,APP_ENV=${_APP_ENV}'
+      - 'ENGRAMO_API_URL=${_ENGRAMO_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAMO_ENABLE_PAID_AI=${_ENGRAMO_ENABLE_PAID_AI},MCP_ALLOWED_HOSTS=${_SERVICE_NAME}-$PROJECT_NUMBER.europe-west1.run.app,APP_ENV=${_APP_ENV}'
 
 images:
   - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
 
 substitutions:
   _SERVICE_NAME: 'engramo-mcp'
-  _ENGRAM_API_URL: 'https://api-engram.volmyr.com'
+  _ENGRAMO_API_URL: 'https://api-engram.volmyr.com'
   _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com'
-  _ENGRAM_ENABLE_PAID_AI: 'false'
+  _ENGRAMO_ENABLE_PAID_AI: 'false'
   _APP_ENV: 'dev'
 
 options:

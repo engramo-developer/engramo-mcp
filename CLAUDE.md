@@ -3,7 +3,7 @@
 ## Project Overview
 
 Standalone Rust 2024 binary that exposes the EngrAmo flashcard API to AI clients. Two transports, one binary:
-- `engramo-mcp stdio` (default) — Claude Desktop, Cursor. One process = one user (`ENGRAM_API_TOKEN` env var).
+- `engramo-mcp stdio` (default) — Claude Desktop, Cursor. One process = one user (`ENGRAMO_API_TOKEN` env var).
 - `engramo-mcp http` — Streamable HTTP at `/` (root) for remote clients (e.g. ChatGPT). Multi-user: each session
   authenticates with its own `Authorization: Bearer <token>`; there is no global token in this mode.
 
@@ -21,15 +21,15 @@ src/
 ├── version.rs       — server_version() (compile-time Cargo name/version) + the `GET /version`
 │                       handler; reused by the always-on `get_server_version` MCP tool
 ├── lib.rs           — re-exports public modules
-├── config.rs        — McpConfig: ENGRAM_API_URL (required), ENGRAM_API_TOKEN (optional — required
-│                       only for stdio, see require_token()), ENGRAM_ENABLE_PAID_AI (default off)
-├── client.rs        — EngramClient: typed HTTP client, attaches X-Api-Key header
+├── config.rs        — McpConfig: ENGRAMO_API_URL (required), ENGRAMO_API_TOKEN (optional — required
+│                       only for stdio, see require_token()), ENGRAMO_ENABLE_PAID_AI (default off)
+├── client.rs        — EngramoClient: typed HTTP client, attaches X-Api-Key header
 ├── error.rs         — ApiError enum: maps HTTP status → typed error
 ├── http_auth.rs     — http mode's auth edge: bearer extraction/validation, the CURRENT_BEARER_TOKEN
 │                       task-local, and SessionTokens (binds each MCP session to the token that
 │                       opened it — rmcp authorizes later requests on the session id alone)
 ├── dto.rs           — lightweight DTOs mirroring API JSON shapes
-├── server.rs        — EngramMcpServer: ServerHandler impl + always-on tool handlers; `new()`
+├── server.rs        — EngramoMcpServer: ServerHandler impl + always-on tool handlers; `new()`
 │                       conditionally sums in `Self::paid_ai_tools_router()` when the flag is on;
 │                       `with_tts()` separately sums in the local-TTS router (see `tts/` below)
 ├── tools/
@@ -44,19 +44,19 @@ src/
 │   │                   (bring-your-own-AI — always on, no server-side generation cost)
 │   ├── ai.rs        — feature-flagged paid-AI tools (TTS, translate, dictionary, AI-agent chat,
 │   │                   translate_batch_import) — own `#[tool_router(router = paid_ai_tools_router)]`
-│   │                   impl block on `EngramMcpServer`, only registered when ENGRAM_ENABLE_PAID_AI is on
+│   │                   impl block on `EngramoMcpServer`, only registered when ENGRAMO_ENABLE_PAID_AI is on
 │   └── tts.rs       — local, bring-your-own-key TTS tools (list_tts_voices, generate_card_audio);
 │                       own `#[tool_router(router = local_tts_tools_router)]` impl block, only
-│                       registered by `EngramMcpServer::with_tts()` — stdio only, see `tts/` below
+│                       registered by `EngramoMcpServer::with_tts()` — stdio only, see `tts/` below
 ├── tts/             — engine-agnostic local TTS layer, **stdio-only** (see the Transport invariant
 │                       below); never wired into `http` mode
 │   ├── mod.rs       — TtsEngine trait, TtsConfig::from_env()/from_lookup(), env var names/defaults
-│   ├── gemini.rs    — GeminiTts: key rotation across ENGRAM_TTS_GEMINI_API_KEYS, voice catalog,
+│   ├── gemini.rs    — GeminiTts: key rotation across ENGRAMO_TTS_GEMINI_API_KEYS, voice catalog,
 │   │                   per-key error classification, upstream-text scrubbing
 │   └── mp3.rs       — AudioEncoder seam + pcm16_mono_to_mp3 (statically linked LAME, LGPL-2.0 —
 │                       see THIRD_PARTY_LICENSES)
 ├── resources/
-│   └── mod.rs       — MCP Resources: engram://catalogs, due, stats, learning-paths, subscription, card-schema
+│   └── mod.rs       — MCP Resources: engramo://catalogs, due, stats, learning-paths, subscription, card-schema
 └── prompts/
     └── mod.rs       — MCP Prompts: review_session, create_flashcard, explain_card, study_plan
 ```
@@ -83,23 +83,23 @@ Spans must satisfy all five rules or `rich_text` is discarded:
 
 ### HTTP Client
 - All requests include `X-Api-Key: <token>` header.
-- `EngramClient` methods return `Result<T, ApiError>` — callers convert errors to `err_result`.
+- `EngramoClient` methods return `Result<T, ApiError>` — callers convert errors to `err_result`.
 - Config loaded from env vars:
-  - `ENGRAM_API_URL` — base URL, e.g. `http://localhost:8080`
-  - `ENGRAM_API_TOKEN` — user's API token (required for `stdio`; unused in `http` mode)
-  - `ENGRAM_ENABLE_PAID_AI` — `true`/`1`/`yes`/`on` to register the paid-AI tools (default off)
+  - `ENGRAMO_API_URL` — base URL, e.g. `http://localhost:8080`
+  - `ENGRAMO_API_TOKEN` — user's API token (required for `stdio`; unused in `http` mode)
+  - `ENGRAMO_ENABLE_PAID_AI` — `true`/`1`/`yes`/`on` to register the paid-AI tools (default off)
   - `MCP_BIND_ADDR` — bind address for `http` mode (default `0.0.0.0:8080`)
-  - `ENGRAM_TTS_GEMINI_API_KEYS` — one key or comma-separated list; **stdio only** (see `tts/mod.rs`,
+  - `ENGRAMO_TTS_GEMINI_API_KEYS` — one key or comma-separated list; **stdio only** (see `tts/mod.rs`,
     read only by `run_stdio`). Unset/blank → both local-TTS tools absent. The generic `GEMINI_API_KEY`
     is deliberately never read.
-  - `ENGRAM_TTS_PROVIDER` — engine selector, default `gemini` (only value accepted today)
-  - `ENGRAM_TTS_MODEL` — Gemini TTS model id, default `gemini-2.5-flash-preview-tts`
-  - `ENGRAM_TTS_VOICE` — default voice for `generate_card_audio`, default `Puck`
+  - `ENGRAMO_TTS_PROVIDER` — engine selector, default `gemini` (only value accepted today)
+  - `ENGRAMO_TTS_MODEL` — Gemini TTS model id, default `gemini-3.8-flash-tts`
+  - `ENGRAMO_TTS_VOICE` — default voice for `generate_card_audio`, default `Puck`
 
 ### Transport
-- **stdio** (default): `cargo run -- stdio` (or no subcommand). One process = one user, `EngramClient` built
-  once from `ENGRAM_API_TOKEN`. Compatible with Claude Desktop and Cursor.
-  Start with: `ENGRAM_API_URL=... ENGRAM_API_TOKEN=... cargo run`
+- **stdio** (default): `cargo run -- stdio` (or no subcommand). One process = one user, `EngramoClient` built
+  once from `ENGRAMO_API_TOKEN`. Compatible with Claude Desktop and Cursor.
+  Start with: `ENGRAMO_API_URL=... ENGRAMO_API_TOKEN=... cargo run`
 - **http**: `cargo run -- http`. Serves rmcp's `StreamableHttpService` at `/` (root, via `fallback_service` —
   axum no longer allows `nest_service` at root) behind an axum `Router`.
   A `bearer_auth_middleware` (`http_auth.rs`) extracts `Authorization: Bearer <token>` and scopes it into a
@@ -108,7 +108,7 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   headers. The factory runs synchronously inside `handle_post` while establishing a new session
   (`initialize` request), which is still within the task the middleware scoped, so `try_with` sees the
   value. Missing/empty bearer → `401` at the middleware, before a session is ever created. One
-  `EngramClient` (and thus one EngrAmo account) per MCP session, for the session's lifetime.
+  `EngramoClient` (and thus one EngrAmo account) per MCP session, for the session's lifetime.
 - **Session binding (security):** rmcp authorizes every post-`initialize` request on the `Mcp-Session-Id`
   header alone, so `SessionTokens` records which token opened each session and 401s a request that presents a
   different one — otherwise a leaked session id would let anyone act as that session's owner. Requests are

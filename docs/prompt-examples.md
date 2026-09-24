@@ -29,7 +29,7 @@ topic="ordering coffee", source_lang="Spanish", target_lang="English", count=5
 ```
 
 Produces 5 cards, each with 1-4 key words highlighted and added to the dictionary, a translated
-back side, and one style reused across the whole deck. See `engram://card-schema`'s Example 3 for
+back side, and one style reused across the whole deck. See `engramo://card-schema`'s Example 3 for
 exactly what the output looks like.
 
 Add an existing catalog instead of creating a new one:

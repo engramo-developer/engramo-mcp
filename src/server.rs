@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 
 use base64::Engine;
 
-use crate::client::EngramClient;
+use crate::client::EngramoClient;
 use crate::dto::{
     CardInput, CreateCardRequest, CreateCatalogWithCardsApiRequest, CreateLearningPathRequest,
     UpdateCardRequest, UpdateCatalogRequest, UploadMediaResult,
@@ -40,8 +40,8 @@ use crate::tools::search::SearchParams;
 use crate::tts::TtsEngine;
 use uuid::Uuid;
 
-pub struct EngramMcpServer {
-    pub(crate) client: EngramClient,
+pub struct EngramoMcpServer {
+    pub(crate) client: EngramoClient,
     /// Local, bring-your-own-key TTS engine (`tools/tts.rs`). `None` unless `with_tts` was
     /// called — which only `run_stdio` (`main.rs`) ever does. `http` mode's session factory
     /// (`build_session_server`, below) never calls it, so a session built there can never
@@ -51,17 +51,17 @@ pub struct EngramMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
-impl EngramMcpServer {
+impl EngramoMcpServer {
     /// `paid_ai_enabled` gates whether the paid-AI tool router (TTS, translation,
     /// dictionary, AI-agent chat — see `tools/ai.rs`) is registered at all. When
     /// `false`, those tools are entirely absent from `tools/list` — the public,
-    /// bring-your-own-AI deployment default (`ENGRAM_ENABLE_PAID_AI` unset).
+    /// bring-your-own-AI deployment default (`ENGRAMO_ENABLE_PAID_AI` unset).
     ///
     /// Local TTS (`tools/tts.rs`) is never registered here — call [`Self::with_tts`]
     /// afterwards to add it. This signature is unchanged on purpose: `http` mode's session
     /// factory calls this (via [`build_session_server`]) and must have no way to end up with
     /// a TTS engine.
-    pub fn new(client: EngramClient, paid_ai_enabled: bool) -> Self {
+    pub fn new(client: EngramoClient, paid_ai_enabled: bool) -> Self {
         let mut tool_router = Self::server_info_tools_router()
             + Self::catalog_tools_router()
             + Self::card_tools_router()
@@ -91,25 +91,25 @@ impl EngramMcpServer {
     }
 }
 
-/// Builds the `EngramMcpServer` for one `http`-mode session from that session's own bearer
+/// Builds the `EngramoMcpServer` for one `http`-mode session from that session's own bearer
 /// token. Extracted out of the session factory closure in `build_app` (`main.rs`) so it can be unit
 /// tested directly without going through axum/rmcp plumbing (rollout plan R8). Deliberately
-/// has **no** TTS parameter and never calls [`EngramMcpServer::with_tts`] — see the `tts`
+/// has **no** TTS parameter and never calls [`EngramoMcpServer::with_tts`] — see the `tts`
 /// module doc comment. Behaviour is otherwise identical to what the closure did before.
 pub fn build_session_server(
     http: &crate::client::HardenedClient,
     api_url: &str,
     token: &str,
     paid_ai_enabled: bool,
-) -> EngramMcpServer {
-    let client = EngramClient::with_http(http.clone(), api_url, token);
-    EngramMcpServer::new(client, paid_ai_enabled)
+) -> EngramoMcpServer {
+    let client = EngramoClient::with_http(http.clone(), api_url, token);
+    EngramoMcpServer::new(client, paid_ai_enabled)
 }
 
 // ── Server info tools ─────────────────────────────────────────────────────────
 
 #[tool_router(router = server_info_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(
         description = "Get the version of this EngrAmo MCP server binary itself (its build/release \
         version, e.g. from Cargo.toml) — NOT a catalog's or card's `version` field (an unrelated \
@@ -124,7 +124,7 @@ impl EngramMcpServer {
 // ── Catalog tools ─────────────────────────────────────────────────────────────
 
 #[tool_router(router = catalog_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(
         description = "List the user's flashcard catalogs with cursor-based pagination. Returns id, name, and card_count for each catalog. Use get_catalog to fetch full details."
     )]
@@ -205,7 +205,7 @@ impl EngramMcpServer {
 // ── Card tools ────────────────────────────────────────────────────────────────
 
 #[tool_router(router = card_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(description = "List flashcards in a catalog with cursor-based pagination.")]
     pub async fn list_cards(
         &self,
@@ -353,7 +353,7 @@ impl EngramMcpServer {
 // ── Learning tools ────────────────────────────────────────────────────────────
 
 #[tool_router(router = learning_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(
         description = "Get flashcards due for review today, sorted by priority. Use this to start a study session."
     )]
@@ -424,7 +424,7 @@ impl EngramMcpServer {
 // ── Learning path tools ───────────────────────────────────────────────────────
 
 #[tool_router(router = learning_path_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(description = "List all learning paths with cursor-based pagination.")]
     pub async fn list_learning_paths(
         &self,
@@ -505,7 +505,7 @@ impl EngramMcpServer {
 // ── Search tools ──────────────────────────────────────────────────────────────
 
 #[tool_router(router = search_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(
         description = "Search across all cards, catalogs, and learning paths. Returns ids and types. \
         If the user gives you a catalog's short ID (the ~8-character code shown in the app/URL, e.g. \
@@ -543,7 +543,7 @@ impl EngramMcpServer {
 // ── Media tools ───────────────────────────────────────────────────────────────
 
 #[tool_router(router = media_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(
         description = "List uploaded media files. Optionally filter by media type ('image', 'audio', etc.)."
     )]
@@ -614,10 +614,10 @@ impl EngramMcpServer {
 
 // ── ServerHandler ─────────────────────────────────────────────────────────────
 
-impl ServerHandler for EngramMcpServer {
+impl ServerHandler for EngramoMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut instructions = String::from(
-            "Engram flashcard assistant. Use catalog and card tools to manage flashcards, \
+            "Engramo flashcard assistant. Use catalog and card tools to manage flashcards, \
              learning tools to track spaced-repetition progress, and search to find content. \
              Cards can carry more than plain text — a dictionary (word translations), rich_text/style \
              (font, color, per-side styling), and your own audio/images via upload_media (bring your \
@@ -626,13 +626,13 @@ impl ServerHandler for EngramMcpServer {
              shown in the app/URL (e.g. \"A7KX9QM2\") — if the user gives you a short ID, resolve it \
              first with search_catalogs/search_global (it's indexed, so this is fast and usually \
              returns one exact match), don't page through list_catalogs guessing. \
-             Resources expose live data (catalogs, due cards, stats) and engram://card-schema documents \
+             Resources expose live data (catalogs, due cards, stats) and engramo://card-schema documents \
              all of the above with worked examples. \
              Prompts guide you through review sessions, flashcard creation (including \
              create_language_deck for styled, translated, dictionary-annotated decks), and study planning.",
         );
         if self.tts.is_some() {
-            // Only true when the user configured their own TTS key (ENGRAM_TTS_GEMINI_API_KEYS,
+            // Only true when the user configured their own TTS key (ENGRAMO_TTS_GEMINI_API_KEYS,
             // stdio-only — see `with_tts`/`tts` module doc comment): still no paid AI, since this
             // spends the user's own Gemini quota, never EngrAmo's.
             instructions.push_str(
@@ -886,7 +886,7 @@ fn normalize_card_content(content: &mut crate::dto::CardContent) {
 }
 
 #[tool_router(router = generate_tools_router)]
-impl EngramMcpServer {
+impl EngramoMcpServer {
     #[tool(description = "Create a single styled flashcard. \
             Pass catalog_id to add to an existing catalog; omit for the default catalog. \
             For language-learning cards: translate face.text yourself and set back.text before calling; \
@@ -1039,7 +1039,7 @@ mod tests {
     ];
 
     // Local, bring-your-own-key TTS tools (`tools/tts.rs`) — gated purely by whether
-    // `with_tts` was called, never by `ENGRAM_ENABLE_PAID_AI`.
+    // `with_tts` was called, never by `ENGRAMO_ENABLE_PAID_AI`.
     const LOCAL_TTS_TOOL_NAMES: [&str; 2] = ["list_tts_voices", "generate_card_audio"];
 
     fn fake_tts_engine() -> std::sync::Arc<dyn crate::tts::TtsEngine> {
@@ -1050,7 +1050,7 @@ mod tests {
         ))
     }
 
-    fn tool_names(server: &EngramMcpServer) -> Vec<String> {
+    fn tool_names(server: &EngramoMcpServer) -> Vec<String> {
         server
             .tool_router
             .list_all()
@@ -1061,8 +1061,8 @@ mod tests {
 
     #[test]
     fn test_get_info_instructions_mention_rich_card_capabilities() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let instructions = server.get_info().instructions.unwrap_or_default();
         // These are the capabilities a plain "what can you do?" should surface without the
         // user needing to already know a tool/prompt name — see docs/prompt-examples.md.
@@ -1079,8 +1079,8 @@ mod tests {
 
     #[test]
     fn test_get_info_instructions_omit_tts_mention_without_tts_engine() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let instructions = server.get_info().instructions.unwrap_or_default();
         assert!(
             !instructions.contains("generate_card_audio"),
@@ -1095,8 +1095,8 @@ mod tests {
 
     #[test]
     fn test_get_info_instructions_mention_tts_when_engine_configured() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false).with_tts(fake_tts_engine());
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false).with_tts(fake_tts_engine());
         let instructions = server.get_info().instructions.unwrap_or_default();
         assert!(
             instructions.contains("generate_card_audio"),
@@ -1120,8 +1120,8 @@ mod tests {
         // `Implementation::from_build_env()`, which resolves to rmcp's own crate name/version
         // (since those `env!` macros expand when rmcp is compiled) rather than ours. Assert
         // clients actually see "engramo-mcp" / this crate's version.
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let server_info = server.get_info().server_info;
         assert_eq!(server_info.name, "engramo-mcp");
         assert!(!server_info.version.is_empty());
@@ -1133,10 +1133,10 @@ mod tests {
         // Regression guard: `tools/media.rs`'s `MediaTools` struct is a separate, unused
         // scaffold (like every other `tools/*.rs` XxxTools struct in this codebase) — the
         // tool actually served to clients is the one registered directly on
-        // `EngramMcpServer` below. A tool added only to `MediaTools` would pass its own
+        // `EngramoMcpServer` below. A tool added only to `MediaTools` would pass its own
         // tests while being completely unreachable from a real MCP client.
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let names = tool_names(&server);
         assert!(names.contains(&"upload_media".to_string()), "{names:?}");
         assert!(names.contains(&"list_media".to_string()), "{names:?}");
@@ -1145,9 +1145,9 @@ mod tests {
     #[test]
     fn test_search_tools_describe_short_id_resolution_on_the_real_server() {
         // Same regression class as the upload_media test above: assert against the tool
-        // actually registered on EngramMcpServer, not the unused tools/search.rs scaffold.
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        // actually registered on EngramoMcpServer, not the unused tools/search.rs scaffold.
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let tools = server.tool_router.list_all();
         for name in ["search_global", "search_catalogs"] {
             let tool = tools
@@ -1174,8 +1174,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = EngramClient::new(mock_server.uri(), "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new(mock_server.uri(), "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let result = server
             .upload_media(Parameters(UploadMediaParams {
                 content_base64: base64::engine::general_purpose::STANDARD.encode(b"test audio"),
@@ -1189,8 +1189,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_server_version_returns_crate_name_and_version() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let result = server.get_server_version().await.unwrap();
         assert!(!result.is_error.unwrap_or(false));
         let text = result
@@ -1205,34 +1205,34 @@ mod tests {
 
     #[test]
     fn test_paid_ai_tools_absent_when_flag_off() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let names = tool_names(&server);
         for tool in PAID_AI_TOOL_NAMES {
             assert!(
                 !names.contains(&tool.to_string()),
-                "expected {tool} to be ABSENT when ENGRAM_ENABLE_PAID_AI is off"
+                "expected {tool} to be ABSENT when ENGRAMO_ENABLE_PAID_AI is off"
             );
         }
     }
 
     #[test]
     fn test_paid_ai_tools_present_when_flag_on() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, true);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, true);
         let names = tool_names(&server);
         for tool in PAID_AI_TOOL_NAMES {
             assert!(
                 names.contains(&tool.to_string()),
-                "expected {tool} to be registered when ENGRAM_ENABLE_PAID_AI is on"
+                "expected {tool} to be registered when ENGRAMO_ENABLE_PAID_AI is on"
             );
         }
     }
 
     #[test]
     fn test_local_tts_tools_absent_by_default() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false);
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
         let names = tool_names(&server);
         for tool in LOCAL_TTS_TOOL_NAMES {
             assert!(
@@ -1245,8 +1245,8 @@ mod tests {
 
     #[test]
     fn test_local_tts_tools_present_after_with_tts() {
-        let client = EngramClient::new("http://localhost", "engram_test");
-        let server = EngramMcpServer::new(client, false).with_tts(fake_tts_engine());
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false).with_tts(fake_tts_engine());
         let names = tool_names(&server);
         for tool in LOCAL_TTS_TOOL_NAMES {
             assert!(
@@ -1259,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_local_tts_tools_absent_via_build_session_server_paid_ai_off() {
-        let http = EngramClient::build_http_client();
+        let http = EngramoClient::build_http_client();
         let server = build_session_server(&http, "http://localhost", "session-token", false);
         let names = tool_names(&server);
         for tool in LOCAL_TTS_TOOL_NAMES {
@@ -1273,7 +1273,7 @@ mod tests {
 
     #[test]
     fn test_local_tts_tools_absent_via_build_session_server_paid_ai_on() {
-        let http = EngramClient::build_http_client();
+        let http = EngramoClient::build_http_client();
         let server = build_session_server(&http, "http://localhost", "session-token", true);
         let names = tool_names(&server);
         for tool in LOCAL_TTS_TOOL_NAMES {
@@ -1288,8 +1288,8 @@ mod tests {
     #[test]
     fn test_always_on_tools_present_regardless_of_flag() {
         for flag in [false, true] {
-            let client = EngramClient::new("http://localhost", "engram_test");
-            let server = EngramMcpServer::new(client, flag);
+            let client = EngramoClient::new("http://localhost", "engramo_test");
+            let server = EngramoMcpServer::new(client, flag);
             let names = tool_names(&server);
             assert!(names.contains(&"list_catalogs".to_string()));
             assert!(names.contains(&"generate_card".to_string()));

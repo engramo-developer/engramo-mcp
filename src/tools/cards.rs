@@ -8,7 +8,7 @@ use rmcp::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::client::EngramClient;
+use crate::client::EngramoClient;
 use crate::dto::{CardContent, UpdateCardRequest};
 use crate::tools::catalogs::{err_result, ok_json, ok_text, parse_uuid};
 
@@ -54,14 +54,14 @@ pub struct DeleteCardParams {
 
 #[derive(Clone)]
 pub struct CardTools {
-    pub client: EngramClient,
+    pub client: EngramoClient,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl CardTools {
-    pub fn new(client: EngramClient) -> Self {
+    pub fn new(client: EngramoClient) -> Self {
         Self {
             client,
             tool_router: Self::tool_router(),
@@ -175,7 +175,7 @@ mod tests {
     }
 
     fn make_tools(base_url: &str) -> CardTools {
-        CardTools::new(EngramClient::new(base_url, "engram_test"))
+        CardTools::new(EngramoClient::new(base_url, "engramo_test"))
     }
 
     #[tokio::test]

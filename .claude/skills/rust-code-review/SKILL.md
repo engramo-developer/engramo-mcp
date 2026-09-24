@@ -20,7 +20,7 @@ Apply this checklist to the target. Surface real issues, not stylistic noise. Se
 - [ ] Every `#[tool_router]` method has `#[tool(description = "...")]`; descriptions tell the model when to use it
 - [ ] Every params struct derives `schemars::JsonSchema` + `Deserialize`, with doc comments on fields
 - [ ] Paid-AI tools live only in the `#[tool_router(router = paid_ai_tools_router)]` block in `src/tools/ai.rs` and are
-      summed in by `EngramMcpServer::new()` only when `ENGRAM_ENABLE_PAID_AI` is on — never registered unconditionally
+      summed in by `EngramoMcpServer::new()` only when `ENGRAMO_ENABLE_PAID_AI` is on — never registered unconditionally
 - [ ] Bring-your-own-AI tools (`src/tools/generate.rs`) never call a paid server-side AI endpoint
 
 ### Rich text (R1–R5)
@@ -31,7 +31,7 @@ Apply this checklist to the target. Surface real issues, not stylistic noise. Se
 - [ ] Update-card merge keeps server-managed fields (`audio_id`, `dictionary`) when the model omits them
 
 ### HTTP client and errors
-- [ ] All API calls go through `EngramClient` and carry the `X-Api-Key` header
+- [ ] All API calls go through `EngramoClient` and carry the `X-Api-Key` header
 - [ ] Non-2xx responses mapped with `ApiError::from_response`, not ad-hoc status checks
 - [ ] Transport failures wrapped as `ApiError::Network`
 - [ ] Error text shown to the model is actionable (e.g. 409 tells it to fetch the latest version)

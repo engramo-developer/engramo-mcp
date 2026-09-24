@@ -72,7 +72,7 @@ pub(crate) fn parse_uuid(s: &str) -> Result<Uuid, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::EngramClient;
+    use crate::client::EngramoClient;
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -81,8 +81,8 @@ mod tests {
         Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
     }
 
-    fn make_server(base_url: &str) -> crate::server::EngramMcpServer {
-        crate::server::EngramMcpServer::new(EngramClient::new(base_url, "engram_test"), false)
+    fn make_server(base_url: &str) -> crate::server::EngramoMcpServer {
+        crate::server::EngramoMcpServer::new(EngramoClient::new(base_url, "engramo_test"), false)
     }
 
     #[tokio::test]
