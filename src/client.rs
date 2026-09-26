@@ -11,7 +11,7 @@ use crate::dto::{
     PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UploadMediaResponseDto,
     UsageSummaryDto, UserSubscriptionDto,
 };
-use crate::error::ApiError;
+use crate::error::{ApiError, read_bounded};
 
 /// True for Unicode formatting characters that have no visible glyph of their
 /// own but can still change how a filename *displays* — e.g. RIGHT-TO-LEFT
@@ -27,6 +27,53 @@ fn is_unicode_format_char(c: char) -> bool {
         | '\u{FEFF}' // BOM / ZERO WIDTH NO-BREAK SPACE
     )
 }
+
+/// The per-page cap for every list endpoint. The server caps it, and `page_params` clamps
+/// `limit` to `1..=MAX_PAGE_LIMIT` before sending.
+pub(crate) const MAX_PAGE_LIMIT: i64 = 50;
+/// Real cursors, search queries and media-type filters are short; anything longer is a
+/// malformed or abusive value that would only produce an oversized upstream URL (and a noisy
+/// 414/431 error log).
+const MAX_QUERY_PARAM_LEN: usize = 512;
+
+/// Validates one free-form, LLM-supplied query value and returns it as a query pair. Rejects
+/// an over-long value before any request is sent, so there is a single limit for `cursor`,
+/// `q` and `media_type`.
+fn bounded_param(name: &'static str, value: &str) -> Result<(&'static str, String), ApiError> {
+    if value.len() > MAX_QUERY_PARAM_LEN {
+        let hint = if name == "cursor" {
+            "; pass back the exact value from the previous response"
+        } else {
+            ""
+        };
+        return Err(ApiError::BadRequest(format!(
+            "{name} is too long (max {MAX_QUERY_PARAM_LEN} bytes){hint}"
+        )));
+    }
+    Ok((name, value.to_string()))
+}
+
+/// Builds the `limit`/`cursor` query parameters shared by every paginated list endpoint. The
+/// values come from the calling LLM, so `limit` is clamped to `1..=MAX_PAGE_LIMIT` and an
+/// over-long `cursor` is rejected before any request is sent.
+fn page_params(
+    limit: Option<i64>,
+    cursor: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, ApiError> {
+    let mut params = Vec::new();
+    if let Some(l) = limit {
+        params.push(("limit", l.clamp(1, MAX_PAGE_LIMIT).to_string()));
+    }
+    if let Some(c) = cursor {
+        params.push(bounded_param("cursor", c)?);
+    }
+    Ok(params)
+}
+
+/// Upper bound on a 2xx response body read into memory. A misbehaving upstream or proxy must
+/// not be able to make one session allocate without bound (the 30 s timeout limits time, not
+/// size).
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Typed HTTP client for the Engramo REST API.
 /// Every request automatically attaches the user's API token via `X-Api-Key`.
@@ -216,12 +263,36 @@ impl EngramoClient {
         }
     }
 
+    /// Builds the size-cap error, logging it at ERROR: an oversized body is an abnormal
+    /// upstream/proxy condition that should reach Error Reporting.
+    fn response_too_large() -> ApiError {
+        tracing::error!(
+            limit = MAX_RESPONSE_BYTES,
+            "Engramo API response body exceeds size limit"
+        );
+        ApiError::ResponseTooLarge(MAX_RESPONSE_BYTES)
+    }
+
     async fn deserialize<T: serde::de::DeserializeOwned>(
         &self,
         resp: reqwest::Response,
     ) -> Result<T, ApiError> {
         if resp.status().is_success() {
-            resp.json::<T>().await.map_err(ApiError::from)
+            // Read the body separately from parsing it: a transport failure while reading
+            // (`?` via `From<reqwest::Error>`) is still a `Network` error, while a failure
+            // to deserialize an otherwise-successful body is a `Decode` error — see
+            // `ApiError::decode` for why these need different, non-vague messages (#35).
+            if resp
+                .content_length()
+                .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+            {
+                return Err(Self::response_too_large());
+            }
+            let (buf, truncated) = read_bounded(resp, MAX_RESPONSE_BYTES).await?;
+            if truncated {
+                return Err(Self::response_too_large());
+            }
+            serde_json::from_slice::<T>(&buf).map_err(ApiError::decode)
         } else {
             Err(ApiError::from_response(resp).await)
         }
@@ -234,13 +305,7 @@ impl EngramoClient {
         limit: Option<i64>,
         cursor: Option<&str>,
     ) -> Result<PagedResponse<CatalogDto>, ApiError> {
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(l) = limit {
-            params.push(("limit", l.to_string()));
-        }
-        if let Some(c) = cursor {
-            params.push(("cursor", c.to_string()));
-        }
+        let params = page_params(limit, cursor)?;
         self.get_with_query("/catalogs", &params).await
     }
 
@@ -272,13 +337,7 @@ impl EngramoClient {
         limit: Option<i64>,
         cursor: Option<&str>,
     ) -> Result<CatalogWithCardsResponse, ApiError> {
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(l) = limit {
-            params.push(("limit", l.to_string()));
-        }
-        if let Some(c) = cursor {
-            params.push(("cursor", c.to_string()));
-        }
+        let params = page_params(limit, cursor)?;
         self.get_with_query(&format!("/catalogs/{catalog_id}/cards"), &params)
             .await
     }
@@ -337,13 +396,7 @@ impl EngramoClient {
         limit: Option<i64>,
         cursor: Option<&str>,
     ) -> Result<PagedResponseWithCount<LearningCardDto>, ApiError> {
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(l) = limit {
-            params.push(("limit", l.to_string()));
-        }
-        if let Some(c) = cursor {
-            params.push(("cursor", c.to_string()));
-        }
+        let params = page_params(limit, cursor)?;
         self.get_with_query("/learning/cards", &params).await
     }
 
@@ -352,13 +405,7 @@ impl EngramoClient {
         limit: Option<i64>,
         cursor: Option<&str>,
     ) -> Result<PagedResponseWithCount<LearningCardDto>, ApiError> {
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(l) = limit {
-            params.push(("limit", l.to_string()));
-        }
-        if let Some(c) = cursor {
-            params.push(("cursor", c.to_string()));
-        }
+        let params = page_params(limit, cursor)?;
         self.get_with_query("/learning/cards/all", &params).await
     }
 
@@ -397,13 +444,7 @@ impl EngramoClient {
         limit: Option<i64>,
         cursor: Option<&str>,
     ) -> Result<PagedResponse<LearningPathDto>, ApiError> {
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(l) = limit {
-            params.push(("limit", l.to_string()));
-        }
-        if let Some(c) = cursor {
-            params.push(("cursor", c.to_string()));
-        }
+        let params = page_params(limit, cursor)?;
         self.get_with_query("/learning-paths", &params).await
     }
 
@@ -434,12 +475,12 @@ impl EngramoClient {
     // ── Search ────────────────────────────────────────────────────────────────
 
     pub async fn search_global(&self, query: &str) -> Result<Vec<GlobalSearchResult>, ApiError> {
-        self.get_with_query("/search", &[("q", query.to_string())])
+        self.get_with_query("/search", &[bounded_param("q", query)?])
             .await
     }
 
     pub async fn search_catalogs(&self, query: &str) -> Result<Vec<CatalogDto>, ApiError> {
-        self.get_with_query("/search/catalogs", &[("q", query.to_string())])
+        self.get_with_query("/search/catalogs", &[bounded_param("q", query)?])
             .await
     }
 
@@ -449,14 +490,13 @@ impl EngramoClient {
         &self,
         media_type: Option<&str>,
         limit: Option<i64>,
+        cursor: Option<&str>,
     ) -> Result<PagedResponse<MediaDto>, ApiError> {
         let mut params: Vec<(&str, String)> = Vec::new();
         if let Some(mt) = media_type {
-            params.push(("media_type", mt.to_string()));
+            params.push(bounded_param("media_type", mt)?);
         }
-        if let Some(l) = limit {
-            params.push(("limit", l.to_string()));
-        }
+        params.extend(page_params(limit, cursor)?);
         self.get_with_query("/media", &params).await
     }
 
@@ -620,7 +660,7 @@ mod tests {
             .and(header("x-api-key", "engramo_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"id": mock_id(), "name": "Rust", "version": 1}],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -643,7 +683,7 @@ mod tests {
             .and(query_param("cursor", "abc"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -653,6 +693,29 @@ mod tests {
             .await
             .unwrap();
         assert!(result.data.is_empty());
+    }
+
+    // Regression test for issue #34: the API sends the cursor as `nextCursor`, not
+    // `cursor` — a stale mock (or a stale DTO) makes `cursor` silently deserialize
+    // to `None`, so every list tool would always report "last page" even when more
+    // data exists. This asserts the client actually surfaces a non-null cursor.
+    #[tokio::test]
+    async fn test_list_catalogs_maps_next_cursor_to_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": "abc"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .list_catalogs(None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.cursor, Some("abc".to_string()));
     }
 
     #[tokio::test]
@@ -883,14 +946,50 @@ mod tests {
             .and(path("/search"))
             .and(query_param("q", "rust"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {"id": mock_id(), "name": "Rust catalog", "item_type": "catalog"}
+                {"id": mock_id(), "itemType": "catalog", "title": "Rust catalog"}
             ])))
             .mount(&server)
             .await;
 
         let results = client(&server.uri()).search_global("rust").await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("Rust catalog"));
+        assert_eq!(results[0].title.as_deref(), Some("Rust catalog"));
+        assert_eq!(results[0].item_type.as_deref(), Some("catalog"));
+    }
+
+    #[tokio::test]
+    async fn test_search_global_maps_full_camel_case_shape() {
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+        let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("q", "ownership"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "itemType": "card",
+                    "id": card_id,
+                    "title": "What is ownership?",
+                    "subtitle": "Rust Basics",
+                    "parentId": catalog_id,
+                    "rank": 0.5,
+                    "imageId": null,
+                    "imageUrl": null
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let results = client(&server.uri())
+            .search_global("ownership")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].item_type.as_deref(), Some("card"));
+        assert_eq!(results[0].id, card_id);
+        assert_eq!(results[0].title.as_deref(), Some("What is ownership?"));
+        assert_eq!(results[0].subtitle.as_deref(), Some("Rust Basics"));
+        assert_eq!(results[0].parent_id, Some(catalog_id));
     }
 
     #[tokio::test]
@@ -991,7 +1090,7 @@ mod tests {
             .and(path("/learning-paths"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"id": mock_id(), "name": "Path 1", "version": 1}],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -1002,6 +1101,30 @@ mod tests {
             .unwrap();
         assert_eq!(result.data.len(), 1);
         assert_eq!(result.data[0].name, "Path 1");
+    }
+
+    /// Regression test: `list_learning_paths` has the same `nextCursor` bug as #34 (see
+    /// `test_list_catalogs_maps_next_cursor_to_cursor`) — confirmed by a reporter calling
+    /// `list_learning_paths({limit:1})` on an account with 3 paths and always getting
+    /// `cursor: null`.
+    #[tokio::test]
+    async fn test_list_learning_paths_maps_next_cursor_to_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": mock_id(), "name": "Path 1", "version": 1}],
+                "nextCursor": "abc"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .list_learning_paths(Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(result.cursor, Some("abc".to_string()));
     }
 
     // ── Cards ─────────────────────────────────────────────────────────────────
@@ -1046,7 +1169,7 @@ mod tests {
             .and(path(format!("/catalogs/{}/cards", mock_id())))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"id": mock_id(), "version": 1, "face": {"text": "Q"}, "back": {"text": "A"}}],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -1056,6 +1179,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.data.len(), 1);
+    }
+
+    /// Regression test: `list_cards` has the same `nextCursor` bug as #34 (see
+    /// `test_list_catalogs_maps_next_cursor_to_cursor`). The real API also sends a
+    /// `permissions` object alongside `data`/`nextCursor` — assert it's harmlessly
+    /// ignored and the cursor still surfaces.
+    #[tokio::test]
+    async fn test_list_cards_maps_next_cursor_to_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{}/cards", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": mock_id(),
+                    "version": 1,
+                    "face": {"text": "Q?"},
+                    "back": {"text": "A."},
+                    "orderNumber": 1
+                }],
+                "nextCursor": "abc",
+                "permissions": {"canEdit": true, "canDelete": true, "isOwner": true}
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .list_cards(mock_id(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.cursor, Some("abc".to_string()));
     }
 
     #[tokio::test]
@@ -1248,8 +1401,8 @@ mod tests {
             .and(path("/learning/cards"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"id": mock_id(), "face": {"text": "Q"}, "back": {"text": "A"}}],
-                "cursor": null,
-                "total_count": 1
+                "nextCursor": null,
+                "total": 1
             })))
             .mount(&server)
             .await;
@@ -1269,8 +1422,8 @@ mod tests {
             .and(path("/learning/cards/all"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [],
-                "cursor": null,
-                "total_count": 0
+                "nextCursor": null,
+                "total": 0
             })))
             .mount(&server)
             .await;
@@ -1280,6 +1433,112 @@ mod tests {
             .await
             .unwrap();
         assert!(result.data.is_empty());
+    }
+
+    /// Regression test for issue #35: a realistic `GET /learning/cards` body, including the
+    /// full set of `LearningCardDto` fields this crate doesn't model (`version`,
+    /// `orderNumber`, `status`, `mode`, `shadowingTurnIndex`, `speakingEnabled`) plus the
+    /// real `nextCursor`/`total` field names, must decode successfully — these extra fields
+    /// are ignored, not rejected.
+    #[tokio::test]
+    async fn test_get_due_cards_realistic_full_body_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": mock_id(),
+                    "version": 3,
+                    "face": {"text": "Q"},
+                    "back": {"text": "A"},
+                    "orderNumber": 1,
+                    "status": "learning",
+                    "nextReview": "2026-09-26T00:00:00Z",
+                    "lastReviewed": "2026-09-20T00:00:00Z",
+                    "mode": "flashcard",
+                    "shadowingTurnIndex": 0,
+                    "speakingEnabled": false
+                }],
+                "nextCursor": "page2",
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .get_due_cards(None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(
+            result.data[0].next_review.as_deref(),
+            Some("2026-09-26T00:00:00Z")
+        );
+        assert_eq!(result.cursor, Some("page2".to_string()));
+        assert_eq!(result.total_count, 1);
+    }
+
+    /// Same as above but for `/learning/cards/all` — the `FullLearningCardDto` shape also
+    /// carries `catalogs` and allows a null `nextReview`.
+    #[tokio::test]
+    async fn test_get_all_learning_cards_realistic_full_body_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards/all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": mock_id(),
+                    "version": 1,
+                    "face": {"text": "Q"},
+                    "back": {"text": "A"},
+                    "orderNumber": 1,
+                    "status": "new",
+                    "nextReview": null,
+                    "lastReviewed": null,
+                    "mode": "flashcard",
+                    "shadowingTurnIndex": 0,
+                    "speakingEnabled": false,
+                    "catalogs": [{"id": mock_id(), "name": "Rust", "version": 1}]
+                }],
+                "nextCursor": null,
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .get_all_learning_cards(None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].next_review, None);
+        assert_eq!(result.cursor, None);
+        assert_eq!(result.total_count, 1);
+    }
+
+    /// Regression test for issue #35: a 200 body missing the required `total` field must
+    /// surface as `ApiError::Decode` whose message names the missing field, not the vague
+    /// `ApiError::Network` reqwest previously produced by dropping the serde detail.
+    #[tokio::test]
+    async fn test_get_due_cards_missing_total_field_yields_decode_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .get_due_cards(None, None)
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::Decode(msg) => assert!(msg.contains("total"), "{msg}"),
+            other => panic!("expected Decode, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1318,15 +1577,21 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/media"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{"id": mock_id(), "media_type": "image", "fileName": "photo.jpg", "size": 1024}],
-                "cursor": null
+                "data": [{"id": mock_id(), "media_type": "image", "name": "photo.jpg", "length": 1024, "content_type": "image/jpeg"}],
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
 
-        let result = client(&server.uri()).list_media(None, None).await.unwrap();
+        let result = client(&server.uri())
+            .list_media(None, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.data.len(), 1);
         assert_eq!(result.data[0].media_type.as_deref(), Some("image"));
+        assert_eq!(result.data[0].name.as_deref(), Some("photo.jpg"));
+        assert_eq!(result.data[0].length, Some(1024));
+        assert_eq!(result.data[0].content_type.as_deref(), Some("image/jpeg"));
     }
 
     #[tokio::test]
@@ -1337,16 +1602,39 @@ mod tests {
             .and(query_param("media_type", "audio"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
 
         let result = client(&server.uri())
-            .list_media(Some("audio"), None)
+            .list_media(Some("audio"), None, None)
             .await
             .unwrap();
         assert!(result.data.is_empty());
+    }
+
+    /// Regression test for #34: `list_media` had no cursor param at all, even though the
+    /// backend `/media` endpoint (`MediaFilter`) accepts one. Assert it's forwarded as a
+    /// query param and that the response's `nextCursor` reaches the caller.
+    #[tokio::test]
+    async fn test_list_media_forwards_cursor_and_surfaces_next_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .and(query_param("cursor", "abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": "def"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .list_media(None, None, Some("abc"))
+            .await
+            .unwrap();
+        assert_eq!(result.cursor.as_deref(), Some("def"));
     }
 
     // ── Subscription ──────────────────────────────────────────────────────────
@@ -1723,7 +2011,7 @@ mod tests {
         // The redirect target must never be contacted — proves the token doesn't follow the 3xx.
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [], "cursor": null
+                "data": [], "nextCursor": null
             })))
             .mount(&redirect_target)
             .await;
@@ -1765,5 +2053,209 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::Internal));
+    }
+
+    #[test]
+    fn test_page_params_clamps_limit() {
+        let p = page_params(Some(i64::MAX), None).unwrap();
+        assert_eq!(p, vec![("limit", "50".to_string())]);
+        let p = page_params(Some(-3), None).unwrap();
+        assert_eq!(p, vec![("limit", "1".to_string())]);
+        let p = page_params(Some(20), Some("abc")).unwrap();
+        assert_eq!(
+            p,
+            vec![("limit", "20".to_string()), ("cursor", "abc".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_rejects_oversized_cursor_without_sending_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let long = "a".repeat(MAX_QUERY_PARAM_LEN + 1);
+        let err = client(&server.uri())
+            .list_catalogs(None, Some(&long))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_deserialize_rejects_body_over_size_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_RESPONSE_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .list_catalogs(None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::ResponseTooLarge(MAX_RESPONSE_BYTES)),
+            "{err:?}"
+        );
+    }
+
+    /// Serves one raw HTTP response (head + body bytes as given) on a loopback port, then
+    /// closes the connection. Needed because wiremock always sends `Content-Length`, and the
+    /// chunked / truncated-body paths can't be reached without controlling the wire bytes.
+    async fn spawn_raw(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await; // consume the request
+            let _ = sock.write_all(&response).await;
+            // dropping `sock` closes the connection
+        });
+        format!("http://{addr}")
+    }
+
+    const CHUNKED_HEAD: &str =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    #[tokio::test]
+    async fn test_deserialize_rejects_chunked_body_over_size_limit() {
+        // No Content-Length, so only the per-chunk cap can catch this.
+        const MIB: usize = 1024 * 1024;
+        let mut resp = CHUNKED_HEAD.as_bytes().to_vec();
+        for _ in 0..(MAX_RESPONSE_BYTES / MIB + 1) {
+            resp.extend_from_slice(format!("{MIB:x}\r\n").as_bytes());
+            resp.extend(std::iter::repeat_n(b' ', MIB));
+            resp.extend_from_slice(b"\r\n");
+        }
+        resp.extend_from_slice(b"0\r\n\r\n");
+        let uri = spawn_raw(resp).await;
+
+        let err = client(&uri).list_catalogs(None, None).await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::ResponseTooLarge(MAX_RESPONSE_BYTES)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deserialize_truncated_chunked_body_is_network_not_decode() {
+        // One partial chunk, then the socket closes without the terminating chunk.
+        let mut resp = CHUNKED_HEAD.as_bytes().to_vec();
+        resp.extend_from_slice(b"5\r\n{\"dat");
+        let uri = spawn_raw(resp).await;
+
+        let err = client(&uri).list_catalogs(None, None).await.unwrap_err();
+        assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_network_error_display_omits_url_and_query() {
+        // Port 1 (tcpmux) has no listener, so the connection is refused deterministically. A
+        // dropped MockServer's port would race with other tests' servers reusing it.
+        let uri = "http://127.0.0.1:1".to_string();
+
+        let err = client(&uri)
+            .search_global("SECRET_QUERY")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(!msg.contains("SECRET_QUERY"), "{msg}");
+        assert!(!msg.contains(&uri), "{msg}");
+        assert!(!msg.contains("127.0.0.1"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_deserialize_non_json_200_yields_syntax_decode_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>SECRET</html>"))
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .list_catalogs(None, None)
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::Decode(msg) => {
+                assert!(msg.contains("Syntax error at line 1"), "{msg}");
+                assert!(!msg.contains("SECRET"), "{msg}");
+                assert!(!msg.contains("update engramo-mcp"), "{msg}");
+            }
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_media_rejects_oversized_cursor_without_sending_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let long = "a".repeat(MAX_QUERY_PARAM_LEN + 1);
+        let err = client(&server.uri())
+            .list_media(Some("image"), None, Some(&long))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_free_form_query_values_over_limit_are_rejected_without_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let long = "a".repeat(MAX_QUERY_PARAM_LEN + 1);
+        let c = client(&server.uri());
+        let errs = [
+            c.search_global(&long).await.unwrap_err(),
+            c.search_catalogs(&long).await.unwrap_err(),
+            c.list_media(Some(&long), None, None).await.unwrap_err(),
+        ];
+        for err in errs {
+            assert!(
+                matches!(&err, ApiError::BadRequest(m) if m.contains("too long")),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_page_params_boundaries() {
+        assert_eq!(
+            page_params(Some(0), None).unwrap(),
+            vec![("limit", "1".to_string())]
+        );
+        assert_eq!(
+            page_params(Some(50), None).unwrap(),
+            vec![("limit", "50".to_string())]
+        );
+        let exact = "a".repeat(MAX_QUERY_PARAM_LEN);
+        assert_eq!(
+            page_params(None, Some(&exact)).unwrap(),
+            vec![("cursor", exact.clone())]
+        );
+        assert!(page_params(None, None).unwrap().is_empty());
+        assert!(page_params(None, Some(&format!("{exact}a"))).is_err());
     }
 }

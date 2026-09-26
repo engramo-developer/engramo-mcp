@@ -16,7 +16,9 @@ use crate::tools::catalogs::{err_result, ok_json, ok_text, parse_uuid};
 pub struct ListCardsParams {
     #[schemars(description = "UUID of the catalog to list cards from")]
     pub catalog_id: String,
-    #[schemars(description = "Maximum number of cards to return (default: 20)")]
+    #[schemars(
+        description = "Maximum number of cards to return (default 20; values are clamped to 1..=50)"
+    )]
     pub limit: Option<i64>,
     #[schemars(description = "Pagination cursor from a previous response")]
     pub cursor: Option<String>,
@@ -68,7 +70,9 @@ impl CardTools {
         }
     }
 
-    #[tool(description = "List flashcards in a catalog with cursor-based pagination.")]
+    #[tool(
+        description = "List flashcards in a catalog with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+    )]
     async fn list_cards(
         &self,
         Parameters(p): Parameters<ListCardsParams>,
@@ -176,6 +180,47 @@ mod tests {
 
     fn make_tools(base_url: &str) -> CardTools {
         CardTools::new(EngramoClient::new(base_url, "engramo_test"))
+    }
+
+    /// Regression test for issue #34/#35: the `list_cards` tool output's `cursor` field
+    /// must reflect the API's real `nextCursor` value, not always be `null` (mirrors
+    /// `catalogs::tests::test_list_catalogs_cursor_reaches_tool_output`).
+    #[tokio::test]
+    async fn test_list_cards_cursor_reaches_tool_output() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{}/cards", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": mock_id(),
+                    "version": 1,
+                    "face": {"text": "Q?"},
+                    "back": {"text": "A."},
+                    "orderNumber": 1
+                }],
+                "nextCursor": "abc",
+                "permissions": {"canEdit": true, "canDelete": true, "isOwner": true}
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .list_cards(Parameters(ListCardsParams {
+                catalog_id: mock_id().to_string(),
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["cursor"], "abc", "{text}");
     }
 
     #[tokio::test]

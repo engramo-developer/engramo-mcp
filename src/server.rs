@@ -126,7 +126,7 @@ impl EngramoMcpServer {
 #[tool_router(router = catalog_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "List the user's flashcard catalogs with cursor-based pagination. Returns id, name, and card_count for each catalog. Use get_catalog to fetch full details."
+        description = "List the user's flashcard catalogs with cursor-based pagination. Returns id, name, and card_count for each catalog. Use get_catalog to fetch full details. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     pub async fn list_catalogs(
         &self,
@@ -206,7 +206,9 @@ impl EngramoMcpServer {
 
 #[tool_router(router = card_tools_router)]
 impl EngramoMcpServer {
-    #[tool(description = "List flashcards in a catalog with cursor-based pagination.")]
+    #[tool(
+        description = "List flashcards in a catalog with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+    )]
     pub async fn list_cards(
         &self,
         Parameters(p): Parameters<ListCardsParams>,
@@ -355,7 +357,7 @@ impl EngramoMcpServer {
 #[tool_router(router = learning_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session."
+        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     pub async fn get_due_cards(
         &self,
@@ -374,7 +376,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Get all cards currently in the learning queue (due and future), with pagination."
+        description = "Get all cards currently in the learning queue (due and future), with pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     pub async fn get_all_learning_cards(
         &self,
@@ -425,7 +427,9 @@ impl EngramoMcpServer {
 
 #[tool_router(router = learning_path_tools_router)]
 impl EngramoMcpServer {
-    #[tool(description = "List all learning paths with cursor-based pagination.")]
+    #[tool(
+        description = "List all learning paths with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+    )]
     pub async fn list_learning_paths(
         &self,
         Parameters(p): Parameters<ListLearningPathsParams>,
@@ -507,7 +511,9 @@ impl EngramoMcpServer {
 #[tool_router(router = search_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "Search across all cards, catalogs, and learning paths. Returns ids and types. \
+        description = "Search across all cards, catalogs, and learning paths. Returns id, item_type \
+        ('catalog' or 'card'), title and subtitle; for a card hit, parent_id is its catalog's UUID \
+        (use it directly with get_catalog/list_cards). \
         If the user gives you a catalog's short ID (the ~8-character code shown in the app/URL, e.g. \
         \"A7KX9QM2\" — NOT a UUID), search for that exact code here (or with search_catalogs) instead \
         of paginating through list_catalogs — the short ID is indexed for search and matches fast, \
@@ -545,7 +551,7 @@ impl EngramoMcpServer {
 #[tool_router(router = media_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "List uploaded media files. Optionally filter by media type ('image', 'audio', etc.)."
+        description = "List uploaded media files. Optionally filter by media type ('image', 'audio', etc.). Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     pub async fn list_media(
         &self,
@@ -554,7 +560,7 @@ impl EngramoMcpServer {
         Ok(
             match self
                 .client
-                .list_media(p.media_type.as_deref(), p.limit)
+                .list_media(p.media_type.as_deref(), p.limit, p.cursor.as_deref())
                 .await
             {
                 Ok(resp) => ok_json(&resp),
@@ -1143,6 +1149,32 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_paginated_list_tools_document_the_50_item_cap_on_the_real_server() {
+        // Regression guard for #34: every cursor-paginated list tool must tell the caller
+        // about the server-side 50-item cap and how to page past it, not just say
+        // "cursor-based pagination" and leave the cap undocumented.
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        for name in [
+            "list_catalogs",
+            "list_cards",
+            "get_due_cards",
+            "get_all_learning_cards",
+            "list_learning_paths",
+            "list_media",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let description = tool.description.clone().unwrap_or_default();
+            assert!(description.contains("50"), "{name}: {description}");
+            assert!(description.contains("cursor"), "{name}: {description}");
+        }
+    }
+
+    #[test]
     fn test_search_tools_describe_short_id_resolution_on_the_real_server() {
         // Same regression class as the upload_media test above: assert against the tool
         // actually registered on EngramoMcpServer, not the unused tools/search.rs scaffold.
@@ -1185,6 +1217,91 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    fn first_text(result: &CallToolResult) -> &str {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn test_list_media_cursor_forwarded_and_reaches_tool_output_on_real_server() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .and(query_param("cursor", "abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "nextCursor": "def"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .list_media(Parameters(ListMediaParams {
+                media_type: None,
+                limit: None,
+                cursor: Some("abc".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v["cursor"], "def");
+    }
+
+    #[tokio::test]
+    async fn test_search_global_title_and_parent_id_reach_tool_output() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("q", "x"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "itemType": "card",
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "title": "T",
+                    "parentId": "00000000-0000-0000-0000-000000000002"
+                }])),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .search_global(Parameters(SearchParams {
+                query: "x".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v[0]["item_type"], "card");
+        assert_eq!(v[0]["title"], "T");
+        assert_eq!(v[0]["parent_id"], "00000000-0000-0000-0000-000000000002");
+    }
+
+    #[test]
+    fn test_search_global_description_documents_parent_id() {
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        let tool = tools.iter().find(|t| t.name == "search_global").unwrap();
+        let description = tool.description.clone().unwrap_or_default();
+        assert!(description.contains("parent_id"), "{description}");
     }
 
     #[tokio::test]
