@@ -620,6 +620,7 @@ impl EngramoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::SearchItemType;
     use serde_json::json;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -954,7 +955,7 @@ mod tests {
         let results = client(&server.uri()).search_global("rust").await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title.as_deref(), Some("Rust catalog"));
-        assert_eq!(results[0].item_type.as_deref(), Some("catalog"));
+        assert_eq!(results[0].item_type, Some(SearchItemType::Catalog));
     }
 
     #[tokio::test]
@@ -985,7 +986,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].item_type.as_deref(), Some("card"));
+        assert_eq!(results[0].item_type, Some(SearchItemType::Card));
         assert_eq!(results[0].id, card_id);
         assert_eq!(results[0].title.as_deref(), Some("What is ownership?"));
         assert_eq!(results[0].subtitle.as_deref(), Some("Rust Basics"));

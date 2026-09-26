@@ -511,9 +511,11 @@ impl EngramoMcpServer {
 #[tool_router(router = search_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "Search across all cards, catalogs, and learning paths. Returns id, item_type \
-        ('catalog' or 'card'), title and subtitle; for a card hit, parent_id is its catalog's UUID \
-        (use it directly with get_catalog/list_cards). \
+        description = "Search across cards and catalogs (learning paths are NOT included — use \
+        list_learning_paths/get_learning_path for those). Each hit has item_type ('catalog' or \
+        'card'), title (the catalog's name, or the card's face text), subtitle (the catalog's \
+        description, or the card's back text), and parent_id, which for a card hit is its \
+        catalog's UUID (use it directly with get_catalog/list_cards). \
         If the user gives you a catalog's short ID (the ~8-character code shown in the app/URL, e.g. \
         \"A7KX9QM2\" — NOT a UUID), search for that exact code here (or with search_catalogs) instead \
         of paginating through list_catalogs — the short ID is indexed for search and matches fast, \
@@ -1176,8 +1178,7 @@ mod tests {
 
     #[test]
     fn test_search_tools_describe_short_id_resolution_on_the_real_server() {
-        // Same regression class as the upload_media test above: assert against the tool
-        // actually registered on EngramoMcpServer, not the unused tools/search.rs scaffold.
+        // Assert against the tools actually registered on EngramoMcpServer (search_tools_router).
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, false);
         let tools = server.tool_router.list_all();
@@ -1294,6 +1295,71 @@ mod tests {
         assert_eq!(v[0]["parent_id"], "00000000-0000-0000-0000-000000000002");
     }
 
+    /// Repro for issue #36: a realistic `/search` payload — one catalog hit (with
+    /// `imageId`/`imageUrl` set) and one card hit (with `parentId`), Cyrillic text
+    /// included — driven end-to-end through the `search_global` tool handler. The
+    /// bug report claims every field but `id` comes back null; this asserts
+    /// `item_type` and `title` are non-null for both hits in the tool's JSON output.
+    #[tokio::test]
+    async fn test_search_global_realistic_backend_payload_reaches_tool_output() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let catalog_id = "dda5cf9a-84c3-463b-985f-df02b71a3a4b";
+        let card_id = "00000000-0000-0000-0000-000000000099";
+        let card_parent_id = "00000000-0000-0000-0000-000000000098";
+        let image_id = "00000000-0000-0000-0000-0000000000aa";
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("q", "іспанська"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "itemType": "catalog",
+                    "id": catalog_id,
+                    "title": "[Іспанська] Співбесіда: …",
+                    "subtitle": "desc",
+                    "parentId": null,
+                    "rank": 0.42,
+                    "imageId": image_id,
+                    "imageUrl": "https://cdn.example.com/img.png"
+                },
+                {
+                    "itemType": "card",
+                    "id": card_id,
+                    "title": "¿Cómo estás?",
+                    "subtitle": "back text",
+                    "parentId": card_parent_id,
+                    "rank": 0.1,
+                    "imageId": null
+                }
+            ])))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .search_global(Parameters(SearchParams {
+                query: "іспанська".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+
+        // Catalog hit.
+        assert_eq!(v[0]["id"], catalog_id);
+        assert_eq!(v[0]["item_type"], "catalog", "{v}");
+        assert_eq!(v[0]["title"], "[Іспанська] Співбесіда: …", "{v}");
+
+        // Card hit.
+        assert_eq!(v[1]["id"], card_id);
+        assert_eq!(v[1]["item_type"], "card", "{v}");
+        assert_eq!(v[1]["title"], "¿Cómo estás?", "{v}");
+        assert_eq!(v[1]["parent_id"], card_parent_id, "{v}");
+    }
+
     #[test]
     fn test_search_global_description_documents_parent_id() {
         let client = EngramoClient::new("http://localhost", "engramo_test");
@@ -1302,6 +1368,145 @@ mod tests {
         let tool = tools.iter().find(|t| t.name == "search_global").unwrap();
         let description = tool.description.clone().unwrap_or_default();
         assert!(description.contains("parent_id"), "{description}");
+    }
+
+    /// Regression guard for issue #36's description change: `search_global` no longer
+    /// claims to cover learning paths, and points callers at `list_learning_paths`
+    /// instead. Nothing else pins this wording, so the old "cards, catalogs, and
+    /// learning paths" claim could silently come back.
+    #[test]
+    fn test_search_global_description_excludes_learning_paths() {
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        let tool = tools.iter().find(|t| t.name == "search_global").unwrap();
+        let description = tool.description.clone().unwrap_or_default();
+        assert!(
+            description.contains("learning paths are NOT included"),
+            "{description}"
+        );
+        assert!(description.contains("list_learning_paths"), "{description}");
+        assert!(
+            !description.contains("cards, catalogs, and learning paths"),
+            "{description}"
+        );
+    }
+
+    /// Regression for the tool-handler contract (finding F2): an oversized `q` must
+    /// surface as `is_error: true` output — never a raw `Err`, and never a request sent
+    /// to the backend at all.
+    #[tokio::test]
+    async fn test_search_global_oversized_query_returns_is_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        // Over client.rs's private MAX_QUERY_PARAM_LEN (512); can't reference the
+        // constant from here since it isn't `pub(crate)`.
+        let long_query = "a".repeat(513);
+        let result = server
+            .search_global(Parameters(SearchParams { query: long_query }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("too long"), "{result:?}");
+    }
+
+    /// Moved from the now-deleted `tools/search.rs` scaffold (`SearchTools` was never
+    /// constructed) — asserts the tool-handler error path for `search_catalogs`.
+    #[tokio::test]
+    async fn test_search_catalogs_unauthorized_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/catalogs"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .search_catalogs(Parameters(SearchParams {
+                query: "rust".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Unauthorized"), "{result:?}");
+    }
+
+    /// Drives the `search_global` tool handler's error arm — only `search_catalogs` had
+    /// a tool-level error test before this.
+    #[tokio::test]
+    async fn test_search_global_unauthorized_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .search_global(Parameters(SearchParams {
+                query: "rust".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Unauthorized"), "{result:?}");
+    }
+
+    /// Drives the `search_catalogs` tool handler's success arm — previously covered
+    /// only indirectly through the client-level `test_search_catalogs` in `client.rs`.
+    #[tokio::test]
+    async fn test_search_catalogs_ok_returns_catalog_json() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let catalog_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("GET"))
+            .and(path("/search/catalogs"))
+            .and(query_param("q", "A7KX9QM2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": catalog_id,
+                    "name": "Rust Basics",
+                    "version": 1
+                }])),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .search_catalogs(Parameters(SearchParams {
+                query: "A7KX9QM2".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v[0]["id"], catalog_id);
+        assert_eq!(v.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

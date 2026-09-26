@@ -365,16 +365,33 @@ pub struct CreateLearningPathRequest {
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
-/// The API's `GlobalSearchResult` is `#[serde(rename_all = "camelCase")]`, so the wire
-/// fields are `itemType`, `id`, `title`, `subtitle`, `parentId`, `rank`, `imageId`,
-/// `imageUrl`. We only model the fields this crate uses; `parent_id` is the catalog's
-/// UUID for a card hit, useful for a follow-up `get_catalog`/`list_cards` call.
+/// A search hit's kind. Only `catalog` and `card` are part of global search — learning
+/// paths are NOT indexed by `/search` (issue #36 clarification). `Other` absorbs any
+/// value the backend adds later (or a casing drift) so one unrecognized hit doesn't fail
+/// the whole array, while keeping the raw wire value visible to the model instead of
+/// collapsing it into an opaque `"unknown"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchItemType {
+    Catalog,
+    Card,
+    /// Any kind this crate doesn't model yet; the raw wire value is kept for the model.
+    #[serde(untagged)]
+    Other(String),
+}
+
+/// Wire shape is camelCase (`itemType`, `id`, `title`, `subtitle`, `parentId`, …).
+/// `parent_id` is the catalog UUID for a card hit. `rank`, `imageId` and `imageUrl`
+/// (a signed URL) are intentionally unmodeled. Don't add `#[serde(alias)]`: a payload
+/// carrying both keys is a duplicate-field error that fails the whole `/search` array
+/// (issue #36; pinned by tests below).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "camelCase"))]
 pub struct GlobalSearchResult {
     pub id: Uuid,
-    /// "catalog" or "card".
-    pub item_type: Option<String>,
+    /// Hit kind: `Catalog` / `Card`, or `Other(raw)` for any value this crate doesn't model
+    /// (see [`SearchItemType`]).
+    pub item_type: Option<SearchItemType>,
     pub title: Option<String>,
     pub subtitle: Option<String>,
     pub parent_id: Option<Uuid>,
@@ -625,7 +642,7 @@ mod tests {
             "title":"Ownership","subtitle":"Rust Basics",
             "parentId":"00000000-0000-0000-0000-000000000002"}"#;
         let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
-        assert_eq!(result.item_type.as_deref(), Some("card"));
+        assert_eq!(result.item_type, Some(SearchItemType::Card));
         assert_eq!(result.title.as_deref(), Some("Ownership"));
         assert_eq!(result.subtitle.as_deref(), Some("Rust Basics"));
         assert_eq!(
@@ -638,7 +655,7 @@ mod tests {
     fn test_global_search_result_serializes_snake_case() {
         let r = GlobalSearchResult {
             id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
-            item_type: Some("card".to_string()),
+            item_type: Some(SearchItemType::Card),
             title: Some("T".to_string()),
             subtitle: None,
             parent_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap()),
@@ -648,6 +665,131 @@ mod tests {
         assert!(json.contains("\"item_type\""), "{json}");
         assert!(!json.contains("parentId"), "{json}");
         assert!(!json.contains("itemType"), "{json}");
+    }
+
+    /// An item type the backend adds later must not fail the whole array — it should
+    /// decode to `Other` (preserving the raw wire value) instead of erroring.
+    #[test]
+    fn test_global_search_result_unknown_item_type_does_not_fail() {
+        let json = r#"{"itemType":"learning_path","id":"00000000-0000-0000-0000-000000000001"}"#;
+        let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.item_type,
+            Some(SearchItemType::Other("learning_path".to_string()))
+        );
+        let out = serde_json::to_string(&result.item_type).unwrap();
+        assert_eq!(out, "\"learning_path\"");
+    }
+
+    /// Extra, non-canonical keys alongside the canonical ones (e.g. a stray `name`/`type`
+    /// from a different shape, or the signed `imageUrl` we never model) must be ignored by
+    /// serde rather than overriding the canonical values — this is why we don't declare
+    /// them as `#[serde(alias = ...)]`: an alias would make a payload carrying both keys
+    /// a "duplicate field" error that fails the whole `/search` array.
+    #[test]
+    fn test_global_search_result_unknown_extra_keys_do_not_override_canonical_fields() {
+        let json = r#"{"itemType":"card","id":"00000000-0000-0000-0000-000000000001",
+            "title":"Ownership","name":"Something Else","type":"catalog",
+            "parentId":"00000000-0000-0000-0000-000000000002",
+            "imageUrl":"https://cdn.example.com/img.png"}"#;
+        let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.item_type, Some(SearchItemType::Card));
+        assert_eq!(result.title.as_deref(), Some("Ownership"));
+        assert_eq!(
+            result.parent_id,
+            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_search_item_type_serializes_lowercase_and_other() {
+        assert_eq!(
+            serde_json::to_string(&SearchItemType::Catalog).unwrap(),
+            "\"catalog\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SearchItemType::Card).unwrap(),
+            "\"card\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SearchItemType::Other("learning_path".to_string())).unwrap(),
+            "\"learning_path\""
+        );
+    }
+
+    /// `rename_all = "lowercase"` is case-sensitive: a backend casing drift (e.g. "Card"
+    /// instead of "card") falls to `Other`, not `Card` — this pins that behavior so a
+    /// casing skew is visible in tool output instead of silently misclassified.
+    #[test]
+    fn test_search_item_type_is_case_sensitive_mixed_case_is_other() {
+        let json = r#"{"itemType":"Card","id":"00000000-0000-0000-0000-000000000001"}"#;
+        let r: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(r.item_type, Some(SearchItemType::Other("Card".to_string())));
+    }
+
+    #[test]
+    fn test_global_search_result_missing_title_is_none() {
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000001"}"#;
+        let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.title, None);
+        assert_eq!(result.item_type, None);
+    }
+
+    #[test]
+    fn test_global_search_result_null_title_is_none() {
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000001","title":null}"#;
+        let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.title, None);
+    }
+
+    /// `rank` and `imageId` are unmodeled extra keys, and `imageUrl` (a signed URL) is
+    /// not modeled either — none of them can leak into serialized tool output even
+    /// though the backend sends them.
+    #[test]
+    fn test_global_search_result_rank_and_image_url_never_reach_output() {
+        let json = r#"{"itemType":"catalog","id":"00000000-0000-0000-0000-000000000001",
+            "rank":0.42,"imageId":"00000000-0000-0000-0000-0000000000aa",
+            "imageUrl":"https://cdn.example.com/img.png"}"#;
+        let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_string(&result).unwrap();
+        assert!(!out.contains("rank"), "{out}");
+        assert!(!out.contains("image_id"), "{out}");
+        assert!(!out.contains("imageId"), "{out}");
+        assert!(!out.contains("image_url"), "{out}");
+        assert!(!out.contains("imageUrl"), "{out}");
+        assert!(!out.contains("cdn.example.com"), "{out}");
+    }
+
+    /// Pins current behavior: untagged `Other(String)` only absorbs strings — a
+    /// non-string `itemType` (number, object, bool) fails the whole hit, and thus the
+    /// whole `/search` array, even though the doc comment describes the fallback as
+    /// tolerant. If this turns out to be the wrong tradeoff, that's a separate fix.
+    #[test]
+    fn test_global_search_result_non_string_item_type_is_rejected() {
+        let json = r#"[{"itemType":5,"id":"00000000-0000-0000-0000-000000000001"}]"#;
+        let r: Result<Vec<GlobalSearchResult>, _> = serde_json::from_str(json);
+        assert!(
+            r.is_err(),
+            "non-string itemType must not silently decode: {r:?}"
+        );
+    }
+
+    /// One `Other` hit alongside known `Catalog`/`Card` hits in the same array must not
+    /// fail its neighbours.
+    #[test]
+    fn test_global_search_result_array_with_unknown_item_type_decodes_all_hits() {
+        let json = r#"[
+            {"itemType":"catalog","id":"00000000-0000-0000-0000-000000000001"},
+            {"itemType":"learning_path","id":"00000000-0000-0000-0000-000000000002"},
+            {"itemType":"card","id":"00000000-0000-0000-0000-000000000003"}]"#;
+        let v: Vec<GlobalSearchResult> = serde_json::from_str(json).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].item_type, Some(SearchItemType::Catalog));
+        assert_eq!(
+            v[1].item_type,
+            Some(SearchItemType::Other("learning_path".into()))
+        );
+        assert_eq!(v[2].item_type, Some(SearchItemType::Card));
     }
 
     #[test]
