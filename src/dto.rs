@@ -96,7 +96,7 @@ pub struct UpdateCatalogRequest {
 // ── Card Content ──────────────────────────────────────────────────────────────
 
 /// Styling for a single rich-text span.
-#[derive(Debug, Default, Serialize, Deserialize, Clone, schemars::JsonSchema)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone, schemars::JsonSchema)]
 pub struct RichTextSpanStyle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bold: Option<bool>,
@@ -106,6 +106,10 @@ pub struct RichTextSpanStyle {
     pub underline: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strikethrough: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superscript: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscript: Option<bool>,
     /// Font size in points.
     #[serde(rename = "fontSize", skip_serializing_if = "Option::is_none")]
     pub font_size: Option<i32>,
@@ -118,7 +122,21 @@ pub struct RichTextSpanStyle {
 }
 
 /// A single span of styled text inside a `CardContent`.
+///
+/// Deserialization is lenient (issue #37): some LLMs put styling fields (`bold`,
+/// `fontColor`, ...) directly on the span instead of nesting them under `style`, matching
+/// how the sentence-level style reads. Both shapes are accepted here — flat fields are
+/// folded into `style`, with an explicit nested `style` field winning on conflict — but
+/// serialization only ever emits the nested `style` form, which is the canonical shape
+/// matching the upstream API.
+///
+/// Because of `#[serde(from = "RawRichTextSpan")]`, schemars derives the JSON schema exposed
+/// to MCP clients from `RawRichTextSpan`, not from this struct — its flat fields are hidden
+/// via `#[schemars(skip)]` so the input schema shows only `text` and `style`. Keep
+/// `RawRichTextSpan::text`'s `#[schemars(description = ...)]` in sync with `text` below;
+/// it is the one that actually reaches the model.
 #[derive(Debug, Serialize, Deserialize, Clone, schemars::JsonSchema)]
+#[serde(from = "RawRichTextSpan")]
 pub struct RichTextSpan {
     #[schemars(description = "Verbatim contiguous segment of the original text. \
         Never insert separator characters, markers, or non-original characters \
@@ -127,6 +145,91 @@ pub struct RichTextSpan {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style: Option<RichTextSpanStyle>,
+}
+
+/// Deserialization (and, since `RichTextSpan` derives its schema from this via
+/// `#[serde(from = ...)]`, JSON-schema) helper for [`RichTextSpan`]: accepts either a nested
+/// `style` object or the same fields flattened directly onto the span, or both — see
+/// `RichTextSpan`'s doc comment. `style` is the only styling shape shown in the schema sent
+/// to MCP clients; the flat fields below are `#[schemars(skip)]` (serde still reads them) so
+/// they stay lenient-input-only and are never advertised as a valid shape.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RawRichTextSpan {
+    #[schemars(description = "Verbatim contiguous segment of the original text. \
+        Never insert separator characters, markers, or non-original characters \
+        (do NOT use CJK ideographs, bullet points, pipes, or any Unicode symbol as a span delimiter). \
+        Consecutive spans must join to reproduce the original text exactly.")]
+    text: String,
+    #[schemars(description = "Styling for this span, e.g. \
+        {\"bold\":true,\"fontColor\":\"#27AE60\"}. Nest fields here — this is the only \
+        styling shape accepted.")]
+    #[serde(default)]
+    style: Option<RichTextSpanStyle>,
+    #[schemars(skip)]
+    #[serde(default)]
+    bold: Option<bool>,
+    #[schemars(skip)]
+    #[serde(default)]
+    italic: Option<bool>,
+    #[schemars(skip)]
+    #[serde(default)]
+    underline: Option<bool>,
+    #[schemars(skip)]
+    #[serde(default)]
+    strikethrough: Option<bool>,
+    #[schemars(skip)]
+    #[serde(default)]
+    superscript: Option<bool>,
+    #[schemars(skip)]
+    #[serde(default)]
+    subscript: Option<bool>,
+    #[schemars(skip)]
+    #[serde(rename = "fontSize", default)]
+    font_size: Option<i32>,
+    #[schemars(skip)]
+    #[serde(rename = "fontColor", default)]
+    font_color: Option<String>,
+    #[schemars(skip)]
+    #[serde(rename = "fontFamily", default)]
+    font_family: Option<String>,
+}
+
+impl From<RawRichTextSpan> for RichTextSpan {
+    fn from(raw: RawRichTextSpan) -> Self {
+        let flat = RichTextSpanStyle {
+            bold: raw.bold,
+            italic: raw.italic,
+            underline: raw.underline,
+            strikethrough: raw.strikethrough,
+            superscript: raw.superscript,
+            subscript: raw.subscript,
+            font_size: raw.font_size,
+            font_color: raw.font_color,
+            font_family: raw.font_family,
+        };
+        let nested = raw.style.unwrap_or_default();
+        // Nested `style` wins over flat fields on conflict.
+        let merged = RichTextSpanStyle {
+            bold: nested.bold.or(flat.bold),
+            italic: nested.italic.or(flat.italic),
+            underline: nested.underline.or(flat.underline),
+            strikethrough: nested.strikethrough.or(flat.strikethrough),
+            superscript: nested.superscript.or(flat.superscript),
+            subscript: nested.subscript.or(flat.subscript),
+            font_size: nested.font_size.or(flat.font_size),
+            font_color: nested.font_color.or(flat.font_color),
+            font_family: nested.font_family.or(flat.font_family),
+        };
+        let style = if merged == RichTextSpanStyle::default() {
+            None
+        } else {
+            Some(merged)
+        };
+        Self {
+            text: raw.text,
+            style,
+        }
+    }
 }
 
 /// Card-level text style defaults.
@@ -851,5 +954,172 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"due_count\":15"));
         assert!(json.contains("\"total_count\":200"));
+    }
+
+    // ── RichTextSpan lenient deserialization (issue #37) ─────────────────────
+
+    #[test]
+    fn test_rich_text_span_flat_style_fields_deserialize_into_nested_style() {
+        let json = r##"{"text":"gracias.","bold":true,"fontColor":"#27AE60"}"##;
+        let span: RichTextSpan = serde_json::from_str(json).unwrap();
+        assert_eq!(span.text, "gracias.");
+        let style = span.style.expect("flat fields must populate style");
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.font_color, Some("#27AE60".to_string()));
+    }
+
+    #[test]
+    fn test_rich_text_span_nested_style_deserializes() {
+        let json = r##"{"text":"gracias.","style":{"bold":true,"fontColor":"#27AE60"}}"##;
+        let span: RichTextSpan = serde_json::from_str(json).unwrap();
+        let style = span.style.expect("nested style must be preserved");
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.font_color, Some("#27AE60".to_string()));
+    }
+
+    #[test]
+    fn test_rich_text_span_nested_style_wins_over_flat_on_conflict() {
+        let json = r#"{"text":"gracias.","bold":false,"style":{"bold":true}}"#;
+        let span: RichTextSpan = serde_json::from_str(json).unwrap();
+        let style = span.style.expect("style must be set");
+        assert_eq!(
+            style.bold,
+            Some(true),
+            "nested style.bold must win over the flat bold field"
+        );
+    }
+
+    #[test]
+    fn test_rich_text_span_no_styling_leaves_style_none() {
+        let json = r#"{"text":"gracias."}"#;
+        let span: RichTextSpan = serde_json::from_str(json).unwrap();
+        assert!(span.style.is_none());
+    }
+
+    #[test]
+    fn test_rich_text_span_superscript_subscript_round_trip() {
+        let span = RichTextSpan {
+            text: "x2".to_string(),
+            style: Some(RichTextSpanStyle {
+                superscript: Some(true),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_string(&span).unwrap();
+        assert!(json.contains("\"superscript\":true"));
+        let round_tripped: RichTextSpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.style.unwrap().superscript, Some(true));
+    }
+
+    #[test]
+    fn test_rich_text_span_serializes_nested_style_only_no_flat_fields() {
+        let span = RichTextSpan {
+            text: "gracias.".to_string(),
+            style: Some(RichTextSpanStyle {
+                bold: Some(true),
+                font_color: Some("#27AE60".to_string()),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_value(&span).unwrap();
+        assert_eq!(json["style"]["bold"], serde_json::json!(true));
+        assert_eq!(json["style"]["fontColor"], serde_json::json!("#27AE60"));
+        // No top-level flat styling fields on the wire.
+        assert!(json.get("bold").is_none());
+        assert!(json.get("fontColor").is_none());
+    }
+
+    #[test]
+    fn test_rich_text_span_every_flat_style_field_maps_to_its_own_nested_field() {
+        let json = r#"{"text":"x","italic":true,"underline":false,"strikethrough":true,
+            "superscript":false,"subscript":true,"fontSize":18,"fontFamily":"monospace"}"#;
+        let span: RichTextSpan = serde_json::from_str(json).unwrap();
+        let s = span.style.expect("style");
+        assert_eq!(s.bold, None);
+        assert_eq!(s.italic, Some(true));
+        assert_eq!(s.underline, Some(false));
+        assert_eq!(s.strikethrough, Some(true));
+        assert_eq!(s.superscript, Some(false));
+        assert_eq!(s.subscript, Some(true));
+        assert_eq!(s.font_size, Some(18));
+        assert_eq!(s.font_color, None);
+        assert_eq!(s.font_family.as_deref(), Some("monospace"));
+        // Serialize back: nested only, camelCase keys, subscript present.
+        let v = serde_json::to_value(RichTextSpan {
+            text: span.text,
+            style: Some(s),
+        })
+        .unwrap();
+        assert_eq!(v["style"]["subscript"], serde_json::json!(true));
+        assert_eq!(v["style"]["fontSize"], serde_json::json!(18));
+        assert!(v.get("subscript").is_none());
+    }
+
+    #[test]
+    fn test_rich_text_span_flat_and_nested_disjoint_fields_are_merged() {
+        let json = r##"{"text":"x","bold":true,"fontSize":20,
+            "style":{"fontColor":"#E74C3C","fontSize":14}}"##;
+        let span: RichTextSpan = serde_json::from_str(json).unwrap();
+        let s = span.style.unwrap();
+        assert_eq!(
+            s.bold,
+            Some(true),
+            "flat-only field must survive alongside nested style"
+        );
+        assert_eq!(s.font_color.as_deref(), Some("#E74C3C"));
+        assert_eq!(
+            s.font_size,
+            Some(14),
+            "nested fontSize must win over flat on conflict"
+        );
+    }
+
+    #[test]
+    fn test_rich_text_span_wrong_typed_flat_field_is_rejected() {
+        // Pins the current contract: a typed flat field with the wrong JSON type fails
+        // deserialization of the whole span (and thus the whole tool call).
+        let json = r#"{"text":"x","bold":"true"}"#;
+        assert!(serde_json::from_str::<RichTextSpan>(json).is_err());
+    }
+
+    #[test]
+    fn test_rich_text_span_explicit_null_style_is_none() {
+        let span: RichTextSpan = serde_json::from_str(r#"{"text":"x","style":null}"#).unwrap();
+        assert!(span.style.is_none());
+    }
+
+    #[test]
+    fn test_rich_text_span_flat_false_is_kept_not_collapsed_to_none() {
+        let span: RichTextSpan = serde_json::from_str(r#"{"text":"x","bold":false}"#).unwrap();
+        assert_eq!(span.style.unwrap().bold, Some(false));
+    }
+
+    #[test]
+    fn test_rich_text_span_missing_text_is_rejected() {
+        assert!(serde_json::from_str::<RichTextSpan>(r#"{"bold":true}"#).is_err());
+    }
+
+    #[test]
+    fn test_rich_text_span_schema_documents_nested_style_and_hides_flat_fields() {
+        // The tool input schema (draft2020-12, deserialize contract) is derived from
+        // RawRichTextSpan via #[serde(from = ...)] — assert on that schema directly.
+        let schema = schemars::schema_for!(RawRichTextSpan);
+        let value = serde_json::to_value(&schema).unwrap();
+        let s = value.to_string();
+        // The `text` description must carry the full anti-marker guidance (F1).
+        assert!(s.contains("Verbatim contiguous segment"), "{s}");
+        assert!(s.contains("CJK ideographs"), "{s}");
+        assert!(!s.contains("Deprecated shorthand"), "{s}");
+        // Top-level properties must be exactly `text` and `style` — the flat shorthand
+        // fields must not be advertised as span properties (F2).
+        let props = value["properties"].as_object().expect("properties object");
+        let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["style", "text"], "{value}");
+
+        // Confirm this schema is actually what GenerateCardParams exposes to MCP clients.
+        let params_schema = schemars::schema_for!(crate::tools::generate::GenerateCardParams);
+        let params_s = serde_json::to_string(&params_schema).unwrap();
+        assert!(params_s.contains("CJK ideographs"), "{params_s}");
     }
 }

@@ -39,17 +39,17 @@ const CARD_SCHEMA_DOC: &str = "\
 
 CardContent fields:
   text         String     REQUIRED. The full plain text. This is the validation anchor.
-  rich_text    Span[]     Optional. Styled segments. MUST concatenate to `text` exactly — the
-                          server validates this and silently discards rich_text on mismatch.
+  richText     Span[]     Optional. Styled segments. MUST concatenate to `text` exactly — the
+                          server validates this and silently discards richText on mismatch.
   dictionary   {str:str}  Optional. Word-level translation map (face only). Keys: lowercase
                           source word. Values: primary translation; append \"; (here) X\" if
                           contextual meaning differs from the most common meaning.
   style        CardStyle  Optional. Card-level default style (font, color, alignment).
-  audio_id     UUID       Optional. A media_id from the `upload_media` tool (e.g. the user's own
+  audioId      UUID       Optional. A media_id from the `upload_media` tool (e.g. the user's own
                           voice recording). Never fabricate a UUID here.
-  visual_id    UUID       Optional. A media_id from `upload_media` for an image/video. Requires
-                          `visual_type` alongside it. Never fabricate a UUID here.
-  visual_type  String     Required if `visual_id` is set. \"image\" or \"video\".
+  visualId     UUID       Optional. A media_id from `upload_media` for an image/video. Requires
+                          `visualType` alongside it. Never fabricate a UUID here.
+  visualType   String     Required if `visualId` is set. \"image\" or \"video\".
 
 RichTextSpan fields:
   text         String     REQUIRED. A VERBATIM contiguous slice of the parent `text`.
@@ -57,20 +57,24 @@ RichTextSpan fields:
   style        SpanStyle  Optional.
 
 SpanStyle fields:
-  fontColor    String     CSS color. \"#27AE60\" = green (correct/highlight), \"#E74C3C\" = red (warning).
-  bold         bool
-  italic       bool
-  underline    bool
-  fontFamily   String     Use \"monospace\" for code.
+  fontColor     String     CSS color. \"#27AE60\" = green (correct/highlight), \"#E74C3C\" = red (warning).
+  fontSize      int        Font size in points.
+  bold          bool
+  italic        bool
+  underline     bool
+  strikethrough bool
+  superscript   bool
+  subscript     bool
+  fontFamily    String     Use \"monospace\" for code.
 
 Rich-text validation rules (CRITICAL):
   R1. Set `text` to the complete original sentence first.
   R2. Every span.text must be a verbatim substring of `text`.
   R3. Spans must cover ALL of `text` — no gaps, no extra characters.
   R4. Concatenation of all span.text values must equal `text` exactly (character-for-character).
-  R5. If no styling is needed, omit `rich_text` entirely.
+  R5. If no styling is needed, omit `richText` entirely.
 
-=== Example 1: Simple card (no rich_text) ===
+=== Example 1: Simple card (no richText) ===
 {
   \"face\": { \"text\": \"What is the capital of France?\" },
   \"back\": { \"text\": \"Paris.\" }
@@ -83,7 +87,7 @@ Highlight \"quick brown fox\" in green:
 {
   \"face\": {
     \"text\": \"The quick brown fox jumps over the lazy dog.\",
-    \"rich_text\": [
+    \"richText\": [
       { \"text\": \"The \" },
       { \"text\": \"quick brown fox\", \"style\": { \"fontColor\": \"#27AE60\", \"bold\": true } },
       { \"text\": \" jumps over the lazy dog.\" }
@@ -102,7 +106,7 @@ Back: Ukrainian translation + (infinitive - participle) in green.
 {
   \"face\": {
     \"text\": \"He hablado con mi madre esta mañana por teléfono.\",
-    \"rich_text\": [
+    \"richText\": [
       { \"text\": \"He hablado\", \"style\": { \"fontColor\": \"#27AE60\", \"bold\": true } },
       { \"text\": \" con mi madre esta mañana por teléfono.\" }
     ],
@@ -115,7 +119,7 @@ Back: Ukrainian translation + (infinitive - participle) in green.
   },
   \"back\": {
     \"text\": \"Я поговорив з мамою цього ранку по телефону. (hablar - hablado)\",
-    \"rich_text\": [
+    \"richText\": [
       { \"text\": \"Я поговорив з мамою цього ранку по телефону. (\" },
       { \"text\": \"hablar - hablado\", \"style\": { \"fontColor\": \"#27AE60\" } },
       { \"text\": \")\" }
@@ -130,7 +134,7 @@ Span checks:
 === Example 4: Card with user-supplied audio (BYO audio, no server-side TTS) ===
 The user already recorded their own voice for this card's face and gave you the file. You called
 `upload_media` first (content_base64 of the recording, content_type=\"audio/mpeg\") and got back
-media_id \"3fa85f64-5717-4562-b3fc-2c963f66afa6\" — use that value for `audio_id` below. Never
+media_id \"3fa85f64-5717-4562-b3fc-2c963f66afa6\" — use that value for `audioId` below. Never
 invent a UUID; only use one actually returned by `upload_media`.
 (A face's `audioId` can also be set this same way by the generate_card_audio tool, when it's
 available — it synthesizes speech locally with the user's own TTS key, uploads it, and attaches it
@@ -139,7 +143,7 @@ for you, so you don't need to call upload_media yourself in that case.)
 {
   \"face\": {
     \"text\": \"¿Me puede traer un café con leche, por favor?\",
-    \"audio_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\"
+    \"audioId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\"
   },
   \"back\": { \"text\": \"Could you bring me a coffee with milk, please?\" }
 }\
@@ -160,7 +164,7 @@ pub fn list_all() -> ListResourcesResult {
             "Card Schema & Examples",
             "CardContent JSON schema with validation rules and 4 annotated examples \
              (simple, rich-text styled, language-learning with dictionary, user-supplied audio). \
-             Read this before creating cards to avoid rich_text validation failures.",
+             Read this before creating cards to avoid richText validation failures.",
             "text/plain",
         ),
         make_resource(
@@ -393,12 +397,41 @@ mod tests {
             .unwrap();
         assert_eq!(result.contents.len(), 1);
         if let ResourceContents::TextResourceContents { text, .. } = &result.contents[0] {
-            assert!(text.contains("rich_text"), "{text}");
+            assert!(text.contains("richText"), "{text}");
             assert!(text.contains("dictionary"), "{text}");
             assert!(text.contains("#27AE60"), "{text}");
             assert!(text.contains("R4"), "{text}");
             assert!(text.contains("upload_media"), "{text}");
-            assert!(text.contains("visual_id"), "{text}");
+            assert!(text.contains("visualId"), "{text}");
+            assert!(!text.contains("audio_id"), "{text}");
+            assert!(!text.contains("rich_text"), "{text}");
+        } else {
+            panic!("expected text resource contents");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_card_schema_lists_all_span_style_fields() {
+        let client = EngramoClient::new("http://localhost:9999", "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CARD_SCHEMA))
+            .await
+            .unwrap();
+        if let ResourceContents::TextResourceContents { text, .. } = &result.contents[0] {
+            for f in [
+                "bold",
+                "italic",
+                "underline",
+                "strikethrough",
+                "superscript",
+                "subscript",
+                "fontSize",
+                "fontColor",
+                "fontFamily",
+            ] {
+                assert!(text.contains(f), "{f} missing from card-schema doc: {text}");
+            }
+            // Nested-`style` guidance (issue #37): styling shown nested under `style`, not flat.
+            assert!(text.contains("\"style\": { \"fontColor\""), "{text}");
         } else {
             panic!("expected text resource contents");
         }

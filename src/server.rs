@@ -245,7 +245,9 @@ impl EngramoMcpServer {
     #[tool(
         description = "Update an existing flashcard's face, back, or catalog memberships. \
         Requires the current version for optimistic locking — fetch the card first. \
-        If you get a Conflict error, re-fetch and retry."
+        If you get a Conflict error, re-fetch and retry. \
+        rich_text styling goes under a nested `style` object, e.g. \
+        {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
     pub async fn update_card(
         &self,
@@ -905,6 +907,8 @@ impl EngramoMcpServer {
             — never add separator characters, markers, or ANY characters not present in the original sentence. \
             Spans must partition face.text with no gaps; their concatenation must equal face.text exactly. \
             The server validates this and discards richText if spans disagree with text. \
+            Styling goes under a nested `style` object on the span, never as flat fields, e.g. \
+            {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
             Use fontFamily='monospace' for code, bold=true for key terms, \
             fontColor='#E74C3C' for warnings, '#27AE60' for correct answers. \
             If no styling needed, omit rich_text entirely and just set text.")]
@@ -946,7 +950,9 @@ impl EngramoMcpServer {
             Each span's text must be a VERBATIM continuous segment of the original text \
             — never add separator characters, markers, or ANY characters not present in the original sentence. \
             Spans must partition face.text with no gaps; their concatenation must equal face.text exactly. \
-            The server validates this and discards richText if spans disagree with text."
+            The server validates this and discards richText if spans disagree with text. \
+            Styling goes under a nested `style` object on the span, e.g. \
+            {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
     pub async fn generate_catalog_with_cards(
         &self,
@@ -993,7 +999,9 @@ impl EngramoMcpServer {
             Each span's text must be a VERBATIM continuous segment of the original text \
             — never add separator characters, markers, or ANY characters not present in the original sentence. \
             Spans must partition face.text with no gaps; their concatenation must equal face.text exactly. \
-            The server validates this and discards richText if spans disagree with text."
+            The server validates this and discards richText if spans disagree with text. \
+            Styling goes under a nested `style` object on the span, e.g. \
+            {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
     pub async fn generate_cards(
         &self,
@@ -1525,6 +1533,176 @@ mod tests {
         assert!(text.contains(env!("CARGO_PKG_NAME")), "{text}");
     }
 
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_ok_and_invalid_uuid() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let catalog_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("POST"))
+            .and(path(format!("/learning/catalogs/{catalog_id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .add_catalog_to_learning(Parameters(AddCatalogToLearningParams {
+                catalog_id: catalog_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert_eq!(first_text(&result), "Catalog added to learning.");
+
+        let before = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+        let result = server
+            .add_catalog_to_learning(Parameters(AddCatalogToLearningParams {
+                catalog_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_ok() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "Spanish A1",
+                "description": null,
+                "version": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .create_learning_path(Parameters(CreateLearningPathParams {
+                name: "Spanish A1".to_string(),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert!(first_text(&result).contains("Spanish A1"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_forbidden_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .create_learning_path(Parameters(CreateLearningPathParams {
+                name: "Spanish A1".to_string(),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_deactivate_learning_path_ok_and_invalid_uuid() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{path_id}/deactivate")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .deactivate_learning_path(Parameters(ActivateLearningPathParams {
+                path_id: path_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert_eq!(first_text(&result), "Learning path deactivated.");
+
+        let before = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+        let result = server
+            .deactivate_learning_path(Parameters(ActivateLearningPathParams {
+                path_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deactivate_learning_path_not_found_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{path_id}/deactivate")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .deactivate_learning_path(Parameters(ActivateLearningPathParams {
+                path_id: path_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+    }
+
     #[test]
     fn test_paid_ai_tools_absent_when_flag_off() {
         let client = EngramoClient::new("http://localhost", "engramo_test");
@@ -1845,5 +2023,13 @@ mod tests {
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me gusta el café.");
         assert!(content.rich_text.is_some());
+    }
+
+    #[test]
+    fn test_normalize_empty_rich_text_vec_keeps_plain_text() {
+        let mut c = CardContent::plain("Hola\tamigo");
+        c.rich_text = Some(vec![]);
+        normalize_card_content(&mut c);
+        assert_eq!(c.text, "Holaamigo");
     }
 }
