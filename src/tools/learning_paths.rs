@@ -13,7 +13,9 @@ use crate::tools::catalogs::{err_result, ok_json, ok_text, parse_uuid};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListLearningPathsParams {
-    #[schemars(description = "Maximum number of paths to return (default: 20)")]
+    #[schemars(
+        description = "Maximum number of paths to return (default 20; values are clamped to 1..=50)"
+    )]
     pub limit: Option<i64>,
     #[schemars(description = "Pagination cursor from a previous response")]
     pub cursor: Option<String>,
@@ -55,7 +57,9 @@ impl LearningPathTools {
         }
     }
 
-    #[tool(description = "List all learning paths with cursor-based pagination.")]
+    #[tool(
+        description = "List all learning paths with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+    )]
     async fn list_learning_paths(
         &self,
         Parameters(p): Parameters<ListLearningPathsParams>,
@@ -162,7 +166,7 @@ mod tests {
             .and(path("/learning-paths"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -175,6 +179,41 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    /// Regression test for issue #34/#35: the `list_learning_paths` tool output's `cursor`
+    /// field must reflect the API's real `nextCursor` value, not always be `null` (mirrors
+    /// `catalogs::tests::test_list_catalogs_cursor_reaches_tool_output`). A reporter
+    /// confirmed this with `list_learning_paths({limit:1})` on an account with 3 paths.
+    #[tokio::test]
+    async fn test_list_learning_paths_cursor_reaches_tool_output() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .and(wiremock::matchers::query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": mock_id(), "name": "Path 1", "version": 1}],
+                "nextCursor": "abc"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .list_learning_paths(Parameters(ListLearningPathsParams {
+                limit: Some(1),
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["cursor"], "abc", "{text}");
     }
 
     #[tokio::test]

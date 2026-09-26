@@ -4,7 +4,9 @@ use uuid::Uuid;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListCatalogsParams {
-    #[schemars(description = "Maximum number of catalogs to return (default: 20)")]
+    #[schemars(
+        description = "Maximum number of catalogs to return (default 20; values are clamped to 1..=50)"
+    )]
     pub limit: Option<i64>,
     #[schemars(description = "Pagination cursor from a previous response")]
     pub cursor: Option<String>,
@@ -93,7 +95,7 @@ mod tests {
             .and(path("/catalogs"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"id": mock_id(), "name": "Rust", "version": 1}],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -106,6 +108,39 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    /// Regression test for issue #34: the tool output's `cursor` field must reflect the
+    /// API's real `nextCursor` value, not always be `null`.
+    #[tokio::test]
+    async fn test_list_catalogs_cursor_reaches_tool_output() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": "abc"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["cursor"], "abc", "{text}");
     }
 
     #[tokio::test]
@@ -221,5 +256,78 @@ mod tests {
         let id = parse_uuid("not-a-uuid");
         assert!(id.is_err());
         assert!(id.unwrap_err().contains("Invalid UUID"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_error_body_values_do_not_reach_logs_via_err_result() {
+        use crate::error::test_support::BufWriter;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": mock_id(), "name": "x", "version": "SECRET_USER_TEXT"}],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        drop(guard);
+
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            text.contains("Unexpected response from the Engramo API"),
+            "{text}"
+        );
+        assert!(!text.contains("SECRET_USER_TEXT"), "{text}");
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("SECRET_USER_TEXT"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_network_failure_returns_error_without_url() {
+        use rmcp::handler::server::wrapper::Parameters;
+        // Port 1 (tcpmux) has no listener, so the connection is refused deterministically. A
+        // dropped MockServer's port would race with other tests' servers reusing it.
+        let uri = "http://127.0.0.1:1".to_string();
+
+        let result = make_server(&uri)
+            .list_catalogs(Parameters(ListCatalogsParams {
+                limit: None,
+                cursor: Some("SECRET_CURSOR".to_string()),
+            }))
+            .await
+            .unwrap(); // must NOT be Err — MCP contract
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("Network error"), "{text}");
+        assert!(!text.contains("SECRET_CURSOR"), "{text}");
+        assert!(!text.contains(&uri), "{text}");
     }
 }

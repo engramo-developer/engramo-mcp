@@ -10,13 +10,28 @@ use uuid::Uuid;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PagedResponse<T> {
     pub data: Vec<T>,
+    /// The API sends this field as `nextCursor`, not `cursor` (issue #34) — only that key
+    /// populates `Some(_)`. Serialized output keeps the key `cursor`, matching the tools'
+    /// `cursor` input parameter. Note this is `Option<String>`, so an old mock still using
+    /// the wrong key `cursor` won't error — it just deserializes to `None`, the same silent
+    /// failure mode that caused #34 in the first place; correctness here relies on every
+    /// mock actually using `nextCursor`, not on serde rejecting the old key.
+    #[serde(rename(deserialize = "nextCursor"))]
     pub cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PagedResponseWithCount<T> {
     pub data: Vec<T>,
+    /// See `PagedResponse::cursor` — same rename from the wire's `nextCursor`, same caveat
+    /// about `Option` fields not turning a stale key into a hard error.
+    #[serde(rename(deserialize = "nextCursor"))]
     pub cursor: Option<String>,
+    /// The API sends this field as `total`; strict rename so a stale mock fails loudly
+    /// instead of a confusing "missing field `total_count`" deserialize error (see
+    /// issue #35). Serialized output keeps the key `total_count`, matching the stats
+    /// resource's field name.
+    #[serde(rename(deserialize = "total"))]
     pub total_count: i64,
 }
 
@@ -350,22 +365,32 @@ pub struct CreateLearningPathRequest {
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
+/// The API's `GlobalSearchResult` is `#[serde(rename_all = "camelCase")]`, so the wire
+/// fields are `itemType`, `id`, `title`, `subtitle`, `parentId`, `rank`, `imageId`,
+/// `imageUrl`. We only model the fields this crate uses; `parent_id` is the catalog's
+/// UUID for a card hit, useful for a follow-up `get_catalog`/`list_cards` call.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
 pub struct GlobalSearchResult {
     pub id: Uuid,
-    pub name: Option<String>,
+    /// "catalog" or "card".
     pub item_type: Option<String>,
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    pub parent_id: Option<Uuid>,
 }
 
 // ── Media ─────────────────────────────────────────────────────────────────────
 
+/// The API's `MediaDto` uses plain snake_case on the wire (no rename), so field names
+/// here match it directly: `id`, `name`, `content_type`, `media_type`, `length`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MediaDto {
     pub id: Uuid,
+    pub name: Option<String>,
+    pub content_type: Option<String>,
     pub media_type: Option<String>,
-    #[serde(rename = "fileName")]
-    pub file_name: Option<String>,
-    pub size: Option<i64>,
+    pub length: Option<i64>,
 }
 
 /// Raw shape of `POST /media`'s response body: `{"media_ids": {"ids": [...]}}`.
@@ -548,11 +573,92 @@ mod tests {
 
     #[test]
     fn test_pagedresponse_deserialization() {
-        let json = r#"{"data":[{"id":"00000000-0000-0000-0000-000000000001","name":"Rust","version":1}],"cursor":"abc"}"#;
+        let json = r#"{"data":[{"id":"00000000-0000-0000-0000-000000000001","name":"Rust","version":1}],"nextCursor":"abc"}"#;
         let resp: PagedResponse<CatalogDto> = serde_json::from_str(json).unwrap();
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].name, "Rust");
         assert_eq!(resp.cursor, Some("abc".to_string()));
+    }
+
+    #[test]
+    fn test_pagedresponse_serialization_uses_cursor_key() {
+        // The output key stays `cursor` even though the wire's deserialize key is
+        // `nextCursor` — the tools' `cursor` input parameter expects this name back.
+        let resp = PagedResponse::<CatalogDto> {
+            data: vec![],
+            cursor: Some("abc".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"cursor\":\"abc\""), "{json}");
+        assert!(!json.contains("nextCursor"), "{json}");
+    }
+
+    #[test]
+    fn test_pagedresponse_stale_cursor_key_is_ignored_not_matched() {
+        // `cursor` is `Option<String>`, so a strict (non-alias) rename to `nextCursor`
+        // can't turn a wrong key into a hard deserialize error — serde treats a missing
+        // Option field as `None`, same as before the fix. This is precisely why #34 went
+        // undetected: the field silently defaulted instead of failing. The rename's value
+        // is that only the *real* wire key (`nextCursor`) ever populates `cursor` with
+        // `Some(_)` — asserted by `test_pagedresponse_deserialization` above — not that a
+        // stale mock errors.
+        let json = r#"{"data":[],"cursor":"abc"}"#;
+        let resp: PagedResponse<CatalogDto> = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.cursor, None);
+    }
+
+    #[test]
+    fn test_pagedresponsewithcount_deserialization_and_serialization() {
+        let json = r#"{"data":[],"nextCursor":"xyz","total":42}"#;
+        let resp: PagedResponseWithCount<CatalogDto> = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.cursor, Some("xyz".to_string()));
+        assert_eq!(resp.total_count, 42);
+
+        let out = serde_json::to_string(&resp).unwrap();
+        assert!(out.contains("\"cursor\":\"xyz\""), "{out}");
+        assert!(out.contains("\"total_count\":42"), "{out}");
+    }
+
+    #[test]
+    fn test_global_search_result_deserializes_camel_case() {
+        let json = r#"{"itemType":"card","id":"00000000-0000-0000-0000-000000000001",
+            "title":"Ownership","subtitle":"Rust Basics",
+            "parentId":"00000000-0000-0000-0000-000000000002"}"#;
+        let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.item_type.as_deref(), Some("card"));
+        assert_eq!(result.title.as_deref(), Some("Ownership"));
+        assert_eq!(result.subtitle.as_deref(), Some("Rust Basics"));
+        assert_eq!(
+            result.parent_id,
+            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_global_search_result_serializes_snake_case() {
+        let r = GlobalSearchResult {
+            id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            item_type: Some("card".to_string()),
+            title: Some("T".to_string()),
+            subtitle: None,
+            parent_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"parent_id\""), "{json}");
+        assert!(json.contains("\"item_type\""), "{json}");
+        assert!(!json.contains("parentId"), "{json}");
+        assert!(!json.contains("itemType"), "{json}");
+    }
+
+    #[test]
+    fn test_media_dto_deserializes_snake_case() {
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000001","name":"photo.jpg",
+            "content_type":"image/jpeg","media_type":"image","length":1024}"#;
+        let media: MediaDto = serde_json::from_str(json).unwrap();
+        assert_eq!(media.name.as_deref(), Some("photo.jpg"));
+        assert_eq!(media.content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(media.media_type.as_deref(), Some("image"));
+        assert_eq!(media.length, Some(1024));
     }
 
     #[test]

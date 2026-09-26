@@ -26,8 +26,12 @@ pub(crate) const MAX_UPLOAD_BASE64_LEN: usize = MAX_UPLOAD_BYTES.div_ceil(3) * 4
 pub struct ListMediaParams {
     #[schemars(description = "Filter by media type (e.g., 'image', 'audio')")]
     pub media_type: Option<String>,
-    #[schemars(description = "Maximum number of items to return (default: 20)")]
+    #[schemars(
+        description = "Maximum number of items to return (default 20; values are clamped to 1..=50)"
+    )]
     pub limit: Option<i64>,
+    #[schemars(description = "Pagination cursor from a previous response")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -62,7 +66,7 @@ impl MediaTools {
     }
 
     #[tool(
-        description = "List uploaded media files. Optionally filter by media type ('image', 'audio', etc.)."
+        description = "List uploaded media files. Optionally filter by media type ('image', 'audio', etc.). Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     async fn list_media(
         &self,
@@ -71,7 +75,7 @@ impl MediaTools {
         Ok(
             match self
                 .client
-                .list_media(p.media_type.as_deref(), p.limit)
+                .list_media(p.media_type.as_deref(), p.limit, p.cursor.as_deref())
                 .await
             {
                 Ok(resp) => ok_json(&resp),
@@ -152,7 +156,7 @@ mod tests {
             .and(path("/media"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -161,10 +165,44 @@ mod tests {
             .list_media(Parameters(ListMediaParams {
                 media_type: None,
                 limit: None,
+                cursor: None,
             }))
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_list_media_cursor_forwarded_and_reaches_tool_output() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .and(query_param("cursor", "abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": "def"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .list_media(Parameters(ListMediaParams {
+                media_type: None,
+                limit: None,
+                cursor: Some("abc".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["cursor"], "def", "{text}");
     }
 
     #[tokio::test]
@@ -180,6 +218,7 @@ mod tests {
             .list_media(Parameters(ListMediaParams {
                 media_type: None,
                 limit: None,
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -261,5 +300,33 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_list_media_oversized_cursor_returns_tool_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .list_media(Parameters(ListMediaParams {
+                media_type: None,
+                limit: None,
+                cursor: Some("a".repeat(513)),
+            }))
+            .await
+            .unwrap(); // must NOT be Err — MCP contract
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("cursor is too long"), "{text}");
     }
 }

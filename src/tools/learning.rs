@@ -12,7 +12,9 @@ use crate::tools::catalogs::{err_result, ok_json, ok_text, parse_uuid};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DueCardsParams {
-    #[schemars(description = "Maximum number of cards to return (default: 20)")]
+    #[schemars(
+        description = "Maximum number of cards to return (default 20; values are clamped to 1..=50)"
+    )]
     pub limit: Option<i64>,
     #[schemars(description = "Pagination cursor from a previous response")]
     pub cursor: Option<String>,
@@ -47,7 +49,7 @@ impl LearningTools {
     }
 
     #[tool(
-        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session."
+        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     async fn get_due_cards(
         &self,
@@ -66,7 +68,7 @@ impl LearningTools {
     }
 
     #[tool(
-        description = "Get all cards currently in the learning queue (due and future), with pagination."
+        description = "Get all cards currently in the learning queue (due and future), with pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     async fn get_all_learning_cards(
         &self,
@@ -138,8 +140,8 @@ mod tests {
             .and(path("/learning/cards"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [],
-                "cursor": null,
-                "total_count": 0
+                "nextCursor": null,
+                "total": 0
             })))
             .mount(&server)
             .await;
@@ -152,6 +154,104 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    /// Regression test for issue #35: a decode failure (missing `total`) must surface at
+    /// the tool level as a specific, actionable `is_error` message — not the vague
+    /// "Network error" that reqwest's own decode-error path used to produce.
+    #[tokio::test]
+    async fn test_get_all_learning_cards_missing_total_returns_actionable_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards/all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .get_all_learning_cards(Parameters(DueCardsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("total"), "{text}");
+        assert!(!text.contains("Network error"), "{text}");
+        assert!(text.contains("retrying will not help"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_get_due_cards_cursor_reaches_tool_output() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": "abc",
+                "total": 0
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .get_due_cards(Parameters(DueCardsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["cursor"], "abc", "{text}");
+        assert_eq!(v["total_count"], 0, "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_get_all_learning_cards_cursor_reaches_tool_output() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards/all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": "abc",
+                "total": 3
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .get_all_learning_cards(Parameters(DueCardsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["cursor"], "abc", "{text}");
+        assert_eq!(v["total_count"], 3, "{text}");
     }
 
     #[tokio::test]

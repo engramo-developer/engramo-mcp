@@ -15,8 +15,12 @@ use rmcp::model::{
     ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
 };
 
-use crate::client::EngramoClient;
-use crate::dto::{CatalogSummary, DueCardSummary, LearningPathSummary, LearningStats};
+use std::time::Duration;
+
+use crate::client::{EngramoClient, MAX_PAGE_LIMIT};
+use crate::dto::{
+    CatalogSummary, DueCardSummary, LearningPathSummary, LearningStats, PagedResponse,
+};
 use crate::error::ApiError;
 
 // ── URI constants ─────────────────────────────────────────────────────────────
@@ -224,14 +228,78 @@ fn fetch_as_result(
 
 // ── Per-resource fetchers ─────────────────────────────────────────────────────
 
+/// Page cap so a misbehaving upstream that keeps returning a cursor can't loop forever.
+const RESOURCE_MAX_PAGES: usize = 20;
+/// Hard cap on items one resource read aggregates (20 pages x 50 is the honest maximum). The
+/// upstream's per-page limit isn't enforced on our side, so this bounds memory too.
+const RESOURCE_MAX_ITEMS: usize = RESOURCE_MAX_PAGES * MAX_PAGE_LIMIT as usize;
+/// Overall deadline for one paginated resource read; the page cap bounds iterations, not time.
+const RESOURCE_READ_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Follows `nextCursor` until the data ends, aggregating every page into `S` summaries.
+/// Stops (and logs a warning) when the page cap, the item cap or a non-advancing cursor is
+/// hit, and fails the whole read if the overall deadline passes or any page errors — a later
+/// page's error must not be papered over by returning a partial result as if complete.
+async fn collect_pages<D, S, F, Fut>(mut fetch: F) -> Result<Vec<S>, ApiError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<PagedResponse<D>, ApiError>>,
+    S: From<D>,
+{
+    tokio::time::timeout(RESOURCE_READ_DEADLINE, async {
+        let mut out: Vec<S> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..RESOURCE_MAX_PAGES {
+            let resp = fetch(cursor.clone()).await?;
+            let room = RESOURCE_MAX_ITEMS.saturating_sub(out.len());
+            let over_item_cap = resp.data.len() > room;
+            out.extend(resp.data.into_iter().take(room).map(S::from));
+            if over_item_cap || out.len() >= RESOURCE_MAX_ITEMS {
+                if resp.cursor.is_some() || over_item_cap {
+                    tracing::warn!(
+                        max_items = RESOURCE_MAX_ITEMS,
+                        "resource item cap reached; result truncated"
+                    );
+                }
+                return Ok(out);
+            }
+            let Some(next) = resp.cursor else {
+                return Ok(out);
+            };
+            if cursor.as_deref() == Some(next.as_str()) {
+                tracing::warn!("upstream returned a non-advancing cursor; result truncated");
+                return Ok(out);
+            }
+            cursor = Some(next);
+        }
+        tracing::warn!(
+            max_pages = RESOURCE_MAX_PAGES,
+            "resource pagination cap reached; result truncated"
+        );
+        Ok(out)
+    })
+    .await
+    .map_err(|_| {
+        tracing::error!(
+            deadline_secs = RESOURCE_READ_DEADLINE.as_secs(),
+            "resource read deadline exceeded"
+        );
+        ApiError::Timeout("resource read; use the list tools with a cursor instead")
+    })?
+}
+
 async fn read_catalogs(client: &EngramoClient) -> Result<String, ApiError> {
-    let resp = client.list_catalogs(Some(100), None).await?;
-    let summaries: Vec<CatalogSummary> = resp.data.into_iter().map(Into::into).collect();
+    let summaries: Vec<CatalogSummary> = collect_pages(|c| async move {
+        client
+            .list_catalogs(Some(MAX_PAGE_LIMIT), c.as_deref())
+            .await
+    })
+    .await?;
     Ok(serde_json::to_string(&summaries).unwrap_or_default())
 }
 
 async fn read_due(client: &EngramoClient) -> Result<String, ApiError> {
-    let resp = client.get_due_cards(Some(50), None).await?;
+    let resp = client.get_due_cards(Some(MAX_PAGE_LIMIT), None).await?;
     let summaries: Vec<DueCardSummary> = resp.data.into_iter().map(Into::into).collect();
     Ok(serde_json::to_string(&summaries).unwrap_or_default())
 }
@@ -247,8 +315,12 @@ async fn read_stats(client: &EngramoClient) -> Result<String, ApiError> {
 }
 
 async fn read_learning_paths(client: &EngramoClient) -> Result<String, ApiError> {
-    let resp = client.list_learning_paths(Some(100), None).await?;
-    let summaries: Vec<LearningPathSummary> = resp.data.into_iter().map(Into::into).collect();
+    let summaries: Vec<LearningPathSummary> = collect_pages(|c| async move {
+        client
+            .list_learning_paths(Some(MAX_PAGE_LIMIT), c.as_deref())
+            .await
+    })
+    .await?;
     Ok(serde_json::to_string(&summaries).unwrap_or_default())
 }
 
@@ -269,6 +341,18 @@ fn read_card_schema() -> ReadResourceResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_collect_pages_deadline_returns_timeout() {
+        let result: Result<Vec<CatalogSummary>, ApiError> = collect_pages(|_c| async {
+            std::future::pending::<Result<PagedResponse<crate::dto::CatalogDto>, ApiError>>().await
+        })
+        .await;
+        match result {
+            Err(ApiError::Timeout(msg)) => assert!(msg.contains("resource read"), "{msg}"),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_list_all_returns_six_resources() {
@@ -339,7 +423,7 @@ mod tests {
             .and(path("/catalogs"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"id": "00000000-0000-0000-0000-000000000001", "name": "Rust", "version": 1, "card_count": 5}],
-                "cursor": null
+                "nextCursor": null
             })))
             .mount(&server)
             .await;
@@ -403,5 +487,334 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+    }
+
+    fn resource_text(result: &ReadResourceResult) -> &str {
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text.as_str(),
+            _ => panic!("expected text resource contents"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_catalogs_follows_cursor_across_pages() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param("limit", "50"))
+            .and(query_param("cursor", "c1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "00000000-0000-0000-0000-000000000002", "name": "SecondPage", "version": 1}],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "00000000-0000-0000-0000-000000000001", "name": "FirstPage", "version": 1}],
+                "nextCursor": "c1"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
+            .await
+            .unwrap();
+        let text = resource_text(&result);
+        assert!(text.contains("FirstPage"), "{text}");
+        assert!(text.contains("SecondPage"), "{text}");
+    }
+
+    /// Responds with an empty page and a fresh cursor every time (`c0`, `c1`, ...), i.e. an
+    /// upstream that never ends but whose cursor does advance.
+    struct EndlessPages(std::sync::atomic::AtomicUsize);
+
+    impl wiremock::Respond for EndlessPages {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [], "nextCursor": format!("c{n}")
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_catalogs_stops_at_page_cap_when_cursor_never_ends() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(EndlessPages(Default::default()))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
+            .await
+            .unwrap();
+        assert_eq!(resource_text(&result), "[]");
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), RESOURCE_MAX_PAGES);
+    }
+
+    #[tokio::test]
+    async fn test_read_catalogs_stops_when_cursor_does_not_advance() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [], "nextCursor": "again"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
+            .await
+            .unwrap();
+        assert_eq!(resource_text(&result), "[]");
+        // Page 1 (no cursor) yields "again"; page 2 sends it and gets "again" back -> stop.
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_catalogs_caps_total_items() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let data: Vec<_> = (0..RESOURCE_MAX_ITEMS + 1)
+            .map(|i| {
+                json!({
+                    "id": format!("00000000-0000-0000-0000-{i:012}"),
+                    "name": format!("Cat{i}"),
+                    "version": 1
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": data, "nextCursor": "more"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
+            .await
+            .unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_str(resource_text(&result)).unwrap();
+        assert_eq!(items.len(), RESOURCE_MAX_ITEMS);
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 1, "must stop once the item cap is reached");
+    }
+
+    #[tokio::test]
+    async fn test_read_catalogs_error_on_second_page_returns_internal_error() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param("cursor", "c1"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "00000000-0000-0000-0000-000000000001", "name": "FirstPage", "version": 1}],
+                "nextCursor": "c1"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let err = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_read_learning_paths_follows_cursor_across_pages() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .and(query_param("limit", "50"))
+            .and(query_param("cursor", "c1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "00000000-0000-0000-0000-000000000002", "name": "SecondPath", "version": 1}],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "00000000-0000-0000-0000-000000000001", "name": "FirstPath", "version": 1}],
+                "nextCursor": "c1"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_LEARNING_PATHS))
+            .await
+            .unwrap();
+        let text = resource_text(&result);
+        assert!(text.contains("FirstPath"), "{text}");
+        assert!(text.contains("SecondPath"), "{text}");
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_learning_paths_stops_at_page_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .respond_with(EndlessPages(Default::default()))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_LEARNING_PATHS))
+            .await
+            .unwrap();
+        assert_eq!(resource_text(&result), "[]");
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), RESOURCE_MAX_PAGES);
+    }
+
+    #[tokio::test]
+    async fn test_read_due_ok_with_real_wire_shape() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "face": {"text": "Q"},
+                    "back": {"text": "A"},
+                    "nextReview": "2026-09-26T00:00:00Z"
+                }],
+                "nextCursor": null,
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_DUE))
+            .await
+            .unwrap();
+        let text = resource_text(&result);
+        assert!(text.contains("\"face_text\":\"Q\""), "{text}");
+        assert!(
+            text.contains("00000000-0000-0000-0000-000000000001"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_due_decode_error_returns_internal_error_with_field_name() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let err = read(&client, ReadResourceRequestParams::new(URI_DUE))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(err.message.contains("total"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn test_read_learning_paths_ok() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "00000000-0000-0000-0000-000000000001", "name": "Path 1", "version": 1}],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_LEARNING_PATHS))
+            .await
+            .unwrap();
+        assert_eq!(result.contents.len(), 1);
+        let text = resource_text(&result);
+        assert!(text.contains("Path 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_read_subscription_ok() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/subscription"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plan_id": "pro"})))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_SUBSCRIPTION))
+            .await
+            .unwrap();
+        assert_eq!(result.contents.len(), 1);
+        let text = resource_text(&result);
+        assert!(text.contains("pro"), "{text}");
     }
 }
