@@ -9,6 +9,19 @@ pub struct QuotaExceededBody {
     pub limit: Option<i64>,
 }
 
+/// Short, escaped preview of an untrusted (LLM-supplied) value for error text / logs —
+/// caps how much of a malformed, possibly multi-MB value ends up in `err_result`'s WARN log
+/// line or the tool result, and escapes embedded control characters (e.g. CR/LF) so they
+/// can't forge extra log lines under a non-JSON log formatter.
+pub(crate) fn preview(s: &str) -> String {
+    const MAX: usize = 64;
+    let mut out: String = s.chars().take(MAX).flat_map(char::escape_debug).collect();
+    if s.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
 /// Errors produced by the Engramo HTTP client.
 /// These are always converted to `Ok(CallToolResult { is_error: true })` at the tool level —
 /// never returned as a raw Rust `Err()`, which would crash the AI's tool-calling loop.

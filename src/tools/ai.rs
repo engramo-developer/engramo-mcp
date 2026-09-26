@@ -50,7 +50,9 @@ pub struct TranslateBatchImportParams {
     pub description: Option<String>,
     #[schemars(description = "Optional catalog tags.")]
     pub tags: Option<Vec<String>>,
-    #[schemars(description = "New catalog visibility: 'public' or 'private'.")]
+    #[schemars(
+        description = "New catalog visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id)."
+    )]
     pub visibility: Option<String>,
     #[schemars(
         description = "Base64-encoded content file: either a ZIP archive containing index.json \
@@ -444,5 +446,152 @@ mod tests {
             .map(|t| t.text.as_str())
             .unwrap_or("");
         assert!(text.contains("base64"), "{text}");
+    }
+
+    /// Regression for F5: the second `parse_optional_uuid` early return (on `card_id`) in
+    /// each paid-AI tool must also short-circuit before any request is sent — previously
+    /// only a bad `catalog_id` was ever exercised.
+    #[tokio::test]
+    async fn test_paid_ai_tools_invalid_card_id_returns_error_without_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let s = make_server(&server.uri());
+
+        let results = [
+            s.generate_tts_for_cards(Parameters(CardAiToolParams {
+                catalog_id: None,
+                card_id: Some("bad".to_string()),
+                lang: "es".to_string(),
+            }))
+            .await
+            .unwrap(),
+            s.translate_cards(Parameters(CardAiToolParams {
+                catalog_id: None,
+                card_id: Some("bad".to_string()),
+                lang: "es".to_string(),
+            }))
+            .await
+            .unwrap(),
+            s.generate_dictionary_for_cards(Parameters(CardAiToolParams {
+                catalog_id: None,
+                card_id: Some("bad".to_string()),
+                lang: "es".to_string(),
+            }))
+            .await
+            .unwrap(),
+        ];
+        for r in results {
+            assert_eq!(r.is_error, Some(true), "{r:?}");
+            let text = r
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str())
+                .unwrap_or("");
+            assert!(text.contains("Invalid UUID"), "{text}");
+        }
+    }
+
+    /// Regression for F6: an upstream quota/auth failure must still reach the caller as
+    /// `is_error` tool content, not a propagated `Err`, for every paid-AI tool that only
+    /// had happy-path/pre-request-validation coverage so far.
+    #[tokio::test]
+    async fn test_paid_ai_tools_quota_exceeded_returns_error_content() {
+        let server = MockServer::start().await;
+        let quota = json!({"error":"quota_exceeded","resource_type":"x","used":1,"limit":1});
+        for p in [
+            "/catalogs/tts",
+            "/catalogs/dictionary",
+            "/ai-agent",
+            "/catalogs/translate-batch-import/es",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(429).set_body_json(quota.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let s = make_server(&server.uri());
+
+        let results = [
+            s.generate_tts_for_cards(Parameters(CardAiToolParams {
+                catalog_id: Some(mock_id().to_string()),
+                card_id: None,
+                lang: "es".to_string(),
+            }))
+            .await
+            .unwrap(),
+            s.generate_dictionary_for_cards(Parameters(CardAiToolParams {
+                catalog_id: Some(mock_id().to_string()),
+                card_id: None,
+                lang: "es".to_string(),
+            }))
+            .await
+            .unwrap(),
+            s.ai_agent_chat(Parameters(AiAgentChatParams {
+                session_id: None,
+                message: "hi".to_string(),
+            }))
+            .await
+            .unwrap(),
+            s.translate_batch_import(Parameters(TranslateBatchImportParams {
+                target_lang: "es".to_string(),
+                name: "D".to_string(),
+                description: None,
+                tags: None,
+                visibility: None,
+                content_file_base64: base64::engine::general_purpose::STANDARD.encode(b"[]"),
+                content_file_name: None,
+            }))
+            .await
+            .unwrap(),
+        ];
+        for r in results {
+            assert_eq!(r.is_error, Some(true), "{r:?}");
+            let text = r
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str())
+                .unwrap_or("");
+            assert!(text.contains("Quota exceeded"), "{text}");
+        }
+    }
+
+    /// Regression for F12: `visibility` must reach the multipart `catalog_metadata` part,
+    /// and an omitted `content_file_name` must default to `import.zip`.
+    #[tokio::test]
+    async fn test_translate_batch_import_forwards_unlisted_visibility_and_default_filename() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/translate-batch-import/es"))
+            .and(body_string_contains(r#""visibility":"unlisted""#))
+            .and(body_string_contains(r#"filename="import.zip""#))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": mock_id(), "name": "D", "version": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(TranslateBatchImportParams {
+                target_lang: "es".to_string(),
+                name: "D".to_string(),
+                description: None,
+                tags: None,
+                visibility: Some("unlisted".to_string()),
+                content_file_base64: base64::engine::general_purpose::STANDARD.encode(b"[]"),
+                content_file_name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
     }
 }

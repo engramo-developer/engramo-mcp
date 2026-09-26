@@ -207,7 +207,7 @@ impl EngramoMcpServer {
 #[tool_router(router = card_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "List flashcards in a catalog with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "List flashcards in a catalog with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). Each returned card includes its `catalogs` memberships (id, name), permission-filtered the same as `get_card` — omitted when the API didn't report memberships."
     )]
     pub async fn list_cards(
         &self,
@@ -227,7 +227,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships."
+        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships)."
     )]
     pub async fn get_card(
         &self,
@@ -245,7 +245,12 @@ impl EngramoMcpServer {
     #[tool(
         description = "Update an existing flashcard's face, back, or catalog memberships. \
         Requires the current version for optimistic locking — fetch the card first. \
-        If you get a Conflict error, re-fetch and retry. \
+        `catalog_ids` REPLACES the memberships you can see, so build it from the \
+        `catalogs[].id` values in `get_card` or `list_cards`'s response (which lists only \
+        catalogs visible to you) plus/minus any intended changes — an empty list moves the \
+        card to the user's default catalog. If the card JSON has no `catalogs` key, its \
+        memberships are unknown — call `get_card` first; never send an empty list unless you \
+        intend to move the card to the default catalog. If you get a Conflict error, re-fetch and retry. \
         rich_text styling goes under a nested `style` object, e.g. \
         {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
@@ -555,7 +560,14 @@ impl EngramoMcpServer {
 #[tool_router(router = media_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "List uploaded media files. Optionally filter by media type ('image', 'audio', etc.). Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "List your own media library — files you uploaded with upload_media, \
+        including audio produced by generate_card_audio. This does NOT include media attached \
+        to cards uploaded by other accounts (e.g. in shared/subscribed catalogs); to find a \
+        specific card's audio or image, use get_card and read its `audio_id`/`visual_id` instead. \
+        Optionally filter by media type ('image', 'audio', etc.). Each item has `id`, `name` \
+        (original filename), `content_type`, `media_type`, and `length` (size in bytes). Returns \
+        at most 50 items per call; pass the returned `cursor` back to fetch the next page \
+        (`cursor: null` means this is the last page)."
     )]
     pub async fn list_media(
         &self,
@@ -1185,6 +1197,58 @@ mod tests {
     }
 
     #[test]
+    fn test_update_card_and_list_media_descriptions_document_catalogs_and_get_card_on_the_real_server()
+     {
+        // Regression guard for F1/F2: `update_card`'s and `list_media`'s docs must reach the
+        // real, registered tool — not just their `tools/*.rs` scaffold — so the wording can't
+        // silently drift back to the undocumented scaffold text.
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+
+        let update_card = tools
+            .iter()
+            .find(|t| t.name == "update_card")
+            .expect("update_card not registered");
+        let update_card_description = update_card.description.clone().unwrap_or_default();
+        assert!(
+            update_card_description.contains("REPLACES"),
+            "{update_card_description}"
+        );
+        assert!(
+            update_card_description.contains("has no `catalogs` key")
+                && update_card_description.contains("call `get_card` first"),
+            "{update_card_description}"
+        );
+        let catalog_ids_schema = serde_json::to_string(&update_card.input_schema)
+            .expect("update_card input schema serializes");
+        assert!(
+            catalog_ids_schema.contains("has no `catalogs` key"),
+            "{catalog_ids_schema}"
+        );
+
+        let get_card = tools
+            .iter()
+            .find(|t| t.name == "get_card")
+            .expect("get_card not registered");
+        let get_card_description = get_card.description.clone().unwrap_or_default();
+        assert!(
+            get_card_description.contains("omitted when the API does not report"),
+            "{get_card_description}"
+        );
+
+        let list_media = tools
+            .iter()
+            .find(|t| t.name == "list_media")
+            .expect("list_media not registered");
+        let list_media_description = list_media.description.clone().unwrap_or_default();
+        assert!(
+            list_media_description.contains("get_card"),
+            "{list_media_description}"
+        );
+    }
+
+    #[test]
     fn test_search_tools_describe_short_id_resolution_on_the_real_server() {
         // Assert against the tools actually registered on EngramoMcpServer (search_tools_router).
         let client = EngramoClient::new("http://localhost", "engramo_test");
@@ -1266,6 +1330,165 @@ mod tests {
         assert!(!result.is_error.unwrap_or(false), "{result:?}");
         let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
         assert_eq!(v["cursor"], "def");
+    }
+
+    /// Regression for F2 (issue #38 follow-up): `tools/media.rs`'s `MediaTools` is a
+    /// separate, unused scaffold — assert the `name`/`length` mapping reaches the tool
+    /// output through the real, registered `list_media` handler, not just the scaffold.
+    #[tokio::test]
+    async fn test_list_media_output_includes_name_and_length_on_real_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "id": "22516154-0000-0000-0000-000000000001",
+                    "name": "mcp-test.png",
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "content_type": "image/png",
+                    "media_type": "image",
+                    "length": 2048
+                }],
+                "nextCursor": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .list_media(Parameters(ListMediaParams {
+                media_type: None,
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        let item = &v["data"][0];
+        assert_eq!(item["name"], "mcp-test.png", "{v}");
+        assert_eq!(item["length"], 2048, "{v}");
+    }
+
+    /// Regression for F1 (issue #39 follow-up): `tools/cards.rs`'s `CardTools` is a
+    /// separate, unused scaffold — assert `catalogs` memberships reach the tool output
+    /// through the real, registered `list_cards`/`get_card`/`update_card` handlers.
+    #[tokio::test]
+    async fn test_list_cards_catalogs_reach_tool_output_on_real_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let catalog_id = "00000000-0000-0000-0000-000000000099";
+        let card_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{catalog_id}/cards")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "id": card_id,
+                    "version": 1,
+                    "face": {"text": "Q?"},
+                    "back": {"text": "A."},
+                    "orderNumber": 1,
+                    "catalogs": [{"id": catalog_id, "name": "Spanish"}]
+                }],
+                "nextCursor": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .list_cards(Parameters(ListCardsParams {
+                catalog_id: catalog_id.to_string(),
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v["data"][0]["catalogs"][0]["id"], catalog_id, "{v}");
+        assert_eq!(v["data"][0]["catalogs"][0]["name"], "Spanish", "{v}");
+    }
+
+    #[tokio::test]
+    async fn test_get_card_tool_output_includes_catalogs_on_real_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let catalog_id = "00000000-0000-0000-0000-000000000099";
+        let card_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": card_id,
+                "version": 1,
+                "face": {"text": "Q?"},
+                "back": {"text": "A."},
+                "orderNumber": 1,
+                "catalogs": [{"id": catalog_id, "name": "Spanish"}]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .get_card(Parameters(GetCardParams {
+                card_id: card_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v["catalogs"][0]["id"], catalog_id, "{v}");
+        assert_eq!(v["catalogs"][0]["name"], "Spanish", "{v}");
+    }
+
+    #[tokio::test]
+    async fn test_update_card_tool_output_includes_catalogs_on_real_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let catalog_id = "00000000-0000-0000-0000-000000000099";
+        let card_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": card_id,
+                "version": 2,
+                "face": {"text": "Updated"},
+                "back": {"text": "A."},
+                "catalogs": [{"id": catalog_id, "name": "Spanish"}]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: None,
+                back: None,
+                catalog_ids: vec![catalog_id.to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v["catalogs"][0]["id"], catalog_id, "{v}");
+        assert_eq!(v["catalogs"][0]["name"], "Spanish", "{v}");
     }
 
     #[tokio::test]

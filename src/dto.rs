@@ -305,6 +305,22 @@ impl CardContent {
 
 // ── Card ──────────────────────────────────────────────────────────────────────
 
+/// A catalog a card belongs to, as returned in `CardDto::catalogs` by `GET /cards/{id}`,
+/// `GET /catalogs/{id}/cards` (`list_cards`), and the `update_card` (`PATCH`) response.
+/// Minimal on purpose — only what callers need to round-trip catalog membership through
+/// `update_card`'s `catalog_ids`; any other fields the API sends per entry (e.g. `cardCount`)
+/// are ignored by serde's default unknown-field handling.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CardCatalogRef {
+    pub id: Uuid,
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`: a fixture or future API
+    /// response that omits (or nulls) `name` still parses as `None` instead of failing the
+    /// whole card fetch, and `None` is never serialized as an empty string that would look
+    /// like a real, empty catalog name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CardDto {
     pub id: Uuid,
@@ -313,6 +329,15 @@ pub struct CardDto {
     pub back: CardContent,
     #[serde(rename = "orderNumber")]
     pub order_number: Option<i64>,
+    /// Catalogs this card belongs to. `list_cards` (`GET /catalogs/{id}/cards`) now populates
+    /// this with the same permission-filtered memberships as `get_card`/`update_card`.
+    /// `None` = the endpoint did not report memberships (key omitted or explicitly `null`) —
+    /// distinct from `Some(vec![])`, which means the card really has no catalog memberships.
+    /// `#[serde(default)]` so a fixture or endpoint that omits the key entirely still
+    /// deserializes instead of erroring (see issue #39); serde's `Option<T>` handling maps an
+    /// explicit `null` to `None` the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogs: Option<Vec<CardCatalogRef>>,
 }
 
 /// Minimal card for resource injection (context).
@@ -634,6 +659,7 @@ mod tests {
             },
             back: CardContent::plain("Every value has one owner."),
             order_number: Some(1),
+            catalogs: None,
         };
         let summary: CardSummary = dto.into();
         assert_eq!(summary.face_text, "What is ownership?");
@@ -943,6 +969,26 @@ mod tests {
         let json = r#"{"sessionId":"00000000-0000-0000-0000-000000000001","text":"hi there"}"#;
         let resp: AiChatResponseDto = serde_json::from_str(json).unwrap();
         assert_eq!(resp.text, "hi there");
+    }
+
+    /// Regression for issue #39 follow-up (F7): a `CardCatalogRef` entry that omits `name`
+    /// must still parse, defaulting to `None` rather than failing the whole card fetch.
+    #[test]
+    fn test_card_catalog_ref_missing_name_defaults_to_none() {
+        let r: CardCatalogRef =
+            serde_json::from_str(r#"{"id":"00000000-0000-0000-0000-000000000001","cardCount":3}"#)
+                .unwrap();
+        assert_eq!(r.name, None);
+    }
+
+    /// Regression for issue #39 follow-up (F3/F7): an explicit `"catalogs": null` must
+    /// decode to `None` — distinct from `Some(vec![])` — not fail the whole card.
+    #[test]
+    fn test_card_dto_null_catalogs_decodes_to_none() {
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000001","version":1,
+            "face":{"text":"Q"},"back":{"text":"A"},"catalogs":null}"#;
+        let card: CardDto = serde_json::from_str(json).unwrap();
+        assert!(card.catalogs.is_none());
     }
 
     #[test]

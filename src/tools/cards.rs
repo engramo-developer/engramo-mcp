@@ -41,7 +41,14 @@ pub struct UpdateCardParams {
     pub face: Option<CardContent>,
     #[schemars(description = "Updated back content (optional). Same rich_text rules as `face`.")]
     pub back: Option<CardContent>,
-    #[schemars(description = "All catalog UUIDs this card should belong to")]
+    #[schemars(
+        description = "Catalog UUIDs this card should belong to — REPLACES the memberships you \
+        can see. Start from `catalogs[].id` in `get_card`/`list_cards` (which lists only \
+        catalogs visible to you), then add/remove as intended; an empty list moves the card to \
+        your default catalog. If the card JSON has no `catalogs` key, its memberships are \
+        unknown — call `get_card` first; never send an empty list unless you intend to move \
+        the card to the default catalog."
+    )]
     pub catalog_ids: Vec<String>,
     #[schemars(description = "Card order number within the catalog")]
     pub order_number: i64,
@@ -74,7 +81,7 @@ impl CardTools {
     }
 
     #[tool(
-        description = "List flashcards in a catalog with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "List flashcards in a catalog with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). Each returned card includes its `catalogs` memberships (id, name), permission-filtered the same as `get_card` — omitted when the API didn't report memberships."
     )]
     async fn list_cards(
         &self,
@@ -94,7 +101,7 @@ impl CardTools {
     }
 
     #[tool(
-        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships."
+        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships)."
     )]
     async fn get_card(
         &self,
@@ -112,7 +119,14 @@ impl CardTools {
     #[tool(
         description = "Update an existing flashcard's face, back, or catalog memberships. \
         Requires the current version for optimistic locking — fetch the card first. \
-        If you get a Conflict error, re-fetch and retry."
+        `catalog_ids` REPLACES the memberships you can see, so build it from the \
+        `catalogs[].id` values in `get_card` or `list_cards`'s response (which lists only \
+        catalogs visible to you) plus/minus any intended changes — an empty list moves the \
+        card to the user's default catalog. If the card JSON has no `catalogs` key, its \
+        memberships are unknown — call `get_card` first; never send an empty list unless you \
+        intend to move the card to the default catalog. If you get a Conflict error, re-fetch and retry. \
+        rich_text styling goes under a nested `style` object, e.g. \
+        {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
     async fn update_card(
         &self,
@@ -188,9 +202,15 @@ mod tests {
     /// Regression test for issue #34/#35: the `list_cards` tool output's `cursor` field
     /// must reflect the API's real `nextCursor` value, not always be `null` (mirrors
     /// `catalogs::tests::test_list_catalogs_cursor_reaches_tool_output`).
+    ///
+    /// Also covers issue #39: `GET /catalogs/{id}/cards` now populates each card's
+    /// `catalogs` memberships (same permission-filtered data as `get_card`), so the
+    /// fixture includes it and the assertions check it reaches the tool output.
     #[tokio::test]
     async fn test_list_cards_cursor_reaches_tool_output() {
         let server = MockServer::start().await;
+        // Distinct from the card id (F9) so a mapping bug that swapped the two would be caught.
+        let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
         Mock::given(method("GET"))
             .and(path(format!("/catalogs/{}/cards", mock_id())))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -199,7 +219,8 @@ mod tests {
                     "version": 1,
                     "face": {"text": "Q?"},
                     "back": {"text": "A."},
-                    "orderNumber": 1
+                    "orderNumber": 1,
+                    "catalogs": [{"id": catalog_id, "name": "Spanish"}]
                 }],
                 "nextCursor": "abc",
                 "permissions": {"canEdit": true, "canDelete": true, "isOwner": true}
@@ -224,6 +245,12 @@ mod tests {
             .unwrap_or("");
         let v: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(v["cursor"], "abc", "{text}");
+        assert_eq!(
+            v["data"][0]["catalogs"][0]["id"],
+            catalog_id.to_string(),
+            "{text}"
+        );
+        assert_eq!(v["data"][0]["catalogs"][0]["name"], "Spanish", "{text}");
     }
 
     #[tokio::test]
@@ -293,6 +320,85 @@ mod tests {
             server.received_requests().await.unwrap_or_default().len(),
             1
         );
+    }
+
+    /// Regression test for issue #39: the `get_card` tool's JSON output must surface the
+    /// `catalogs` array (previously dropped because `CardDto` didn't model it at all).
+    #[tokio::test]
+    async fn test_get_card_tool_output_includes_catalogs() {
+        let server = MockServer::start().await;
+        let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(),
+                "version": 1,
+                "face": {"text": "Q?"},
+                "back": {"text": "A."},
+                "orderNumber": 1,
+                "catalogs": [{"id": catalog_id, "name": "Spanish"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .get_card(Parameters(GetCardParams {
+                card_id: mock_id().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["catalogs"][0]["id"], catalog_id.to_string(), "{text}");
+        assert_eq!(v["catalogs"][0]["name"], "Spanish", "{text}");
+    }
+
+    /// Regression test for issue #39: `update_card`'s response also carries `catalogs` —
+    /// assert the tool's JSON output round-trips it, not just `get_card`'s.
+    #[tokio::test]
+    async fn test_update_card_tool_output_includes_catalogs() {
+        let server = MockServer::start().await;
+        // Distinct from the card id (F9) so a mapping bug that swapped the two would be caught.
+        let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(),
+                "version": 2,
+                "face": {"text": "Updated"},
+                "back": {"text": "A."},
+                "catalogs": [{"id": catalog_id, "name": "Spanish"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: mock_id().to_string(),
+                face: None,
+                back: None,
+                catalog_ids: vec![catalog_id.to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["catalogs"][0]["id"], catalog_id.to_string(), "{text}");
+        assert_eq!(v["catalogs"][0]["name"], "Spanish", "{text}");
     }
 
     #[tokio::test]
@@ -392,5 +498,98 @@ mod tests {
             .map(|t| t.text.as_str())
             .unwrap_or("");
         assert!(text.contains("Fetch the latest version"), "{text}");
+    }
+
+    /// Regression for F13: the API-error arm of `list_cards`/`get_card` was only ever
+    /// exercised for invalid UUIDs, never for an actual upstream error (e.g. 404).
+    #[tokio::test]
+    async fn test_card_tools_list_and_get_api_error_returns_error_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{}/cards", mock_id())))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let t = make_tools(&server.uri());
+        let r1 = t
+            .list_cards(Parameters(ListCardsParams {
+                catalog_id: mock_id().to_string(),
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        let r2 = t
+            .get_card(Parameters(GetCardParams {
+                card_id: mock_id().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r1.is_error, Some(true));
+        assert_eq!(r2.is_error, Some(true));
+    }
+
+    /// Regression for F14: `delete_card`'s success arm was only ever exercised via the
+    /// 403/invalid-UUID paths, never the actual `Ok(())` -> "deleted" text.
+    #[tokio::test]
+    async fn test_card_tools_delete_card_ok() {
+        let server = MockServer::start().await;
+        let card_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        Mock::given(method("DELETE"))
+            .and(path(format!("/catalogs/{}/cards/{}", mock_id(), card_id)))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let r = make_tools(&server.uri())
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: mock_id().to_string(),
+                card_id: card_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("deleted"), "{text}");
+    }
+
+    /// Regression for F15: an empty `catalog_ids` list must be accepted (not rejected by
+    /// the parse/collect step) and forwarded as `"catalogIds": []` — the tool description
+    /// says this moves the card to the user's default catalog.
+    #[tokio::test]
+    async fn test_card_tools_update_card_empty_catalog_ids_forwarded_as_empty_array() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .and(body_partial_json(json!({"catalogIds": []})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "version": 2, "face": {"text": "Q"}, "back": {"text": "A"},
+                "catalogs": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let r = make_tools(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: mock_id().to_string(),
+                face: None,
+                back: None,
+                catalog_ids: vec![],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
     }
 }

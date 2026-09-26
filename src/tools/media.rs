@@ -66,7 +66,14 @@ impl MediaTools {
     }
 
     #[tool(
-        description = "List uploaded media files. Optionally filter by media type ('image', 'audio', etc.). Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "List your own media library — files you uploaded with upload_media, \
+        including audio produced by generate_card_audio. This does NOT include media attached \
+        to cards uploaded by other accounts (e.g. in shared/subscribed catalogs); to find a \
+        specific card's audio or image, use get_card and read its `audio_id`/`visual_id` instead. \
+        Optionally filter by media type ('image', 'audio', etc.). Each item has `id`, `name` \
+        (original filename), `content_type`, `media_type`, and `length` (size in bytes). Returns \
+        at most 50 items per call; pass the returned `cursor` back to fetch the next page \
+        (`cursor: null` means this is the last page)."
     )]
     async fn list_media(
         &self,
@@ -225,6 +232,52 @@ mod tests {
         assert!(result.is_error.unwrap_or(false));
     }
 
+    /// Regression for #38: the backend's real `MediaDto` shape (`name` + `length`, plus an
+    /// ignored `created_at`) must round-trip into the tool's JSON output as `name`/`length`,
+    /// not the old (always-null) `fileName`/`size` keys.
+    #[tokio::test]
+    async fn test_list_media_output_includes_name_and_length() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "22516154-0000-0000-0000-000000000001",
+                    "name": "mcp-test.png",
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "content_type": "image/png",
+                    "media_type": "image",
+                    "length": 2048
+                }],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .list_media(Parameters(ListMediaParams {
+                media_type: None,
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        let item = &v["data"][0];
+        assert_eq!(item["name"], "mcp-test.png", "{text}");
+        assert_eq!(item["length"], 2048, "{text}");
+        assert_eq!(item["content_type"], "image/png", "{text}");
+        assert!(item.get("fileName").is_none(), "{text}");
+        assert!(item.get("size").is_none(), "{text}");
+    }
+
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
@@ -328,5 +381,33 @@ mod tests {
             .map(|t| t.text.as_str())
             .unwrap_or("");
         assert!(text.contains("cursor is too long"), "{text}");
+    }
+
+    /// Regression for F16: every `filename: None` test so far stopped before the request
+    /// (invalid base64, oversized) — this pins that the default `"upload"` filename is
+    /// actually sent on a successful upload.
+    #[tokio::test]
+    async fn test_upload_media_default_filename_is_upload() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .and(body_string_contains(r#"filename="upload""#))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "media_ids": {"ids": ["00000000-0000-0000-0000-000000000001"]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let r = make_tools(&server.uri())
+            .upload_media(Parameters(UploadMediaParams {
+                content_base64: b64(b"x"),
+                content_type: "image/png".to_string(),
+                filename: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
     }
 }

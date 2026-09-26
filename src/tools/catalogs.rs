@@ -2,6 +2,8 @@ use rmcp::{model::CallToolResult, schemars};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::error::preview;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListCatalogsParams {
     #[schemars(
@@ -28,7 +30,9 @@ pub struct UpdateCatalogParams {
     pub description: Option<String>,
     #[schemars(description = "New tags")]
     pub tags: Option<Vec<String>>,
-    #[schemars(description = "New visibility: 'public' or 'private'")]
+    #[schemars(
+        description = "New visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id)"
+    )]
     pub visibility: Option<String>,
     #[schemars(description = "Current version of the catalog (required for optimistic locking)")]
     pub version: i32,
@@ -68,7 +72,7 @@ pub(crate) fn err_result(e: impl std::fmt::Display) -> CallToolResult {
 }
 
 pub(crate) fn parse_uuid(s: &str) -> Result<Uuid, String> {
-    Uuid::parse_str(s).map_err(|_| format!("Invalid UUID: '{s}'"))
+    Uuid::parse_str(s).map_err(|_| format!("Invalid UUID: '{}'", preview(s)))
 }
 
 #[cfg(test)]
@@ -256,6 +260,19 @@ mod tests {
         let id = parse_uuid("not-a-uuid");
         assert!(id.is_err());
         assert!(id.unwrap_err().contains("Invalid UUID"));
+    }
+
+    /// Regression for F10: a huge, malformed LLM-supplied value must not be echoed in full
+    /// into the error text (and thus into the WARN log via `err_result`) — `preview` caps it.
+    #[test]
+    fn test_parse_uuid_huge_input_error_is_capped() {
+        let huge = "x".repeat(1024 * 1024);
+        let err = parse_uuid(&huge).unwrap_err();
+        assert!(
+            err.len() < 100,
+            "error message not capped: {} bytes",
+            err.len()
+        );
     }
 
     #[tokio::test]

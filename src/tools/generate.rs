@@ -74,7 +74,9 @@ pub struct GenerateCatalogWithCardsParams {
     pub image_id: Option<String>,
     #[schemars(description = "Optional list of tags")]
     pub tags: Option<Vec<String>>,
-    #[schemars(description = "Visibility: 'public' or 'private' (default: 'private')")]
+    #[schemars(
+        description = "Visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id) (default: 'private')"
+    )]
     pub visibility: Option<String>,
     /// All cards to create. Each card must follow the same rich-text rules as `generate_card`:
     /// always set `text`; span concatenation must equal `text`.
