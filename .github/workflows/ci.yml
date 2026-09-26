@@ -65,6 +65,27 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Release builds a Windows binary, and mp3lame-sys takes a different
+  # (cc-crate, MSVC) build path for LAME on a Windows host than on unix — so
+  # catch a Windows build or test break on the PR, not at tag time.
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
   audit:
     name: Audit dependencies
     runs-on: ubuntu-latest

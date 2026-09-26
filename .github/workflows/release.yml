@@ -94,6 +94,14 @@ jobs:
             target: x86_64-apple-darwin
             artifact: engramo-mcp-darwin-x64
             use_zigbuild: false
+          # mp3lame-sys builds LAME with the `cc` crate on a Windows host
+          # (its autotools path is unix-only), so plain `cargo build` on an
+          # MSVC runner is enough — no host override needed.
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: engramo-mcp-win32-x64.exe
+            use_zigbuild: false
+            exe_suffix: .exe
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,12 +146,14 @@ jobs:
           MP3LAME_SYS_OVERRIDE_HOST: ${{ matrix.target }}
         run: cargo zigbuild --release --target ${{ matrix.target }}
 
-      - name: Build (macOS)
+      - name: Build (macOS, Windows)
         if: ${{ !matrix.use_zigbuild }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/engramo-mcp ${{ matrix.artifact }}
+        # bash on every runner (Git Bash on Windows) so `cp` behaves the same.
+        shell: bash
+        run: cp target/${{ matrix.target }}/release/engramo-mcp${{ matrix.exe_suffix }} ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -164,13 +174,13 @@ jobs:
       - name: Verify downloaded artifacts
         run: |
           set -euo pipefail
-          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64; do
+          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe; do
             if [ ! -s "$f" ]; then
               echo "::error::missing or empty artifact: $f"
               exit 1
             fi
           done
-          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64
+          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe
 
       # Real tag release: unchanged from before this workflow gained
       # workflow_dispatch. Same inputs, same behavior.
@@ -184,6 +194,7 @@ jobs:
             engramo-mcp-linux-arm64
             engramo-mcp-darwin-arm64
             engramo-mcp-darwin-x64
+            engramo-mcp-win32-x64.exe
 
       # Dry run: creates a draft release (deletable, not visible to normal
       # users) so the action, including asset upload, still gets exercised.
@@ -208,6 +219,7 @@ jobs:
             engramo-mcp-linux-arm64
             engramo-mcp-darwin-arm64
             engramo-mcp-darwin-x64
+            engramo-mcp-win32-x64.exe
 
   npm-publish:
     name: Publish to npm
@@ -229,13 +241,13 @@ jobs:
       - name: Verify downloaded artifacts
         run: |
           set -euo pipefail
-          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64; do
+          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe; do
             if [ ! -s "$f" ]; then
               echo "::error::missing or empty artifact: $f"
               exit 1
             fi
           done
-          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64
+          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -253,6 +265,7 @@ jobs:
             ["darwin-x64"]="engramo-mcp-darwin-x64"
             ["linux-arm64"]="engramo-mcp-linux-arm64"
             ["linux-x64"]="engramo-mcp-linux-x64"
+            ["win32-x64"]="engramo-mcp-win32-x64.exe"
           )
 
           # --provenance requires a real registry interaction and fails/warns
@@ -277,9 +290,12 @@ jobs:
               fs.writeFileSync('$pkg_dir/package.json', JSON.stringify(pkg, null, 2) + '\n');
             "
 
-            # Copy binary and make executable
-            cp "$artifact" "$pkg_dir/engramo-mcp"
-            chmod +x "$pkg_dir/engramo-mcp"
+            # Copy binary and make executable. Windows only runs a file with
+            # an .exe extension, so its binary keeps one (run.js resolves it).
+            bin_name="engramo-mcp"
+            case "$platform" in win32-*) bin_name="engramo-mcp.exe" ;; esac
+            cp "$artifact" "$pkg_dir/$bin_name"
+            chmod +x "$pkg_dir/$bin_name"
 
             # LGPL-2.0 notice for LAME, statically linked into this binary
             # (see THIRD_PARTY_LICENSES at the repo root).

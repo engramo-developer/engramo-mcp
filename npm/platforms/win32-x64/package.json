@@ -1,0 +1,16 @@
+{
+  "name": "@engramo/mcp-win32-x64",
+  "version": "0.0.0",
+  "description": "Windows x64 binary for engramo-mcp",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/engramo-developer/engramo-mcp"
+  },
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": [
+    "engramo-mcp.exe",
+    "THIRD_PARTY_LICENSES"
+  ]
+}
