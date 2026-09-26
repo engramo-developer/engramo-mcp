@@ -12,7 +12,11 @@ const PLATFORM_PACKAGES = {
   'darwin-x64': '@engramo/mcp-darwin-x64',
   'linux-arm64': '@engramo/mcp-linux-arm64',
   'linux-x64': '@engramo/mcp-linux-x64',
+  'win32-x64': '@engramo/mcp-win32-x64',
 };
+
+// Windows only executes files with an executable extension.
+const BINARY_NAME = os.platform() === 'win32' ? 'engramo-mcp.exe' : 'engramo-mcp';
 
 function getPlatformKey() {
   const platform = os.platform();
@@ -29,7 +33,7 @@ function resolveBinaryPath(pkg) {
   try {
     const pkgJsonPath = require.resolve(`${pkg}/package.json`);
     const pkgDir = path.dirname(pkgJsonPath);
-    return path.join(pkgDir, 'engramo-mcp');
+    return path.join(pkgDir, BINARY_NAME);
   } catch {
     return null;
   }

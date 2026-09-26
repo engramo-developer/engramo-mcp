@@ -44,6 +44,9 @@ Install the MCP server globally so it's available as a system command:
 npm install -g @engramo/mcp
 ```
 
+Prebuilt binaries ship for macOS (arm64, x64), Linux (arm64, x64) and Windows (x64). On other platforms, build
+from source with `cargo build --release`.
+
 Verify the installation:
 
 ```bash
