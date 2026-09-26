@@ -81,14 +81,33 @@ mkdir -p .claude/.review-cache
 ls .claude/.review-cache/iter-*.md 2>/dev/null | sort -V | tail -1
 ```
 
-- No files → warn "no previous cache found, starting fresh" and proceed as `CONTINUE_MODE = false`.
-- Last file is `iter-N.md` → count unchecked findings: `grep -c '^### \[ \]' .claude/.review-cache/iter-N.md || echo 0`.
-  - Count > 0: the implementator did not finish that file — resume it (Step 2a on `iter-N.md`), with `IMPL_ITER = N`.
-  - Count == 0: set `IMPL_ITER = N`.
-- **Carry forward `final.md` residuals.** If `final.md` exists with unchecked findings (the previous run ended
-  `residual-blocked`), copy them into the next feedback file so they are not silently dropped, and say so in the
-  Final Report.
-- If `IMPL_ITER >= MAX_ITERATIONS` → report "nothing left to do" and emit the Final Report from existing files.
+- No files (neither `iter-*.md` nor `final.md`) → warn "no previous cache found, starting fresh" and proceed as
+  `CONTINUE_MODE = false`.
+
+**`--continue` resumes from the newest review artifact. It NEVER re-runs the initial reviewer pass (Step 1) when a
+cache exists** — findings already triaged are the work queue, and re-reviewing from scratch repeats finished work.
+
+Pick the resume point by looking at `iter-*.md` and `final.md` together (`ls -t` for recency):
+
+1. **`final.md` exists and is newer than the last `iter-N.md`** (the previous run ended `residual-blocked`, its last
+   step being the regression review). Its unchecked findings are the queue.
+   - Count them: `grep -c '^### \[ \]' .claude/.review-cache/final.md || echo 0`.
+   - Count == 0 → previous run was `clean`: report "nothing left to do" and emit the Final Report from existing files.
+   - Count > 0 → `cp final.md iter-<N+1>.md`, set `IMPL_ITER = N+1` (the implementator pass that `iter-N.md` fed
+     already ran, so it counts), and **go straight to Step 2a on `iter-<N+1>.md`. Skip Step 1.** Say in the Final
+     Report: "carried K residuals from final.md".
+2. **Otherwise the last file is `iter-N.md`** → count unchecked findings:
+   `grep -c '^### \[ \]' .claude/.review-cache/iter-N.md || echo 0`.
+   - Count > 0: the implementator did not finish that file — resume it (Step 2a on `iter-N.md`), with
+     `IMPL_ITER = N`. Skip Step 1.
+   - Count == 0: all findings are ticked but no later review exists — set `IMPL_ITER = N + 1` (the pass on
+     `iter-N.md` ran), and run Step 3 (final regression review) directly. Skip Step 1.
+
+- If `IMPL_ITER >= MAX_ITERATIONS` and the queue is non-empty, still run the pending Step 2a once for the carried
+  findings — a carried queue is never dropped just because the earlier run used up its budget. Otherwise (empty
+  queue) report "nothing left to do".
+- Never leave a reviewer running that is no longer needed: if you notice you started the wrong step, stop those
+  agents (`TaskStop`) and correct course before spawning more.
 - Re-measure `TEST_COUNT` with the `cargo test | awk` line above.
 
 Compute the absolute path of `.claude/.review-cache` as `<CACHE_DIR>` and use it for every path below.
@@ -144,7 +163,8 @@ That line is the result of the reviewer pass.
 
 ### Step 1 — Initial review
 
-> Skip only when `CONTINUE_MODE = true` and Setup found an unfinished implementator pass.
+> Skip whenever `CONTINUE_MODE = true` and Setup found a cache (carried `final.md` residuals, an unfinished
+> `iter-N.md`, or a fully-ticked `iter-N.md`). Step 1 runs only for a fresh run or when `--continue` found no cache.
 
 Run a reviewer pass with `feedback_path=<CACHE_DIR>/iter-0.md` and `iteration=1`.
 

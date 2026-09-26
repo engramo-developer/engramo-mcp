@@ -11,7 +11,7 @@ use crate::dto::{
     PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UploadMediaResponseDto,
     UsageSummaryDto, UserSubscriptionDto,
 };
-use crate::error::{ApiError, read_bounded};
+use crate::error::{ApiError, preview, read_bounded};
 
 /// True for Unicode formatting characters that have no visible glyph of their
 /// own but can still change how a filename *displays* — e.g. RIGHT-TO-LEFT
@@ -422,7 +422,8 @@ impl EngramoClient {
     pub async fn grade_card(&self, card_id: Uuid, grade: &str) -> Result<(), ApiError> {
         if !matches!(grade, "again" | "hard" | "good" | "easy") {
             return Err(ApiError::BadRequest(format!(
-                "invalid grade '{grade}': must be one of \"again\", \"hard\", \"good\", \"easy\""
+                "invalid grade '{}': must be one of \"again\", \"hard\", \"good\", \"easy\"",
+                preview(grade)
             )));
         }
         self.post_void(&format!("/learning/cards/{card_id}/{grade}"))
@@ -594,7 +595,8 @@ impl EngramoClient {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
             return Err(ApiError::BadRequest(format!(
-                "invalid target_lang '{target_lang}': expected a BCP-47 code like 'es' or 'pt-BR'"
+                "invalid target_lang '{}': expected a BCP-47 code like 'es' or 'pt-BR'",
+                preview(target_lang)
             )));
         }
         let metadata_json = serde_json::to_string(catalog_metadata).map_err(|e| {
@@ -1148,6 +1150,50 @@ mod tests {
         let _: CardContent = result.back; // type check
     }
 
+    /// Regression test for issue #39: `GET /cards/{id}` sends a `catalogs` array with the
+    /// card's memberships (id + name, plus possibly other fields) — assert `CardDto.catalogs`
+    /// actually captures it instead of silently dropping it. Uses a catalog id distinct from
+    /// the card id (F9) so a mapping bug that swapped the two would be caught.
+    #[tokio::test]
+    async fn test_get_card_maps_catalogs() {
+        let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "version": 1,
+                "face": {"text": "Q?"}, "back": {"text": "A."},
+                "catalogs": [{"id": catalog_id, "name": "Spanish", "cardCount": 42}]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri()).get_card(mock_id()).await.unwrap();
+        let catalogs = result.catalogs.as_deref().unwrap();
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].id, catalog_id);
+        assert_eq!(catalogs[0].name.as_deref(), Some("Spanish"));
+    }
+
+    /// A response without a `catalogs` key at all (e.g. an older fixture) must still
+    /// deserialize, with `catalogs` defaulting to `None` (the endpoint did not report
+    /// memberships) — not a decode error. See F3: `None` is distinct from `Some(vec![])`.
+    #[tokio::test]
+    async fn test_get_card_missing_catalogs_field_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "version": 1,
+                "face": {"text": "Q?"}, "back": {"text": "A."}
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri()).get_card(mock_id()).await.unwrap();
+        assert!(result.catalogs.is_none());
+    }
+
     #[tokio::test]
     async fn test_get_card_not_found() {
         let server = MockServer::start().await;
@@ -1237,6 +1283,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.version, 2);
+    }
+
+    /// Regression test for issue #39: the `update_card` (PATCH) response also carries
+    /// `catalogs` — assert it round-trips into `CardDto.catalogs` just like `get_card` does.
+    /// Uses a catalog id distinct from the card id (F9) so a mapping bug that swapped the
+    /// two would be caught.
+    #[tokio::test]
+    async fn test_update_card_response_maps_catalogs() {
+        use crate::dto::{CardContent, UpdateCardRequest};
+        let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "version": 2,
+                "face": {"text": "Updated"}, "back": {"text": "A."},
+                "catalogs": [{"id": catalog_id, "name": "Spanish"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let req = UpdateCardRequest {
+            catalog_ids: vec![catalog_id],
+            order_number: 1,
+            face: Some(CardContent::plain("Updated")),
+            back: None,
+            version: 1,
+        };
+        let result = client(&server.uri())
+            .update_card(mock_id(), &req)
+            .await
+            .unwrap();
+        let catalogs = result.catalogs.as_deref().unwrap();
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].id, catalog_id);
+        assert_eq!(catalogs[0].name.as_deref(), Some("Spanish"));
     }
 
     #[tokio::test]
@@ -1995,6 +2077,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// Regression for F4: an invalid MIME string must fail before any request is sent —
+    /// pins both the error variant/message and that the request never goes out.
+    #[tokio::test]
+    async fn test_upload_media_invalid_content_type_is_bad_request_without_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .upload_media(b"x".to_vec(), "f.bin", "not a mime type")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("Invalid content type")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
