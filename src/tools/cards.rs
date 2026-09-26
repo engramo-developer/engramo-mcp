@@ -34,9 +34,12 @@ pub struct GetCardParams {
 pub struct UpdateCardParams {
     #[schemars(description = "UUID of the card to update")]
     pub card_id: String,
-    #[schemars(description = "Updated face content (optional)")]
+    #[schemars(
+        description = "Updated face content (optional). rich_text styling goes under a nested \
+        `style` object, e.g. {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
+    )]
     pub face: Option<CardContent>,
-    #[schemars(description = "Updated back content (optional)")]
+    #[schemars(description = "Updated back content (optional). Same rich_text rules as `face`.")]
     pub back: Option<CardContent>,
     #[schemars(description = "All catalog UUIDs this card should belong to")]
     pub catalog_ids: Vec<String>,
@@ -253,6 +256,110 @@ mod tests {
         assert!(
             text.contains("ermission") || text.contains("access"),
             "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_card_tools_get_card_ok_and_invalid_uuid() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(),
+                "version": 1,
+                "face": {"text": "Q?"},
+                "back": {"text": "A."},
+                "orderNumber": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_tools(&server.uri())
+            .get_card(Parameters(GetCardParams {
+                card_id: mock_id().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let result = make_tools(&server.uri())
+            .get_card(Parameters(GetCardParams {
+                card_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_card_tools_invalid_uuids_return_error_without_request() {
+        let server = MockServer::start().await;
+        let tools = make_tools(&server.uri());
+
+        let result = tools
+            .list_cards(Parameters(ListCardsParams {
+                catalog_id: "bad".to_string(),
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        let result = tools
+            .update_card(Parameters(UpdateCardParams {
+                card_id: "bad".to_string(),
+                face: None,
+                back: None,
+                catalog_ids: vec![mock_id().to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        let result = tools
+            .update_card(Parameters(UpdateCardParams {
+                card_id: mock_id().to_string(),
+                face: None,
+                back: None,
+                catalog_ids: vec!["bad".to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        let result = tools
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: "bad".to_string(),
+                card_id: mock_id().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        let result = tools
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: mock_id().to_string(),
+                card_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
         );
     }
 

@@ -23,15 +23,17 @@ pub struct GenerateCardParams {
     /// - ALWAYS set `text` to the full plain sentence — it's the validation anchor.
     ///   If richText spans are also provided, their concatenation must equal `text` exactly.
     ///   The server validates this and discards richText if they disagree.
-    /// - fontFamily="monospace" for code; bold=true for key terms;
+    /// - Styling goes under a nested `style` object, never as flat fields on the span:
+    ///   `{"text":"gracias.","style":{"bold":true,"fontColor":"#27AE60"}}`.
+    ///   fontFamily="monospace" for code; bold=true for key terms;
     ///   fontColor="#E74C3C" for warnings, "#27AE60" for correct answers.
-    /// - Omit rich_text entirely if no styling is needed.
+    /// - Omit richText entirely if no styling is needed.
     ///
     /// For language-learning cards, set `face.dictionary` yourself (word → translation map).
     ///
     /// For audio/images: EngrAmo does NOT generate these for you. If the user already has an
     /// audio recording or image (their own voice, a self-generated file, a picture they gave
-    /// you), call `upload_media` first and set `audio_id`/`visual_id` (+ `visual_type`) to the
+    /// you), call `upload_media` first and set `audioId`/`visualId` (+ `visualType`) to the
     /// returned `media_id`. Never fabricate a UUID for either field.
     pub face: CardContent,
 
@@ -41,7 +43,7 @@ pub struct GenerateCardParams {
     ///
     /// Same rich-text rules as `face`: always set `text`; spans must match it exactly.
     /// For language-learning cards, translate `face.text` yourself and set `back.text` —
-    /// do not leave it empty. Same `upload_media` rule as `face` for `audio_id`/`visual_id`.
+    /// do not leave it empty. Same `upload_media` rule as `face` for `audioId`/`visualId`.
     pub back: CardContent,
 }
 
@@ -50,7 +52,8 @@ pub struct GenerateCardParams {
 pub struct CardInputParams {
     /// Front of the card. Read `engramo://card-schema` for the complete schema, validation rules,
     /// and 4 annotated examples. Always set `text` to the full sentence; spans must concatenate
-    /// to match `text` exactly.
+    /// to match `text` exactly. Styling goes under a nested `style` object, e.g.
+    /// `{"text":"gracias.","style":{"bold":true,"fontColor":"#27AE60"}}`.
     pub face: CardContent,
     /// Back of the card. Read `engramo://card-schema` for the complete schema, validation rules,
     /// and 4 annotated examples. Same rich-text rules as `face`.
@@ -448,6 +451,61 @@ mod tests {
         assert!(text.contains("Invalid UUID"), "{text}");
     }
 
+    #[tokio::test]
+    async fn test_generate_card_quota_exceeded_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+                "error": "quota_exceeded",
+                "resource_type": "cards_total",
+                "used": 100,
+                "limit": 100
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .generate_card(Parameters(GenerateCardParams {
+                catalog_id: None,
+                face: CardContent::plain("Q"),
+                back: CardContent::plain("A"),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            text.contains("402") || text.contains("quota") || text.contains("Quota"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_unauthorized_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .generate_card(Parameters(GenerateCardParams {
+                catalog_id: None,
+                face: CardContent::plain("Q"),
+                back: CardContent::plain("A"),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+    }
+
     // ── generate_catalog_with_cards ───────────────────────────────────────────
 
     #[tokio::test]
@@ -801,6 +859,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_card_preserves_back_audio_id_from_existing_card() {
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_existing_card_json("face-audio", json!(null))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: None,
+                back: Some(CardContent::plain("Nuevo")), // no audio_id set
+                catalog_ids: vec![mock_id().to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let patch_req = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::PATCH)
+            .expect("PATCH request not made");
+        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
+        assert_eq!(
+            body["back"]["audioId"].as_str(),
+            Some("back-audio-id"),
+            "back.audio_id must be preserved from existing card"
+        );
+        assert_eq!(body["back"]["text"].as_str(), Some("Nuevo"));
+    }
+
+    #[tokio::test]
+    async fn test_update_card_does_not_overwrite_explicitly_set_back_audio_id() {
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_existing_card_json("face-audio", json!(null))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+
+        let mut back = CardContent::plain("Nuevo");
+        back.audio_id = Some("explicit".to_string());
+
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: None,
+                back: Some(back),
+                catalog_ids: vec![mock_id().to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let patch_req = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::PATCH)
+            .expect("PATCH request not made");
+        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
+        assert_eq!(body["back"]["audioId"].as_str(), Some("explicit"));
+    }
+
+    #[tokio::test]
     async fn test_update_card_get_card_error_returns_error_result() {
         use crate::tools::cards::UpdateCardParams;
         let server = MockServer::start().await;
@@ -850,6 +1004,109 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_update_card_invalid_card_id_makes_no_request() {
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: "not-a-uuid".to_string(),
+                face: None,
+                back: None,
+                catalog_ids: vec![],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_invalid_catalog_id_returns_error_without_patch() {
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_existing_card_json("face-audio", json!(null))),
+            )
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: Some(CardContent::plain("x")),
+                back: None,
+                catalog_ids: vec!["bad".to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method == wiremock::http::Method::PATCH),
+            "no PATCH must be sent when catalog_ids fails validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_conflict_after_merge_returns_error() {
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_existing_card_json("face-audio", json!(null))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: Some(CardContent::plain("x")),
+                back: None,
+                catalog_ids: vec![mock_id().to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("Fetch the latest version"), "{text}");
     }
 
     // ── generate_cards ─────────────────────────────────────────────────────────
@@ -922,6 +1179,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_cards_two_cards_ok_returns_array() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .generate_cards(Parameters(GenerateCardsParams {
+                catalog_id: mock_id().to_string(),
+                cards: vec![
+                    CardInputParams {
+                        face: CardContent::plain("a\t"),
+                        back: CardContent::plain("A"),
+                    },
+                    CardInputParams {
+                        face: CardContent::plain("b"),
+                        back: CardContent::plain("B"),
+                    },
+                ],
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let cards: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert_eq!(cards.len(), 2, "{text}");
+
+        let requests = server.received_requests().await.unwrap();
+        let post_bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/cards")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(post_bodies.len(), 2);
+        for body in &post_bodies {
+            assert_eq!(
+                body["catalogId"].as_str(),
+                Some(mock_id().to_string().as_str())
+            );
+        }
+        assert_eq!(post_bodies[0]["face"]["text"].as_str(), Some("a"));
+    }
+
+    #[tokio::test]
     async fn test_update_card_normalizes_rich_text_before_merge() {
         use crate::dto::RichTextSpan;
         use crate::tools::cards::UpdateCardParams;
@@ -984,6 +1293,383 @@ mod tests {
             body["face"]["audioId"].as_str(),
             Some("existing-audio"),
             "audio_id must be preserved after normalization"
+        );
+    }
+
+    // ── Lenient rich-text style deserialization (issue #37) ──────────────────
+
+    #[tokio::test]
+    async fn test_generate_card_flat_style_fields_produce_nested_style_on_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+
+        // Exact issue #37 repro: LLM sends flat `bold`/`fontColor` directly on the span.
+        let raw = json!({
+            "catalog_id": null,
+            "face": {
+                "text": "Hola, gracias.",
+                "richText": [
+                    { "text": "Hola, " },
+                    { "text": "gracias.", "bold": true, "fontColor": "#27AE60" }
+                ]
+            },
+            "back": { "text": "Hello, thank you." }
+        });
+        let params: GenerateCardParams = serde_json::from_value(raw).unwrap();
+
+        make_server(&server.uri())
+            .generate_card(Parameters(params))
+            .await
+            .unwrap();
+
+        let body = card_request_body(&server).await;
+        assert_eq!(
+            body["face"]["richText"][1]["style"],
+            json!({"bold": true, "fontColor": "#27AE60"}),
+            "flat span fields must be folded into a nested style object on the wire: {body}"
+        );
+        assert!(
+            body["face"]["richText"][1].get("bold").is_none(),
+            "no flat `bold` field must reach the wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_flat_style_fields_produce_nested_style_on_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let raw = json!({
+            "name": "Spanish",
+            "description": null,
+            "image_id": null,
+            "tags": null,
+            "visibility": null,
+            "cards": [{
+                "face": {
+                    "text": "Hola, gracias.",
+                    "richText": [
+                        { "text": "Hola, " },
+                        { "text": "gracias.", "bold": true, "fontColor": "#27AE60" }
+                    ]
+                },
+                "back": { "text": "Hello, thank you." }
+            }]
+        });
+        let params: GenerateCatalogWithCardsParams = serde_json::from_value(raw).unwrap();
+
+        make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(params))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.url.path() == "/catalogs/with-cards")
+            .expect("POST /catalogs/with-cards not called");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(
+            body["cards"][0]["face"]["richText"][1]["style"],
+            json!({"bold": true, "fontColor": "#27AE60"}),
+            "flat span fields must be folded into a nested style object on the wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_outgoing_patch_carries_nested_style() {
+        use crate::dto::{RichTextSpan, RichTextSpanStyle};
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_existing_card_json("existing-audio", json!(null))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+
+        let mut face = CardContent::plain("");
+        face.rich_text = Some(vec![
+            RichTextSpan {
+                text: "Quedo ".to_string(),
+                style: None,
+            },
+            RichTextSpan {
+                text: "actualizado".to_string(),
+                style: Some(RichTextSpanStyle {
+                    bold: Some(true),
+                    font_color: Some("#27AE60".to_string()),
+                    ..Default::default()
+                }),
+            },
+        ]);
+
+        make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: Some(face),
+                back: None,
+                catalog_ids: vec![mock_id().to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+
+        let patch_req = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::PATCH)
+            .expect("PATCH request not made");
+        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
+        assert_eq!(
+            body["face"]["richText"][1]["style"],
+            json!({"bold": true, "fontColor": "#27AE60"}),
+            "outgoing PATCH must carry nested style: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_card_round_trips_nested_style_including_superscript() {
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": card_id,
+                "version": 1,
+                "face": {
+                    "text": "E=mc2",
+                    "richText": [
+                        { "text": "E=mc" },
+                        { "text": "2", "style": { "superscript": true, "bold": true } }
+                    ]
+                },
+                "back": { "text": "Mass-energy equivalence" },
+                "orderNumber": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .get_card(Parameters(crate::tools::cards::GetCardParams {
+                card_id: card_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            v["face"]["richText"][1]["style"],
+            json!({"superscript": true, "bold": true}),
+            "nested style (including superscript) must round-trip into tool output: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_cards_round_trips_nested_style() {
+        let server = MockServer::start().await;
+        let catalog_id = mock_id();
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{catalog_id}/cards")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": mock_id(),
+                    "version": 1,
+                    "face": {
+                        "text": "gracias.",
+                        "richText": [
+                            { "text": "gracias.", "style": { "bold": true, "fontColor": "#27AE60" } }
+                        ]
+                    },
+                    "back": { "text": "thank you" },
+                    "orderNumber": 1
+                }],
+                "nextCursor": null,
+                "permissions": {"canEdit": true, "canDelete": true, "isOwner": true}
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .list_cards(Parameters(crate::tools::cards::ListCardsParams {
+                catalog_id: catalog_id.to_string(),
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            v["data"][0]["face"]["richText"][0]["style"],
+            json!({"bold": true, "fontColor": "#27AE60"}),
+            "nested style must round-trip into list_cards tool output: {text}"
+        );
+    }
+
+    // ── real server: get_card / delete_card error and invalid-UUID paths ──────
+
+    #[tokio::test]
+    async fn test_server_get_card_not_found_returns_error() {
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .get_card(Parameters(crate::tools::cards::GetCardParams {
+                card_id: card_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_server_delete_card_ok_and_forbidden() {
+        use crate::tools::cards::DeleteCardParams;
+        let server = MockServer::start().await;
+        let catalog_id = mock_id();
+        let card_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/catalogs/{catalog_id}/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: catalog_id.to_string(),
+                card_id: card_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert_eq!(text, "Card deleted successfully.");
+
+        let server2 = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/catalogs/{catalog_id}/cards/{card_id}")))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"error": "you don't have edit access"})),
+            )
+            .mount(&server2)
+            .await;
+
+        let result = make_server(&server2.uri())
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: catalog_id.to_string(),
+                card_id: card_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            text.contains("ermission") || text.contains("access"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_card_tools_invalid_uuid_make_no_request() {
+        use crate::tools::cards::{DeleteCardParams, GetCardParams, ListCardsParams};
+        let server = MockServer::start().await;
+        let s = make_server(&server.uri());
+
+        let result = s
+            .list_cards(Parameters(ListCardsParams {
+                catalog_id: "bad".to_string(),
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        let result = s
+            .get_card(Parameters(GetCardParams {
+                card_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        let result = s
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: "bad".to_string(),
+                card_id: mock_id().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        let result = s
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: mock_id().to_string(),
+                card_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
         );
     }
 }
