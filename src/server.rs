@@ -26,7 +26,7 @@ use crate::tools::catalogs::{
     ok_json, ok_text, parse_uuid,
 };
 use crate::tools::generate::{
-    GenerateCardParams, GenerateCardsParams, GenerateCatalogWithCardsParams,
+    GenerateCardParams, GenerateCardsParams, GenerateCatalogWithCardsParams, check_batch_size,
 };
 use crate::tools::learning::{AddCardToLearningParams, AddCatalogToLearningParams, DueCardsParams};
 use crate::tools::learning_paths::{
@@ -893,8 +893,9 @@ fn normalize_card_content(content: &mut crate::dto::CardContent) {
             // Span concatenation doesn't match the provided text — LLM corrupted them.
             // Discard richText and fall back to plain text.
             warn!(
-                anchor = %anchor,
-                derived = %derived,
+                anchor_chars = anchor.chars().count(),
+                derived_chars = derived.chars().count(),
+                span_count = spans.len(),
                 "normalize_card_content: span mismatch — discarding richText"
             );
             content.text = anchor;
@@ -931,8 +932,8 @@ impl EngramoMcpServer {
         normalize_card_content(&mut p.face);
         normalize_card_content(&mut p.back);
         debug!(
-            face_text = %p.face.text,
-            back_text = %p.back.text,
+            face_chars = p.face.text.chars().count(),
+            back_chars = p.back.text.chars().count(),
             has_rich_text = p.face.rich_text.is_some(),
             "generate_card: after normalization"
         );
@@ -964,12 +965,17 @@ impl EngramoMcpServer {
             Spans must partition face.text with no gaps; their concatenation must equal face.text exactly. \
             The server validates this and discards richText if spans disagree with text. \
             Styling goes under a nested `style` object on the span, e.g. \
-            {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
+            {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
+            The returned catalog's cardCount reflects the cards created in this call. \
+            At most 200 cards per call; split larger sets into several calls."
     )]
     pub async fn generate_catalog_with_cards(
         &self,
         Parameters(mut p): Parameters<GenerateCatalogWithCardsParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = check_batch_size(p.cards.len()) {
+            return Ok(err_result(e));
+        }
         for card in &mut p.cards {
             normalize_card_content(&mut card.face);
             normalize_card_content(&mut card.back);
@@ -994,7 +1000,13 @@ impl EngramoMcpServer {
                 .collect(),
         };
         Ok(match self.client.create_catalog_with_cards(&req).await {
-            Ok(resp) => ok_json(&resp),
+            Ok(mut resp) => {
+                // POST /catalogs/with-cards snapshots the catalog before inserting cards (#40);
+                // a freshly created catalog holds exactly the cards just created.
+                resp.catalog.card_count =
+                    Some(i64::try_from(resp.cards_created).unwrap_or(i64::MAX));
+                ok_json(&resp)
+            }
             Err(e) => err_result(e),
         })
     }
@@ -1013,12 +1025,16 @@ impl EngramoMcpServer {
             Spans must partition face.text with no gaps; their concatenation must equal face.text exactly. \
             The server validates this and discards richText if spans disagree with text. \
             Styling goes under a nested `style` object on the span, e.g. \
-            {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
+            {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
+            At most 200 cards per call; split larger sets into several calls."
     )]
     pub async fn generate_cards(
         &self,
         Parameters(mut p): Parameters<GenerateCardsParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = check_batch_size(p.cards.len()) {
+            return Ok(err_result(e));
+        }
         let catalog_id = match parse_uuid(&p.catalog_id) {
             Ok(id) => id,
             Err(e) => return Ok(err_result(e)),
@@ -1085,6 +1101,29 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect()
+    }
+
+    #[test]
+    fn test_batch_tool_descriptions_state_max_batch_cards() {
+        use crate::tools::generate::MAX_BATCH_CARDS;
+        let server = EngramoMcpServer::new(
+            EngramoClient::new("http://localhost", "engramo_test"),
+            false,
+        );
+        let needle = format!("At most {MAX_BATCH_CARDS} cards per call");
+        for name in ["generate_cards", "generate_catalog_with_cards"] {
+            let tool = server
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|t| t.name == name)
+                .expect(name);
+            let desc = tool.description.as_deref().unwrap_or("");
+            assert!(
+                desc.contains(&needle),
+                "{name} description out of sync with MAX_BATCH_CARDS"
+            );
+        }
     }
 
     #[test]
@@ -1926,6 +1965,230 @@ mod tests {
         assert!(result.is_error.unwrap_or(false));
     }
 
+    const TEST_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    fn mock_server_for(uri: &str) -> EngramoMcpServer {
+        EngramoMcpServer::new(EngramoClient::new(uri, "engramo_test"), false)
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_ok_and_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "Rust", "version": 1
+            })))
+            .mount(&mock_server)
+            .await;
+        let result = mock_server_for(&mock_server.uri())
+            .get_catalog(Parameters(GetCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert!(first_text(&result).contains("Rust"), "{result:?}");
+
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let result = mock_server_for(&missing.uri())
+            .get_catalog(Parameters(GetCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Not found"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_update_catalog_ok_and_invalid_uuid_makes_no_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "Renamed", "version": 2
+            })))
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let params = |catalog_id: &str| UpdateCatalogParams {
+            catalog_id: catalog_id.to_string(),
+            name: Some("Renamed".to_string()),
+            description: None,
+            tags: None,
+            visibility: None,
+            version: 1,
+        };
+        let result = server
+            .update_catalog(Parameters(params(TEST_ID)))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert!(first_text(&result).contains("Renamed"), "{result:?}");
+
+        let before = mock_server.received_requests().await.unwrap().len();
+        let result = server
+            .update_catalog(Parameters(params("not-a-uuid")))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Invalid UUID"), "{result:?}");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn test_delete_catalog_forbidden_and_invalid_uuid() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .delete_catalog(Parameters(DeleteCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            first_text(&result).contains("Permission denied"),
+            "{result:?}"
+        );
+
+        let before = mock_server.received_requests().await.unwrap().len();
+        let result = server
+            .delete_catalog(Parameters(DeleteCatalogParams {
+                catalog_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn test_add_card_to_learning_ok_and_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning/cards/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+        let result = mock_server_for(&mock_server.uri())
+            .add_card_to_learning(Parameters(AddCardToLearningParams {
+                card_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert_eq!(first_text(&result), "Card added to learning.");
+
+        let missing = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning/cards/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let result = mock_server_for(&missing.uri())
+            .add_card_to_learning(Parameters(AddCardToLearningParams {
+                card_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Not found"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_get_learning_path_ok_and_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "Spanish A1", "description": null, "version": 1
+            })))
+            .mount(&mock_server)
+            .await;
+        let result = mock_server_for(&mock_server.uri())
+            .get_learning_path(Parameters(GetLearningPathParams {
+                path_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert!(first_text(&result).contains("Spanish A1"), "{result:?}");
+
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let result = mock_server_for(&missing.uri())
+            .get_learning_path(Parameters(GetLearningPathParams {
+                path_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Not found"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_activate_learning_path_ok_and_invalid_uuid() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{TEST_ID}/activate")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .activate_learning_path(Parameters(ActivateLearningPathParams {
+                path_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert_eq!(first_text(&result), "Learning path activated.");
+
+        let before = mock_server.received_requests().await.unwrap().len();
+        let result = server
+            .activate_learning_path(Parameters(ActivateLearningPathParams {
+                path_id: "bad".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), before);
+    }
+
     #[test]
     fn test_paid_ai_tools_absent_when_flag_off() {
         let client = EngramoClient::new("http://localhost", "engramo_test");
@@ -2117,15 +2380,9 @@ mod tests {
         // '✈' at the very start of the first span (no preceding plain span).
         let mut spans = vec![bold_span("✈Estamos viendo"), span(" una película.")];
         strip_span_boundary_markers(&mut spans);
-        // span[0] is the first span; '✈' is not at the END of a non-final span, but it
-        // IS at the START of a non-first... wait: span[0] is the first span so its
-        // leading char is checked against the "non-first spans" rule.
-        // span[1] start = ' ' (ASCII) → no leading candidate from span[1].
-        // So '✈' is at the START of span[0] which is the FIRST span → NOT detected as
-        // a leading marker. It will be stripped only if it was a trailing marker on a
-        // non-final span — which it isn't here.
-        // However, sanitize_text (is_emoji_char) covers this case for plain text.
-        // The spans here remain unchanged since no boundary rule fires.
+        // Leading markers are only detected on non-first spans, and span[1] starts with ASCII,
+        // so no boundary rule fires here. `sanitize_text` (is_emoji_char) strips '✈' from real
+        // input before this function runs — see test_sanitize_strips_airplane_emoji.
         assert_eq!(spans[0].text, "✈Estamos viendo");
         assert_eq!(spans[1].text, " una película.");
     }
