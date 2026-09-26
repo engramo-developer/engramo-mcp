@@ -2,6 +2,21 @@ use serde::Deserialize;
 
 use crate::dto::CardContent;
 
+/// Upper bound on cards per `generate_cards` / `generate_catalog_with_cards` call. Keeps one
+/// MCP call from turning into an unbounded run of sequential upstream requests.
+pub const MAX_BATCH_CARDS: usize = 200;
+
+/// Rejects a batch larger than [`MAX_BATCH_CARDS`]. The error text is returned to the client
+/// verbatim via `err_result`.
+pub fn check_batch_size(n: usize) -> Result<(), String> {
+    if n > MAX_BATCH_CARDS {
+        return Err(format!(
+            "Too many cards: {n} (max {MAX_BATCH_CARDS} per call); split into several calls"
+        ));
+    }
+    Ok(())
+}
+
 // ── Params ────────────────────────────────────────────────────────────────────
 
 /// Params for `generate_card`.
@@ -132,7 +147,7 @@ mod tests {
             "id": mock_id(),
             "name": "Rust",
             "version": 1,
-            "card_count": 0
+            "cardCount": 0
         })
     }
 
@@ -508,6 +523,41 @@ mod tests {
         assert!(result.is_error.unwrap_or(false));
     }
 
+    #[tokio::test]
+    async fn test_generate_card_catalog_not_found_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .generate_card(Parameters(GenerateCardParams {
+                catalog_id: Some(mock_id().to_string()),
+                face: CardContent::plain("Q"),
+                back: CardContent::plain("A"),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(result_text(&result).contains("Not found"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_network_failure_returns_error() {
+        let result = make_server(&dead_uri())
+            .generate_card(Parameters(GenerateCardParams {
+                catalog_id: None,
+                face: CardContent::plain("Q"),
+                back: CardContent::plain("A"),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(!result_text(&result).is_empty(), "{result:?}");
+    }
+
     // ── generate_catalog_with_cards ───────────────────────────────────────────
 
     #[tokio::test]
@@ -543,6 +593,216 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    /// Mounts `POST /catalogs/with-cards` returning `catalog` / `cards_created`, calls the tool
+    /// with `cards_created` plain cards, and returns the parsed tool output.
+    async fn generate_catalog_output(
+        catalog: serde_json::Value,
+        cards_created: usize,
+    ) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog,
+                "cardsCreated": cards_created
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Rust Basics".to_string(),
+                description: None,
+                image_id: None,
+                tags: None,
+                visibility: None,
+                cards: (0..cards_created)
+                    .map(|i| CardInputParams {
+                        face: CardContent::plain(format!("Q{i}")),
+                        back: CardContent::plain(format!("A{i}")),
+                    })
+                    .collect(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_overwrites_stale_zero_card_count() {
+        let body = generate_catalog_output(
+            json!({"id": mock_id(), "name": "Rust", "version": 1, "cardCount": 0}),
+            2,
+        )
+        .await;
+        assert_eq!(body["catalog"]["cardCount"].as_i64(), Some(2), "{body}");
+        assert_eq!(body["cardsCreated"].as_i64(), Some(2), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_sets_card_count_when_absent() {
+        let body =
+            generate_catalog_output(json!({"id": mock_id(), "name": "Rust", "version": 1}), 2)
+                .await;
+        assert_eq!(body["catalog"]["cardCount"].as_i64(), Some(2), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_at_cap_is_accepted() {
+        let body = generate_catalog_output(
+            json!({"id": mock_id(), "name": "Rust", "version": 1}),
+            MAX_BATCH_CARDS,
+        )
+        .await; // helper already asserts !is_error
+        assert_eq!(
+            body["catalog"]["cardCount"].as_i64(),
+            Some(MAX_BATCH_CARDS as i64),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn test_check_batch_size_boundary() {
+        assert!(check_batch_size(MAX_BATCH_CARDS).is_ok());
+        let err = check_batch_size(MAX_BATCH_CARDS + 1).unwrap_err();
+        assert!(err.contains("Too many cards"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_empty_sets_card_count_zero() {
+        // Stale upstream value (7) must be overwritten, and Some(0) must be serialized.
+        let body = generate_catalog_output(
+            json!({"id": mock_id(), "name": "Rust", "version": 1, "cardCount": 7}),
+            0,
+        )
+        .await;
+        assert_eq!(body["catalog"]["cardCount"].as_i64(), Some(0), "{body}");
+        assert_eq!(body["cardsCreated"].as_i64(), Some(0), "{body}");
+    }
+
+    async fn generate_catalog_one_card(uri: &str) -> rmcp::model::CallToolResult {
+        make_server(uri)
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Rust Basics".to_string(),
+                description: None,
+                image_id: None,
+                tags: None,
+                visibility: None,
+                cards: vec![CardInputParams {
+                    face: CardContent::plain("Q"),
+                    back: CardContent::plain("A"),
+                }],
+            }))
+            .await
+            .unwrap() // must NOT be Err — MCP contract
+    }
+
+    fn result_text(result: &rmcp::model::CallToolResult) -> &str {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("")
+    }
+
+    /// A URI that refuses connections. Port 1 (tcpmux) has no listener; a dropped
+    /// `MockServer`'s port could be reused by a parallel test, so don't rely on that.
+    fn dead_uri() -> String {
+        "http://127.0.0.1:1".to_string()
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_unauthorized_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let result = generate_catalog_one_card(&server.uri()).await;
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(!result_text(&result).is_empty(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_server_error_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "boom"})))
+            .mount(&server)
+            .await;
+
+        let result = generate_catalog_one_card(&server.uri()).await;
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(!result_text(&result).is_empty(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_network_failure_returns_error() {
+        let result = generate_catalog_one_card(&dead_uri()).await;
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(!result_text(&result).is_empty(), "{result:?}");
+    }
+
+    fn n_cards(n: usize) -> Vec<CardInputParams> {
+        (0..n)
+            .map(|i| CardInputParams {
+                face: CardContent::plain(format!("Q{i}")),
+                back: CardContent::plain(format!("A{i}")),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_over_cap_returns_error_without_request() {
+        let server = MockServer::start().await;
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Huge".to_string(),
+                description: None,
+                image_id: None,
+                tags: None,
+                visibility: None,
+                cards: n_cards(MAX_BATCH_CARDS + 1),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(
+            result_text(&result).contains("Too many cards"),
+            "{result:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_cards_over_cap_returns_error_without_request() {
+        let server = MockServer::start().await;
+        let result = make_server(&server.uri())
+            .generate_cards(Parameters(GenerateCardsParams {
+                catalog_id: mock_id().to_string(),
+                cards: n_cards(MAX_BATCH_CARDS + 1),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(
+            result_text(&result).contains("Too many cards"),
+            "{result:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -610,6 +870,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+        let body: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(body["catalog"]["cardCount"].as_i64(), Some(0), "{body}");
     }
 
     #[tokio::test]
@@ -805,6 +1067,57 @@ mod tests {
             body["face"]["dictionary"]["quedo"].as_str(),
             Some("I wait"),
             "dictionary must be preserved from existing card"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_preserves_back_dictionary_from_existing_card() {
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": card_id,
+                "version": 1,
+                "face": { "text": "dog" },
+                "back": { "text": "perro", "dictionary": { "perro": "dog" } },
+                "orderNumber": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: None,
+                back: Some(CardContent::plain("perro")), // no dictionary set
+                catalog_ids: vec![mock_id().to_string()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+
+        let patch_req = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::PATCH)
+            .expect("PATCH request not made");
+        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
+        assert_eq!(
+            body["back"]["dictionary"]["perro"].as_str(),
+            Some("dog"),
+            "back dictionary must be preserved from existing card"
         );
     }
 
@@ -1178,6 +1491,36 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_generate_cards_fails_mid_batch_after_first_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "boom"})))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .generate_cards(Parameters(GenerateCardsParams {
+                catalog_id: mock_id().to_string(),
+                cards: n_cards(3),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        // First card sent and succeeded, second failed, third never attempted.
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
