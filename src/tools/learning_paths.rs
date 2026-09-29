@@ -33,12 +33,52 @@ pub struct CreateLearningPathParams {
     pub name: String,
     #[schemars(description = "Optional description")]
     pub description: Option<String>,
+    #[schemars(
+        description = "Optional UUIDs of catalogs to add to the new path right after it's created. Each catalog is added in its own request after the path exists (non-atomic) — the response includes `catalogs_added`/`catalogs_failed` when this is set, so failed ids can be retried with add_catalog_to_learning_path."
+    )]
+    pub catalog_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ActivateLearningPathParams {
     #[schemars(description = "UUID of the learning path to activate")]
     pub path_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AddCatalogToLearningPathParams {
+    #[schemars(description = "UUID of the learning path")]
+    pub path_id: String,
+    #[schemars(description = "UUID of the catalog to add to the path")]
+    pub catalog_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoveCatalogFromLearningPathParams {
+    #[schemars(description = "UUID of the learning path")]
+    pub path_id: String,
+    #[schemars(description = "UUID of the catalog to remove from the path")]
+    pub catalog_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateLearningPathParams {
+    #[schemars(description = "UUID of the learning path to update")]
+    pub path_id: String,
+    #[schemars(description = "New name")]
+    pub name: Option<String>,
+    #[schemars(description = "New description")]
+    pub description: Option<String>,
+    #[schemars(description = "New tags")]
+    pub tags: Option<Vec<String>>,
+    #[schemars(
+        description = "New visibility: 'public' or 'private'. 'unlisted' is catalog-only and is rejected for learning paths."
+    )]
+    pub visibility: Option<String>,
+    #[schemars(
+        description = "Current version of the learning path (required for optimistic locking)"
+    )]
+    pub version: i32,
 }
 
 #[derive(Clone)]

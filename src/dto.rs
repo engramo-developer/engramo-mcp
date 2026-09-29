@@ -491,6 +491,24 @@ pub struct CreateLearningPathRequest {
     pub description: Option<String>,
 }
 
+/// Request body for `PATCH /learning-paths/{id}`. Mirrors `UpdateCatalogRequest`: every field
+/// but `version` is optional and omitted-if-`None` (the API treats an omitted field as "keep
+/// current value" via `COALESCE`, not as "clear it"). `image_id` is deliberately left out,
+/// consistent with `UpdateCatalogRequest` not carrying an image field either — add it later if
+/// a caller actually needs to change a path's cover image via MCP.
+#[derive(Debug, Serialize)]
+pub struct UpdateLearningPathRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    pub version: i32,
+}
+
 // ── Search ────────────────────────────────────────────────────────────────────
 
 /// A search hit's kind. Only `catalog` and `card` are part of global search — learning
@@ -989,6 +1007,41 @@ mod tests {
             "face":{"text":"Q"},"back":{"text":"A"},"catalogs":null}"#;
         let card: CardDto = serde_json::from_str(json).unwrap();
         assert!(card.catalogs.is_none());
+    }
+
+    #[test]
+    fn test_update_learning_path_request_omits_none_fields_but_keeps_version() {
+        let req = UpdateLearningPathRequest {
+            name: Some("New Name".to_string()),
+            description: None,
+            tags: None,
+            visibility: None,
+            version: 3,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"name\":\"New Name\""), "{json}");
+        assert!(json.contains("\"version\":3"), "{json}");
+        assert!(!json.contains("description"), "{json}");
+        assert!(!json.contains("tags"), "{json}");
+        assert!(!json.contains("visibility"), "{json}");
+    }
+
+    #[test]
+    fn test_update_learning_path_request_serializes_all_fields_when_set() {
+        let req = UpdateLearningPathRequest {
+            name: Some("New Name".to_string()),
+            description: Some("New description".to_string()),
+            tags: Some(vec!["tag1".to_string()]),
+            visibility: Some("public".to_string()),
+            version: 1,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"description\":\"New description\""),
+            "{json}"
+        );
+        assert!(json.contains("\"tags\":[\"tag1\"]"), "{json}");
+        assert!(json.contains("\"visibility\":\"public\""), "{json}");
     }
 
     #[test]
