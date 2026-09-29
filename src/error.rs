@@ -218,8 +218,11 @@ impl ApiError {
                         .unwrap_or_default()
                 ))
             }
-            403 => Self::PermissionDenied(extract_error_message(&body)),
-            404 => Self::NotFound(extract_error_message(&body)),
+            403 => Self::PermissionDenied(forbidden_hint(strip_duplicate_prefix(
+                "Permission denied",
+                extract_error_message(&body),
+            ))),
+            404 => Self::NotFound(dedup_or_raw("Not found", extract_error_message(&body))),
             409 => Self::Conflict(
                 "resource was modified by another client. Fetch the latest version and retry."
                     .to_string(),
@@ -244,7 +247,9 @@ impl ApiError {
             // `style.textAlign: "diagonal"`) — a client input mistake, same as 400, not a
             // transient server failure. The rejection text names the exact field and valid
             // values, which is directly actionable for the calling LLM to correct and retry.
-            400 | 422 => Self::BadRequest(extract_error_message(&body)),
+            400 | 422 => {
+                Self::BadRequest(dedup_or_raw("Bad request", extract_error_message(&body)))
+            }
             _ => {
                 // Unrecognized/5xx status — a genuine backend failure, not a routine
                 // tool-call outcome. Log at ERROR so it reaches GCP Error Reporting.
@@ -304,6 +309,56 @@ fn redact_location(location: &str) -> String {
     redacted.chars().take(MAX_LOCATION_LEN).collect()
 }
 
+/// Strips a leading, case-insensitive duplicate of `label` (followed by `:` and optional
+/// whitespace) from `msg` — see issue #54B. The backend's own error body is often already
+/// prefixed with the same word this variant's `Display` impl adds (e.g. a 404 body of
+/// `"Not found: Learning path X not found"` wrapped as `ApiError::NotFound(..)`), which would
+/// otherwise double up as `"Not found: Not found: Learning path X not found"`. A message that
+/// doesn't start with the prefix is returned unchanged.
+fn strip_duplicate_prefix(label: &str, msg: String) -> String {
+    let mut chars = msg.trim_start().chars();
+    for lc in label.chars() {
+        match chars.next() {
+            Some(c) if c.eq_ignore_ascii_case(&lc) => continue,
+            _ => return msg,
+        }
+    }
+    match chars.next() {
+        Some(':') => chars.as_str().trim_start().to_string(),
+        _ => msg,
+    }
+}
+
+/// Like [`strip_duplicate_prefix`], but falls back to the original, unstripped `raw` message
+/// when stripping would leave nothing (e.g. a backend body of exactly `"Not found:"`) — an
+/// empty remainder tells the calling LLM less than the raw body did. Used by the 404 and
+/// 400/422 arms of [`ApiError::from_response`]; the 403 arm calls `strip_duplicate_prefix`
+/// directly because `forbidden_hint` turns an empty string into an actionable hint.
+fn dedup_or_raw(label: &str, raw: String) -> String {
+    let stripped = strip_duplicate_prefix(label, raw.clone());
+    if stripped.trim().is_empty() {
+        raw
+    } else {
+        stripped
+    }
+}
+
+/// Expands a bare `"Forbidden"` (or empty) 403 body into an actionable hint — see #54A/#52.
+/// The backend collapses every 403 body to the literal "Forbidden", which also covers "the id
+/// doesn't exist", "it belongs to another user", and "the action needs a higher role" (e.g.
+/// setting catalog visibility to 'public'/'unlisted'), so the bare word alone gives the caller
+/// nothing to act on. Any other, more specific 403 message is left untouched.
+fn forbidden_hint(msg: String) -> String {
+    let bare = msg.trim();
+    if bare.is_empty() || bare.eq_ignore_ascii_case("forbidden") {
+        "Forbidden (the resource may not exist, may belong to another user, or the action — \
+         e.g. setting catalog visibility to 'public'/'unlisted' — may require a higher role)"
+            .to_string()
+    } else {
+        msg
+    }
+}
+
 /// Extract a human-readable message from a JSON `{ "error": "..." }` body. The message is
 /// returned to the (possibly remote, multi-tenant) MCP client and logged, so a non-JSON body
 /// (e.g. a proxy's error page) is never passed through as markup, control characters are
@@ -334,6 +389,45 @@ fn extract_error_message(body: &str) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::{Arc, Mutex};
+
+    /// Serializes every test in the crate that installs a capturing `tracing` subscriber as
+    /// the (thread-local or global) default.
+    ///
+    /// `tracing-core`'s per-callsite interest cache and its global max-level hint are
+    /// process-wide state, not per-thread: installing or dropping a dispatcher on one test
+    /// thread can change whether a *different* thread's concurrently-running subscriber
+    /// receives an event at all (a callsite once cached as "no subscriber is interested"
+    /// stays that way for every thread until something rebuilds the cache). Under the default
+    /// parallel test runner this made log-capturing tests flaky depending on what else
+    /// happened to be running at the same time.
+    ///
+    /// Every test that installs a capturing subscriber (`tracing::subscriber::set_default` /
+    /// `with_default`) must hold this lock for the subscriber's entire lifetime, from before
+    /// it is installed until after the captured buffer has been read. That guarantees at most
+    /// one capturing subscriber — and one `rebuild_interest_cache()` call, where used — is
+    /// ever active at a time, so no other thread's subscriber can be starved by a stale
+    /// "never interested" cache entry.
+    ///
+    /// This is a `tokio::sync::Mutex`, not `std::sync::Mutex`: some of the tests that need it
+    /// hold the guard across `.await` points (fine under `#[tokio::test]`'s default
+    /// current-thread runtime, but `clippy::await_holding_lock` rightly flags a std guard
+    /// there), and sync tests take it with `blocking_lock()` instead. As a bonus, a
+    /// `tokio::sync::Mutex` never poisons, so a test panicking while holding it cannot
+    /// cascade into unrelated test failures — no `unwrap_or_else` recovery dance needed.
+    ///
+    /// A test that does *not* install a capturing subscriber itself must still take this lock
+    /// if it is the first to touch a callsite that some *other*, capturing test asserts on:
+    /// `rebuild_interest_cache()` inside the capturing test does not reliably undo a `never`
+    /// interest already cached by a concurrent, unlocked touch of the same callsite. This was
+    /// observed empirically: when the non-capturing
+    /// `test_from_response_redirect_is_bad_request_with_actionable_message` ran without the lock,
+    /// the capturing `test_from_response_redirect_logs_redacted_location_without_token` below
+    /// (which shares the 300..=399 `tracing::warn!` callsite) failed to see its WARN line. The
+    /// protection is best-effort: many other non-capturing tool-handler tests hit the same
+    /// `err_result` and `ApiError::decode` callsites as capturing tests elsewhere in the crate
+    /// (e.g. in `tools::catalogs`) without taking this lock at all.
+    pub(crate) static TRACING_CAPTURE_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// Minimal in-memory tracing writer so tests can assert on what a log line actually
     /// contains, without pulling in a new dev-dependency.
@@ -465,12 +559,21 @@ mod tests {
         }
         let e = serde_json::from_str::<Probe>(r#"{"kind":"SECRET_USER_TEXT"}"#).unwrap_err();
 
+        // See `test_support::TRACING_CAPTURE_LOCK`: must be held for the capturing
+        // subscriber's entire lifetime, not just around `set_default`.
+        let _lock = test_support::TRACING_CAPTURE_LOCK.blocking_lock();
+
         let buf = BufWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
+        // Rebuild so the thread-local subscriber above actually sees the event, even if a
+        // callsite was previously cached as "no subscriber interested" by another test. Safe
+        // now that TRACING_CAPTURE_LOCK guarantees no other capturing subscriber is active
+        // concurrently.
+        tracing::callsite::rebuild_interest_cache();
         let err = ApiError::decode(e);
         drop(guard);
 
@@ -784,6 +887,17 @@ mod tests {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // This test doesn't capture logs itself, but it hits the exact same `tracing::warn!`
+        // callsite (the 300..=399 branch of `ApiError::from_response`) as the capturing test
+        // `test_from_response_redirect_logs_redacted_location_without_token` below. Without a
+        // thread-local subscriber, that callsite's *first-ever* touch is evaluated against the
+        // process's `NoSubscriber` default, which caches `Interest::never()` for it globally —
+        // permanently disabling the event for every thread, including a concurrently-running
+        // capturing test, unless something rebuilds the cache afterward. Taking the same lock
+        // here just serializes it against that test (observed to be required, see the
+        // `TRACING_CAPTURE_LOCK` doc); it does not need to install a subscriber of its own.
+        let _lock = test_support::TRACING_CAPTURE_LOCK.lock().await;
+
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
@@ -887,12 +1001,22 @@ mod tests {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // See `test_support::TRACING_CAPTURE_LOCK`: held for the capturing subscriber's
+        // entire lifetime, including across the `.await`s below — a `tokio::sync::Mutex`
+        // guard is fine to hold across an await (unlike a std one, which clippy rejects).
+        let _lock = test_support::TRACING_CAPTURE_LOCK.lock().await;
+
         let buf = BufWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
             .with_ansi(false)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        // Rebuild so the thread-local subscriber above actually sees the event, even if a
+        // callsite was previously cached as "no subscriber interested" by another test. Safe
+        // now that TRACING_CAPTURE_LOCK guarantees no other capturing subscriber is active
+        // concurrently.
+        tracing::callsite::rebuild_interest_cache();
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -921,6 +1045,279 @@ mod tests {
             logged.contains("https://api.example.com/catalogs"),
             "{logged}"
         );
+    }
+
+    #[test]
+    fn test_strip_duplicate_prefix_dedups_not_found() {
+        let msg = strip_duplicate_prefix(
+            "Not found",
+            "Not found: Learning path X not found".to_string(),
+        );
+        assert_eq!(msg, "Learning path X not found");
+    }
+
+    #[test]
+    fn test_strip_duplicate_prefix_dedups_bad_request_case_insensitive() {
+        let msg = strip_duplicate_prefix(
+            "Bad request",
+            "bad request: 'name' field is required".to_string(),
+        );
+        assert_eq!(msg, "'name' field is required");
+    }
+
+    #[test]
+    fn test_strip_duplicate_prefix_passthrough_when_no_prefix() {
+        let msg = strip_duplicate_prefix("Not found", "catalog abc-123 does not exist".to_string());
+        assert_eq!(msg, "catalog abc-123 does not exist");
+    }
+
+    #[test]
+    fn test_strip_duplicate_prefix_keeps_label_without_colon() {
+        // exact label, no trailing colon -> unchanged
+        assert_eq!(
+            strip_duplicate_prefix("Not found", "Not found".to_string()),
+            "Not found"
+        );
+        // label followed by a space, not a colon -> unchanged
+        assert_eq!(
+            strip_duplicate_prefix("Not found", "Not found anywhere in catalog".to_string()),
+            "Not found anywhere in catalog"
+        );
+        // label is a prefix of a longer word -> unchanged
+        assert_eq!(
+            strip_duplicate_prefix("Bad request", "Bad requests are throttled".to_string()),
+            "Bad requests are throttled"
+        );
+        // message shorter than the label -> unchanged
+        assert_eq!(
+            strip_duplicate_prefix("Not found", "Not".to_string()),
+            "Not"
+        );
+    }
+
+    #[test]
+    fn test_strip_duplicate_prefix_trims_leading_whitespace_before_matching() {
+        // `extract_error_message` replaces control characters (e.g. a leading "\n") with
+        // spaces, so the label match must tolerate leading whitespace instead of doubling up.
+        let msg = strip_duplicate_prefix("Not found", " Not found: X".to_string());
+        assert_eq!(msg, "X");
+    }
+
+    #[test]
+    fn test_dedup_or_raw_falls_back_when_stripping_leaves_nothing() {
+        assert_eq!(
+            dedup_or_raw("Not found", "Not found:".to_string()),
+            "Not found:"
+        );
+        assert_eq!(
+            dedup_or_raw("Bad request", "Bad request: ".to_string()),
+            "Bad request: "
+        );
+    }
+
+    #[test]
+    fn test_dedup_or_raw_still_dedups_normal_case() {
+        assert_eq!(
+            dedup_or_raw("Not found", "Not found: catalog X".to_string()),
+            "catalog X"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_response_404_body_with_only_label_falls_back_to_raw() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"error": "Not found:"})),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        match ApiError::from_response(resp).await {
+            ApiError::NotFound(msg) => assert_eq!(msg, "Not found:"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_forbidden_hint_expands_bare_forbidden() {
+        let msg = forbidden_hint("Forbidden".to_string());
+        assert!(msg.starts_with("Forbidden ("), "{msg}");
+        assert!(msg.contains("may not exist"), "{msg}");
+        assert!(msg.contains("public"), "{msg}");
+        assert!(msg.contains("unlisted"), "{msg}");
+    }
+
+    #[test]
+    fn test_forbidden_hint_expands_empty_body() {
+        let msg = forbidden_hint(String::new());
+        assert!(msg.starts_with("Forbidden ("), "{msg}");
+    }
+
+    #[test]
+    fn test_forbidden_hint_passes_through_non_bare_message() {
+        let msg = forbidden_hint("you don't have edit access to this catalog".to_string());
+        assert_eq!(msg, "you don't have edit access to this catalog");
+    }
+
+    #[test]
+    fn test_forbidden_hint_case_insensitive_and_trimmed() {
+        for input in [
+            "forbidden",
+            "FORBIDDEN",
+            "  Forbidden  ",
+            "FORBIDDEN ",
+            "   ",
+        ] {
+            let msg = forbidden_hint(input.to_string());
+            assert!(msg.starts_with("Forbidden ("), "input={input:?} got={msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_response_404_dedups_backend_prefix() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "Not found: Learning path X not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let err = ApiError::from_response(resp).await;
+        assert_eq!(
+            err.to_string(),
+            "Not found: Learning path X not found",
+            "must not double up the prefix"
+        );
+        match err {
+            ApiError::NotFound(msg) => assert_eq!(msg, "Learning path X not found"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_response_400_dedups_backend_prefix() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "Bad request: 'name' field is required"
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let err = ApiError::from_response(resp).await;
+        assert_eq!(
+            err.to_string(),
+            "Bad request: 'name' field is required",
+            "must not double up the prefix"
+        );
+        match err {
+            ApiError::BadRequest(msg) => assert_eq!(msg, "'name' field is required"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_response_403_bare_forbidden_is_actionable() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(serde_json::json!({"error": "Forbidden"})),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let err = ApiError::from_response(resp).await;
+        let msg = err.to_string();
+        assert!(msg.starts_with("Permission denied: Forbidden ("), "{msg}");
+        assert!(msg.contains("may not exist"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_from_response_403_non_bare_message_passes_through() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "you don't have edit access to this catalog"
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let err = ApiError::from_response(resp).await;
+        assert_eq!(
+            err.to_string(),
+            "Permission denied: you don't have edit access to this catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_response_403_dedups_prefix_then_expands_bare_forbidden() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Case 1: a backend body already prefixed with "Permission denied: Forbidden" must be
+        // de-duplicated by `strip_duplicate_prefix` *before* `forbidden_hint` sees the bare
+        // "Forbidden" and expands it — not left as a doubled, unexpanded prefix.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "Permission denied: Forbidden"
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let err = ApiError::from_response(resp).await;
+        let msg = err.to_string();
+        assert!(msg.starts_with("Permission denied: Forbidden ("), "{msg}");
+        assert!(
+            !msg.contains("Permission denied: Permission denied"),
+            "{msg}"
+        );
+        assert!(msg.contains("may not exist"), "{msg}");
+
+        // Case 2: a case-insensitive prefix on a specific message is stripped, and the
+        // specific message (not bare "Forbidden") passes through `forbidden_hint` unchanged.
+        let server2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "permission denied: you lack the editor role"
+            })))
+            .mount(&server2)
+            .await;
+
+        let resp2 = reqwest::get(server2.uri()).await.unwrap();
+        let err2 = ApiError::from_response(resp2).await;
+        assert_eq!(
+            err2.to_string(),
+            "Permission denied: you lack the editor role"
+        );
+        match err2 {
+            ApiError::PermissionDenied(m) => assert_eq!(m, "you lack the editor role"),
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
     }
 
     #[tokio::test]
