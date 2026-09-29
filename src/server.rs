@@ -20,6 +20,7 @@ use crate::dto::{
     CardInput, CreateCardRequest, CreateCatalogWithCardsApiRequest, CreateLearningPathRequest,
     UpdateCardRequest, UpdateCatalogRequest, UpdateLearningPathRequest, UploadMediaResult,
 };
+use crate::error::ApiError;
 use crate::tools::cards::{DeleteCardParams, GetCardParams, ListCardsParams, UpdateCardParams};
 use crate::tools::catalogs::{
     DeleteCatalogParams, GetCatalogParams, ListCatalogsParams, UpdateCatalogParams, err_result,
@@ -30,8 +31,9 @@ use crate::tools::generate::{
 };
 use crate::tools::learning::{AddCardToLearningParams, AddCatalogToLearningParams, DueCardsParams};
 use crate::tools::learning_paths::{
-    ActivateLearningPathParams, AddCatalogToLearningPathParams, CreateLearningPathParams,
-    GetLearningPathParams, ListLearningPathsParams, RemoveCatalogFromLearningPathParams,
+    ActivateLearningPathParams, AddCatalogToLearningPathParams, CatalogAddFailure,
+    CreateLearningPathParams, CreatedLearningPathWithCatalogs, GetLearningPathParams,
+    ListLearningPathsParams, MAX_PATH_CATALOG_IDS, RemoveCatalogFromLearningPathParams,
     UpdateLearningPathParams,
 };
 use crate::tools::media::{
@@ -479,12 +481,27 @@ impl EngramoMcpServer {
         &self,
         Parameters(p): Parameters<CreateLearningPathParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let raw_ids = p.catalog_ids.unwrap_or_default();
+        if raw_ids.len() > MAX_PATH_CATALOG_IDS {
+            return Ok(err_result(format!(
+                "Too many catalog_ids: {} (max {MAX_PATH_CATALOG_IDS}); add the rest with \
+                 add_catalog_to_learning_path",
+                raw_ids.len()
+            )));
+        }
         // Validate every catalog id before creating anything, so a typo can't leave behind a
-        // half-populated path.
+        // half-populated path. Duplicates are dropped (first occurrence wins) so the same id
+        // can't show up twice in `catalogs_added`, or in both `catalogs_added` and
+        // `catalogs_failed`.
+        let mut seen = std::collections::HashSet::new();
         let mut catalog_ids = Vec::new();
-        for raw_id in p.catalog_ids.unwrap_or_default() {
+        for raw_id in raw_ids {
             match parse_uuid(&raw_id) {
-                Ok(id) => catalog_ids.push((raw_id, id)),
+                Ok(id) => {
+                    if seen.insert(id) {
+                        catalog_ids.push((raw_id, id));
+                    }
+                }
                 Err(e) => return Ok(err_result(e)),
             }
         }
@@ -503,26 +520,41 @@ impl EngramoMcpServer {
         }
 
         let mut added: Vec<String> = Vec::new();
-        let mut failed: Vec<serde_json::Value> = Vec::new();
-        for (raw_id, id) in catalog_ids {
+        let mut failed: Vec<CatalogAddFailure> = Vec::new();
+        let mut ids_iter = catalog_ids.into_iter();
+        for (raw_id, id) in ids_iter.by_ref() {
             match self.client.add_catalog_to_learning_path(path.id, id).await {
                 Ok(()) => added.push(raw_id),
-                Err(e) => failed.push(serde_json::json!({
-                    "catalog_id": raw_id,
-                    "error": e.to_string(),
-                })),
+                Err(e) => {
+                    // Unauthorized/QuotaExceeded won't clear up on the next id in this same
+                    // batch — stop instead of firing the rest of the requests under a token
+                    // that's already known to be rejected/rate-limited.
+                    let fatal =
+                        matches!(e, ApiError::Unauthorized | ApiError::QuotaExceeded { .. });
+                    failed.push(CatalogAddFailure {
+                        catalog_id: raw_id,
+                        error: e.to_string(),
+                    });
+                    if fatal {
+                        for (raw_id, _) in ids_iter.by_ref() {
+                            failed.push(CatalogAddFailure {
+                                catalog_id: raw_id,
+                                error: "skipped: a previous catalog add failed with a fatal \
+                                        error"
+                                    .to_string(),
+                            });
+                        }
+                        break;
+                    }
+                }
             }
         }
 
-        let mut value = match serde_json::to_value(&path) {
-            Ok(v) => v,
-            Err(e) => return Ok(err_result(format!("Serialization error: {e}"))),
-        };
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("catalogs_added".to_string(), serde_json::json!(added));
-            obj.insert("catalogs_failed".to_string(), serde_json::json!(failed));
-        }
-        Ok(ok_json(&value))
+        Ok(ok_json(&CreatedLearningPathWithCatalogs {
+            path: &path,
+            catalogs_added: added,
+            catalogs_failed: failed,
+        }))
     }
 
     #[tool(description = "Activate a learning path so its catalogs are included in daily reviews.")]
@@ -1331,6 +1363,29 @@ mod tests {
     }
 
     #[test]
+    fn test_learning_path_catalog_tools_are_registered_on_the_real_server() {
+        // Same regression class as `test_upload_media_is_registered_on_the_real_server`:
+        // `tools/learning_paths.rs`'s `LearningPathTools` struct is a separate, unused
+        // scaffold — the tools actually served to clients are the ones registered directly on
+        // `EngramoMcpServer` below.
+        for flag in [false, true] {
+            let server =
+                EngramoMcpServer::new(EngramoClient::new("http://localhost", "engramo_test"), flag);
+            let names = tool_names(&server);
+            for name in [
+                "add_catalog_to_learning_path",
+                "remove_catalog_from_learning_path",
+                "update_learning_path",
+            ] {
+                assert!(
+                    names.contains(&name.to_string()),
+                    "{name} missing: {names:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_cursor_paginated_list_tools_document_the_50_item_cap_on_the_real_server() {
         // Regression guard for #34: every cursor-paginated list tool must tell the caller
         // about the server-side 50-item cap and how to page past it, not just say
@@ -2133,6 +2188,64 @@ mod tests {
         assert_eq!(mock_server.received_requests().await.unwrap().len(), before);
     }
 
+    /// Only the invalid-`catalog_id` branch was covered above; `path_id` is validated first
+    /// and must be exercised too.
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_invalid_path_id_makes_no_request() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .add_catalog_to_learning_path(Parameters(AddCatalogToLearningPathParams {
+                    path_id: "not-a-uuid".to_string(),
+                    catalog_id: "00000000-0000-0000-0000-000000000002".to_string(),
+                }))
+                .await
+                .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(first_text(&result).contains("Invalid UUID"), "{result:?}");
+        // `.expect(0)` on the mock is verified when mock_server drops.
+    }
+
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_api_error_returns_is_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let catalog_id = "00000000-0000-0000-0000-000000000002";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{path_id}/catalogs/{catalog_id}"
+            )))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .add_catalog_to_learning_path(Parameters(AddCatalogToLearningPathParams {
+                    path_id: path_id.to_string(),
+                    catalog_id: catalog_id.to_string(),
+                }))
+                .await
+                .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            first_text(&result).contains("Permission denied"),
+            "{result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_remove_catalog_from_learning_path_ok_and_not_found() {
         use wiremock::matchers::{method, path};
@@ -2185,6 +2298,37 @@ mod tests {
                 .unwrap();
         assert_eq!(result.is_error, Some(true), "{result:?}");
         assert!(first_text(&result).contains("Not found"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_remove_catalog_from_learning_path_invalid_uuid_makes_no_request() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let valid = "00000000-0000-0000-0000-000000000001";
+
+        for (p, c) in [("not-a-uuid", valid), (valid, "not-a-uuid")] {
+            let result = server
+                .remove_catalog_from_learning_path(Parameters(
+                    RemoveCatalogFromLearningPathParams {
+                        path_id: p.to_string(),
+                        catalog_id: c.to_string(),
+                    },
+                ))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            assert!(first_text(&result).contains("Invalid UUID"), "{result:?}");
+        }
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2312,6 +2456,99 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(v["catalogs_added"], serde_json::json!([ok_catalog]));
         assert_eq!(v["catalogs_failed"][0]["catalog_id"], bad_catalog);
+    }
+
+    /// When every catalog add succeeds, `catalogs_failed` must be empty, every id must be in
+    /// `catalogs_added` in input order, and the created path's own fields must survive being
+    /// flattened into the response.
+    #[tokio::test]
+    async fn test_create_learning_path_with_catalog_ids_all_succeed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let catalog_1 = "00000000-0000-0000-0000-000000000002";
+        let catalog_2 = "00000000-0000-0000-0000-000000000003";
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": path_id, "name": "Spanish A1", "version": 1
+            })))
+            .mount(&mock_server)
+            .await;
+        for catalog_id in [catalog_1, catalog_2] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/learning-paths/{path_id}/catalogs/{catalog_id}"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(201)
+                        .set_body_json(serde_json::json!({"status": "catalog added"})),
+                )
+                .mount(&mock_server)
+                .await;
+        }
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .create_learning_path(Parameters(CreateLearningPathParams {
+                    name: "Spanish A1".to_string(),
+                    description: None,
+                    catalog_ids: Some(vec![catalog_1.to_string(), catalog_2.to_string()]),
+                }))
+                .await
+                .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = first_text(&result);
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            v["catalogs_added"],
+            serde_json::json!([catalog_1, catalog_2])
+        );
+        assert_eq!(v["catalogs_failed"], serde_json::json!([]));
+        assert_eq!(v["id"], path_id);
+        assert_eq!(v["name"], "Spanish A1");
+        assert_eq!(v["version"], 1);
+    }
+
+    /// Regression guard: `create_learning_path`'s early return after path creation fails must
+    /// keep the add-catalogs loop from ever running — otherwise it would fire
+    /// `POST /learning-paths/{id}/catalogs/{cid}` against a path that doesn't exist.
+    #[tokio::test]
+    async fn test_create_learning_path_with_catalog_ids_creation_failure_adds_nothing() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/learning-paths/.+/catalogs/.+$"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .create_learning_path(Parameters(CreateLearningPathParams {
+                    name: "Spanish A1".to_string(),
+                    description: None,
+                    catalog_ids: Some(vec!["00000000-0000-0000-0000-000000000002".to_string()]),
+                }))
+                .await
+                .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            first_text(&result).contains("Permission denied"),
+            "{result:?}"
+        );
+        // `.expect(0)` on the catalogs mock is verified when mock_server drops.
     }
 
     /// An invalid catalog id is rejected before the path is created, so no empty path leaks.

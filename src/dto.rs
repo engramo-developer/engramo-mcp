@@ -456,6 +456,10 @@ pub struct LearningPathDto {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
     pub version: i32,
 }
 
