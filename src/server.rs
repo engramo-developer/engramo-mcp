@@ -7,7 +7,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, GetPromptRequestParams,
         GetPromptResponse, Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
         PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities, ServerConfig,
     },
     tool, tool_router,
 };
@@ -814,7 +814,7 @@ impl EngramoMcpServer {
 // ── ServerHandler ─────────────────────────────────────────────────────────────
 
 impl ServerHandler for EngramoMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut instructions = String::from(
             "Engramo flashcard assistant. Use catalog and card tools to manage flashcards, \
              learning tools to track spaced-repetition progress, and search to find content. \
@@ -840,7 +840,7 @@ impl ServerHandler for EngramoMcpServer {
                  voice catalog) — this still spends only your own Gemini quota, not EngrAmo's.",
             );
         }
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -853,7 +853,7 @@ impl ServerHandler for EngramoMcpServer {
         // Desktop, Cursor, …) would display this server as "rmcp" / rmcp's own version instead
         // of "engramo-mcp". Override it explicitly with this crate's own build-env values so
         // the identity clients see is actually ours. Do not remove this — it looks redundant
-        // with `ServerInfo::new` but isn't.
+        // with `ServerConfig::new` but isn't.
         .with_server_info(Implementation::new(
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
