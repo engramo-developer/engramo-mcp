@@ -2052,6 +2052,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_catalog_forbidden_visibility_returns_actionable_hint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(serde_json::json!({"error": "Forbidden"})),
+            )
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .update_catalog(Parameters(UpdateCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+                name: None,
+                description: None,
+                tags: None,
+                visibility: Some("public".to_string()),
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = first_text(&result);
+        assert!(text.contains("Permission denied: Forbidden ("), "{text}");
+        assert!(text.contains("unlisted"), "{text}");
+    }
+
+    #[tokio::test]
     async fn test_delete_catalog_forbidden_and_invalid_uuid() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2120,6 +2151,50 @@ mod tests {
             .unwrap();
         assert_eq!(result.is_error, Some(true), "{result:?}");
         assert!(first_text(&result).contains("Not found"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_card_tools_bare_forbidden_returns_actionable_hint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let get_card_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{TEST_ID}")))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(serde_json::json!({"error": "Forbidden"})),
+            )
+            .mount(&get_card_server)
+            .await;
+        let result = mock_server_for(&get_card_server.uri())
+            .get_card(Parameters(GetCardParams {
+                card_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap(); // must be Ok, never Err
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = first_text(&result);
+        assert!(text.starts_with("Permission denied: Forbidden ("), "{text}");
+        assert!(text.contains("may not exist"), "{text}");
+
+        let add_to_learning_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning/cards/{TEST_ID}")))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(serde_json::json!({"error": "Forbidden"})),
+            )
+            .mount(&add_to_learning_server)
+            .await;
+        let result = mock_server_for(&add_to_learning_server.uri())
+            .add_card_to_learning(Parameters(AddCardToLearningParams {
+                card_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = first_text(&result);
+        assert!(text.starts_with("Permission denied: Forbidden ("), "{text}");
+        assert!(text.contains("may not exist"), "{text}");
     }
 
     #[tokio::test]
