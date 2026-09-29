@@ -493,11 +493,14 @@ pub struct CreateLearningPathRequest {
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
-/// A search hit's kind. Only `catalog` and `card` are part of global search — learning
-/// paths are NOT indexed by `/search` (issue #36 clarification). `Other` absorbs any
-/// value the backend adds later (or a casing drift) so one unrecognized hit doesn't fail
-/// the whole array, while keeping the raw wire value visible to the model instead of
-/// collapsing it into an opaque `"unknown"`.
+/// A search hit's kind. `catalog` and `card` have always been part of global search;
+/// newer API versions also return `learning_path` hits (issue #49) once the backend
+/// change ships. `Other` absorbs that value — and any future one, or a casing drift — so
+/// one unrecognized hit doesn't fail the whole array, while keeping the raw wire value
+/// visible to the model instead of collapsing it into an opaque `"unknown"`. This means
+/// `search_global` is already forward-compatible with `item_type: "learning_path"` today,
+/// even before the backend change deploys (see
+/// `test_global_search_result_decodes_learning_path_item_type` below).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchItemType {
@@ -828,6 +831,26 @@ mod tests {
             result.parent_id,
             Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
         );
+    }
+
+    /// Issue #49: once the backend starts returning `item_type: "learning_path"` rows from
+    /// `search_global`, the whole `/search` array must still decode successfully rather than
+    /// failing with a Decode error — the `Other` fallback on `SearchItemType` already covers
+    /// this (see the doc comment above), so this is a targeted regression test for that exact
+    /// row shape.
+    #[test]
+    fn test_global_search_result_decodes_learning_path_item_type() {
+        let json = r#"{"itemType":"learning_path","id":"00000000-0000-0000-0000-000000000001",
+            "title":"Spanish Basics","subtitle":"A short intro path"}"#;
+        let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.item_type,
+            Some(SearchItemType::Other("learning_path".to_string()))
+        );
+        assert_eq!(result.title.as_deref(), Some("Spanish Basics"));
+        // Round-trips back out for the tool's ok_json output.
+        let out = serde_json::to_string(&result).unwrap();
+        assert!(out.contains("\"learning_path\""), "{out}");
     }
 
     #[test]
