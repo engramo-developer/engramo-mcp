@@ -90,7 +90,7 @@ pub struct GenerateCatalogWithCardsParams {
     #[schemars(description = "Optional list of tags")]
     pub tags: Option<Vec<String>>,
     #[schemars(
-        description = "Visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id) (default: 'private')"
+        description = "Visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id) (default: 'private'). Setting 'public' or 'unlisted' may require publish permission — non-moderators can get a permission error."
     )]
     pub visibility: Option<String>,
     /// All cards to create. Each card must follow the same rich-text rules as `generate_card`:

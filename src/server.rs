@@ -227,7 +227,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships)."
+        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships). A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
     )]
     pub async fn get_card(
         &self,
@@ -252,7 +252,8 @@ impl EngramoMcpServer {
         memberships are unknown — call `get_card` first; never send an empty list unless you \
         intend to move the card to the default catalog. If you get a Conflict error, re-fetch and retry. \
         rich_text styling goes under a nested `style` object, e.g. \
-        {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
+        {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
+        A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
     )]
     pub async fn update_card(
         &self,
@@ -338,7 +339,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived; otherwise hard-deleted."
+        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived; otherwise hard-deleted. A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
     )]
     pub async fn delete_card(
         &self,
@@ -401,7 +402,9 @@ impl EngramoMcpServer {
         )
     }
 
-    #[tool(description = "Add a single card to the learning queue. It will appear in due reviews.")]
+    #[tool(
+        description = "Add a single card to the learning queue. It will appear in due reviews. A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
+    )]
     pub async fn add_card_to_learning(
         &self,
         Parameters(p): Parameters<AddCardToLearningParams>,
