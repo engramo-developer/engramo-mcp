@@ -8,8 +8,8 @@ use crate::dto::{
     CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CreateCardRequest, CreateCatalogRequest,
     CreateCatalogWithCardsApiRequest, CreateLearningPathRequest, GlobalSearchResult,
     LearningCardDto, LearningPathDetailDto, LearningPathDto, MediaDto, PagedResponse,
-    PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UploadMediaResponseDto,
-    UsageSummaryDto, UserSubscriptionDto,
+    PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UpdateLearningPathRequest,
+    UploadMediaResponseDto, UsageSummaryDto, UserSubscriptionDto,
 };
 use crate::error::{ApiError, preview, read_bounded};
 
@@ -473,6 +473,32 @@ impl EngramoClient {
             .await
     }
 
+    pub async fn add_catalog_to_learning_path(
+        &self,
+        path_id: Uuid,
+        catalog_id: Uuid,
+    ) -> Result<(), ApiError> {
+        self.post_void(&format!("/learning-paths/{path_id}/catalogs/{catalog_id}"))
+            .await
+    }
+
+    pub async fn remove_catalog_from_learning_path(
+        &self,
+        path_id: Uuid,
+        catalog_id: Uuid,
+    ) -> Result<(), ApiError> {
+        self.delete_ok(&format!("/learning-paths/{path_id}/catalogs/{catalog_id}"))
+            .await
+    }
+
+    pub async fn update_learning_path(
+        &self,
+        path_id: Uuid,
+        req: &UpdateLearningPathRequest,
+    ) -> Result<LearningPathDto, ApiError> {
+        self.patch(&format!("/learning-paths/{path_id}"), req).await
+    }
+
     // ── Search ────────────────────────────────────────────────────────────────
 
     pub async fn search_global(&self, query: &str) -> Result<Vec<GlobalSearchResult>, ApiError> {
@@ -482,6 +508,14 @@ impl EngramoClient {
 
     pub async fn search_catalogs(&self, query: &str) -> Result<Vec<CatalogDto>, ApiError> {
         self.get_with_query("/search/catalogs", &[bounded_param("q", query)?])
+            .await
+    }
+
+    pub async fn search_learning_paths(
+        &self,
+        query: &str,
+    ) -> Result<Vec<LearningPathDto>, ApiError> {
+        self.get_with_query("/search/learning-paths", &[bounded_param("q", query)?])
             .await
     }
 
@@ -1011,6 +1045,27 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
+    #[tokio::test]
+    async fn test_search_learning_paths() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/learning-paths"))
+            .and(query_param("q", "rust & friends"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": mock_id(), "name": "Rust Path", "description": "Learn Rust", "version": 1}
+            ])))
+            .mount(&server)
+            .await;
+
+        let results = client(&server.uri())
+            .search_learning_paths("rust & friends")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Rust Path");
+        assert_eq!(results[0].description.as_deref(), Some("Learn Rust"));
+    }
+
     // ── Learning Paths ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1128,6 +1183,160 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.cursor, Some("abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_success() {
+        let server = MockServer::start().await;
+        let other_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{}/catalogs/{other_id}",
+                mock_id()
+            )))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(json!({"status": "catalog added"})),
+            )
+            .mount(&server)
+            .await;
+
+        client(&server.uri())
+            .add_catalog_to_learning_path(mock_id(), other_id)
+            .await
+            .unwrap();
+        assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_not_found() {
+        let server = MockServer::start().await;
+        let other_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{}/catalogs/{other_id}",
+                mock_id()
+            )))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .add_catalog_to_learning_path(mock_id(), other_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_remove_catalog_from_learning_path_success() {
+        let server = MockServer::start().await;
+        let other_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        Mock::given(method("DELETE"))
+            .and(path(format!(
+                "/learning-paths/{}/catalogs/{other_id}",
+                mock_id()
+            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"status": "catalog removed"})),
+            )
+            .mount(&server)
+            .await;
+
+        client(&server.uri())
+            .remove_catalog_from_learning_path(mock_id(), other_id)
+            .await
+            .unwrap();
+        assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_learning_path_sends_patch_with_version_and_omits_none_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/learning-paths/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "name": "Renamed", "version": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let req = UpdateLearningPathRequest {
+            name: Some("Renamed".to_string()),
+            description: None,
+            tags: None,
+            visibility: None,
+            version: 1,
+        };
+        let result = client(&server.uri())
+            .update_learning_path(mock_id(), &req)
+            .await
+            .unwrap();
+        assert_eq!(result.name, "Renamed");
+        assert_eq!(result.version, 2);
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["name"], "Renamed");
+        assert_eq!(body["version"], 1);
+        assert!(body.get("description").is_none(), "{body}");
+        assert!(body.get("tags").is_none(), "{body}");
+        assert!(body.get("visibility").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_update_learning_path_sends_all_fields_when_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/learning-paths/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "name": "Renamed", "version": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let req = UpdateLearningPathRequest {
+            name: Some("Renamed".to_string()),
+            description: Some("New description".to_string()),
+            tags: Some(vec!["tag1".to_string()]),
+            visibility: Some("public".to_string()),
+            version: 4,
+        };
+        client(&server.uri())
+            .update_learning_path(mock_id(), &req)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["description"], "New description");
+        assert_eq!(body["tags"], json!(["tag1"]));
+        assert_eq!(body["visibility"], "public");
+        assert_eq!(body["version"], 4);
+    }
+
+    #[tokio::test]
+    async fn test_update_learning_path_conflict() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/learning-paths/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+
+        let req = UpdateLearningPathRequest {
+            name: Some("New Name".to_string()),
+            description: None,
+            tags: None,
+            visibility: None,
+            version: 1,
+        };
+        let err = client(&server.uri())
+            .update_learning_path(mock_id(), &req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)));
+        assert!(err.to_string().contains("Fetch the latest version"));
     }
 
     // ── Cards ─────────────────────────────────────────────────────────────────
@@ -2334,6 +2543,7 @@ mod tests {
         let errs = [
             c.search_global(&long).await.unwrap_err(),
             c.search_catalogs(&long).await.unwrap_err(),
+            c.search_learning_paths(&long).await.unwrap_err(),
             c.list_media(Some(&long), None, None).await.unwrap_err(),
         ];
         for err in errs {

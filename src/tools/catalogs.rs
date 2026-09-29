@@ -31,7 +31,7 @@ pub struct UpdateCatalogParams {
     #[schemars(description = "New tags")]
     pub tags: Option<Vec<String>>,
     #[schemars(
-        description = "New visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id)"
+        description = "New visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id). Setting 'public' or 'unlisted' may require publish permission — non-moderators can get a permission error."
     )]
     pub visibility: Option<String>,
     #[schemars(description = "Current version of the catalog (required for optimistic locking)")]
@@ -277,8 +277,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_decode_error_body_values_do_not_reach_logs_via_err_result() {
-        use crate::error::test_support::BufWriter;
+        use crate::error::test_support::{BufWriter, TRACING_CAPTURE_LOCK};
         use rmcp::handler::server::wrapper::Parameters;
+
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime, including across the `.await`s below — a
+        // `tokio::sync::Mutex` guard is fine to hold across an await (unlike a std one,
+        // which clippy rejects).
+        let _lock = TRACING_CAPTURE_LOCK.lock().await;
 
         let buf = BufWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -286,6 +292,11 @@ mod tests {
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
+        // Rebuild so the thread-local subscriber above actually sees the event, even if a
+        // callsite was previously cached as "no subscriber interested" by another test. Safe
+        // now that TRACING_CAPTURE_LOCK guarantees no other capturing subscriber is active
+        // concurrently.
+        tracing::callsite::rebuild_interest_cache();
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))

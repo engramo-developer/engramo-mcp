@@ -51,7 +51,7 @@ pub struct TranslateBatchImportParams {
     #[schemars(description = "Optional catalog tags.")]
     pub tags: Option<Vec<String>>,
     #[schemars(
-        description = "New catalog visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id)."
+        description = "New catalog visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id). Setting 'public' or 'unlisted' may require publish permission — non-moderators can get a permission error."
     )]
     pub visibility: Option<String>,
     #[schemars(

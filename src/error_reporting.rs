@@ -303,6 +303,9 @@ mod tests {
     // covered precisely by the `is_excluded_target` unit tests above).
     #[test]
     fn test_on_event_excluded_target_does_not_panic() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let layer = ErrorReportingLayer::new("test-svc", "1.2.3");
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
@@ -315,6 +318,9 @@ mod tests {
 
     #[test]
     fn test_on_event_own_crate_target_still_emits() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(sub, || {
@@ -446,6 +452,9 @@ mod tests {
 
     #[test]
     fn test_on_event_error_emits_without_panic() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let layer = ErrorReportingLayer::new("test-svc", "1.2.3");
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
@@ -455,6 +464,9 @@ mod tests {
 
     #[test]
     fn test_on_event_warn_is_filtered_out() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let layer = ErrorReportingLayer::new("test-svc", "1.2.3");
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
@@ -464,6 +476,9 @@ mod tests {
 
     #[test]
     fn test_on_event_with_structured_fields_does_not_panic() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let layer = ErrorReportingLayer::new("test-svc", "0.0.0");
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
@@ -474,6 +489,9 @@ mod tests {
     // sensitive field redaction — assert [REDACTED] present, secret absent
     #[test]
     fn test_record_debug_sensitive_field_produces_redacted_marker() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(sub, || {
@@ -496,6 +514,9 @@ mod tests {
     // record_str non-message field — assert field appears in output
     #[test]
     fn test_record_str_non_message_field_appended_to_message() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(sub, || {
@@ -518,6 +539,9 @@ mod tests {
     // record_error via real event — assert Display is used
     #[test]
     fn test_record_error_via_real_event_uses_display() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         use std::fmt;
 
         #[derive(Debug)]
@@ -552,6 +576,9 @@ mod tests {
     // record_error walks source chain
     #[test]
     fn test_record_error_walks_source_chain() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         use std::fmt;
 
         #[derive(Debug)]
@@ -599,6 +626,9 @@ mod tests {
     // UTF-8 safety: truncation at MAX_DEBUG_LEN must not split a multi-byte char
     #[test]
     fn test_record_debug_truncation_respects_char_boundary() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         // 255 ASCII bytes + 'é' (2 bytes) = 257 bytes total; naive [..256] would panic
@@ -617,6 +647,9 @@ mod tests {
     // record_i64 via real event — assert format
     #[test]
     fn test_record_i64_via_event_produces_correct_format() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(sub, || {
@@ -634,6 +667,9 @@ mod tests {
     // record_u64 via real event — assert format
     #[test]
     fn test_record_u64_via_event_produces_correct_format() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(sub, || {
@@ -684,6 +720,9 @@ mod tests {
     // record_i64/u64 sensitive field redaction
     #[test]
     fn test_record_i64_sensitive_field_redacted() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         // `access_token_ttl` contains "token" — a genuinely sensitive int field
@@ -707,6 +746,9 @@ mod tests {
     // Sensitive field redaction via display path
     #[test]
     fn test_sensitive_field_is_redacted_via_display() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         let (layer, captured) = capture_layer();
         let sub = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(sub, || {
@@ -729,6 +771,9 @@ mod tests {
     // location branch — verify Some/Some branch produces a path:line suffix
     #[test]
     fn test_on_event_location_includes_relative_path() {
+        // See `error::test_support::TRACING_CAPTURE_LOCK`: held for the capturing
+        // subscriber's entire lifetime — see that doc comment for why this is needed.
+        let _lock = crate::error::test_support::TRACING_CAPTURE_LOCK.blocking_lock();
         // Verifies the Some/Some branch in on_event executes without panic.
         // Relative workspace paths are kept as-is; absolute paths are trimmed to
         // the last 3 components. The `_ => String::new()` arm is dead code for
