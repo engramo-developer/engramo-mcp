@@ -493,19 +493,18 @@ pub struct CreateLearningPathRequest {
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
-/// A search hit's kind. `catalog` and `card` have always been part of global search;
-/// newer API versions also return `learning_path` hits (issue #49) once the backend
-/// change ships. `Other` absorbs that value — and any future one, or a casing drift — so
-/// one unrecognized hit doesn't fail the whole array, while keeping the raw wire value
-/// visible to the model instead of collapsing it into an opaque `"unknown"`. This means
-/// `search_global` is already forward-compatible with `item_type: "learning_path"` today,
-/// even before the backend change deploys (see
+/// A search hit's kind. `catalog`, `card` and `learning_path` (issue #49) are all
+/// modeled explicitly. `Other` absorbs any future kind, or a casing drift, so one
+/// unrecognized hit doesn't fail the whole array, while keeping the raw wire value
+/// visible to the model instead of collapsing it into an opaque `"unknown"` (see
 /// `test_global_search_result_decodes_learning_path_item_type` below).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchItemType {
     Catalog,
     Card,
+    #[serde(rename = "learning_path")]
+    LearningPath,
     /// Any kind this crate doesn't model yet; the raw wire value is kept for the model.
     #[serde(untagged)]
     Other(String),
@@ -803,14 +802,14 @@ mod tests {
     /// decode to `Other` (preserving the raw wire value) instead of erroring.
     #[test]
     fn test_global_search_result_unknown_item_type_does_not_fail() {
-        let json = r#"{"itemType":"learning_path","id":"00000000-0000-0000-0000-000000000001"}"#;
+        let json = r#"{"itemType":"quiz","id":"00000000-0000-0000-0000-000000000001"}"#;
         let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
         assert_eq!(
             result.item_type,
-            Some(SearchItemType::Other("learning_path".to_string()))
+            Some(SearchItemType::Other("quiz".to_string()))
         );
         let out = serde_json::to_string(&result.item_type).unwrap();
-        assert_eq!(out, "\"learning_path\"");
+        assert_eq!(out, "\"quiz\"");
     }
 
     /// Extra, non-canonical keys alongside the canonical ones (e.g. a stray `name`/`type`
@@ -843,10 +842,7 @@ mod tests {
         let json = r#"{"itemType":"learning_path","id":"00000000-0000-0000-0000-000000000001",
             "title":"Spanish Basics","subtitle":"A short intro path"}"#;
         let result: GlobalSearchResult = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            result.item_type,
-            Some(SearchItemType::Other("learning_path".to_string()))
-        );
+        assert_eq!(result.item_type, Some(SearchItemType::LearningPath));
         assert_eq!(result.title.as_deref(), Some("Spanish Basics"));
         // Round-trips back out for the tool's ok_json output.
         let out = serde_json::to_string(&result).unwrap();
@@ -864,8 +860,12 @@ mod tests {
             "\"card\""
         );
         assert_eq!(
-            serde_json::to_string(&SearchItemType::Other("learning_path".to_string())).unwrap(),
+            serde_json::to_string(&SearchItemType::LearningPath).unwrap(),
             "\"learning_path\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SearchItemType::Other("quiz".to_string())).unwrap(),
+            "\"quiz\""
         );
     }
 
@@ -932,15 +932,12 @@ mod tests {
     fn test_global_search_result_array_with_unknown_item_type_decodes_all_hits() {
         let json = r#"[
             {"itemType":"catalog","id":"00000000-0000-0000-0000-000000000001"},
-            {"itemType":"learning_path","id":"00000000-0000-0000-0000-000000000002"},
+            {"itemType":"quiz","id":"00000000-0000-0000-0000-000000000002"},
             {"itemType":"card","id":"00000000-0000-0000-0000-000000000003"}]"#;
         let v: Vec<GlobalSearchResult> = serde_json::from_str(json).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].item_type, Some(SearchItemType::Catalog));
-        assert_eq!(
-            v[1].item_type,
-            Some(SearchItemType::Other("learning_path".into()))
-        );
+        assert_eq!(v[1].item_type, Some(SearchItemType::Other("quiz".into())));
         assert_eq!(v[2].item_type, Some(SearchItemType::Card));
     }
 

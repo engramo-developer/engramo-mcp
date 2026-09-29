@@ -520,10 +520,12 @@ impl EngramoMcpServer {
     #[tool(
         description = "Searches cards and catalogs (newer API versions also return learning paths \
         with item_type 'learning_path'). To search learning paths specifically, use \
-        search_learning_paths. Each hit has item_type ('catalog', 'card', or a newer value not \
-        listed here), title (the catalog's name, or the card's face text), subtitle (the catalog's \
+        search_learning_paths. Each hit has item_type ('catalog', 'card', 'learning_path', or a \
+        newer value not listed here), title (the catalog's name, or the card's face text), subtitle (the catalog's \
         description, or the card's back text), and parent_id, which for a card hit is its \
-        catalog's UUID (use it directly with get_catalog/list_cards). \
+        catalog's UUID (use it directly with get_catalog/list_cards). For a 'learning_path' hit, \
+        id is the path_id for get_learning_path (title = the path's name, subtitle = its \
+        description). \
         If the user gives you a catalog's short ID (the ~8-character code shown in the app/URL, e.g. \
         \"A7KX9QM2\" — NOT a UUID), search for that exact code here (or with search_catalogs) instead \
         of paginating through list_catalogs — the short ID is indexed for search and matches fast, \
@@ -556,9 +558,12 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Search learning paths by name or description. Use this instead of \
+        description = "Search learning paths by name or description. Returns an array of \
+        {id, name, description, version}; pass `id` as path_id to get_learning_path (to see its \
+        catalogs), activate_learning_path, or deactivate_learning_path. Use this instead of \
         search_global when you specifically want learning paths — search_global may not include \
-        them depending on the API version."
+        them depending on the API version. If this tool reports Not Found for the endpoint \
+        itself (older API), fall back to list_learning_paths."
     )]
     pub async fn search_learning_paths(
         &self,
@@ -1320,6 +1325,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_search_learning_paths_is_registered_on_the_real_server() {
+        // Regression guard for issue #49: the handler tests call the method directly, so assert the
+        // tool is actually reachable through the router a real MCP client sees.
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "search_learning_paths")
+            .expect("search_learning_paths not registered");
+        let description = tool.description.clone().unwrap_or_default();
+        assert!(description.contains("learning paths"), "{description}");
+        assert!(description.contains("search_global"), "{description}");
+        // Input schema is SearchParams — the query field must be exposed.
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(schema.contains("query"), "{schema}");
+    }
+
     #[tokio::test]
     async fn test_upload_media_end_to_end_on_real_server() {
         use wiremock::matchers::{method, path};
@@ -1656,15 +1680,13 @@ mod tests {
         assert!(description.contains("parent_id"), "{description}");
     }
 
-    /// Regression guard for issue #36's description change: `search_global` no longer
-    /// claims to cover learning paths, and points callers at `list_learning_paths`
-    /// instead. Nothing else pins this wording, so the old "cards, catalogs, and
-    /// learning paths" claim could silently come back.
+    /// Regression guard for issue #49's description change: `search_global` now says
+    /// learning paths *may* be included (with item_type 'learning_path') depending on
+    /// API version, and points callers who want them specifically at
+    /// `search_learning_paths`. Nothing else pins this wording, so that pointer could
+    /// silently disappear.
     #[test]
-    fn test_search_global_description_excludes_learning_paths() {
-        // issue #36: the description must not unconditionally promise learning paths are
-        // searched by search_global — it must point callers who want them specifically at
-        // search_learning_paths instead (issue #49).
+    fn test_search_global_description_points_at_search_learning_paths() {
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, false);
         let tools = server.tool_router.list_all();
@@ -1676,10 +1698,6 @@ mod tests {
         );
         assert!(
             !description.contains("cards, catalogs, and learning paths"),
-            "{description}"
-        );
-        assert!(
-            !description.contains("Searches cards, catalogs, and learning paths"),
             "{description}"
         );
     }
