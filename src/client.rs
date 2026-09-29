@@ -511,6 +511,14 @@ impl EngramoClient {
             .await
     }
 
+    pub async fn search_learning_paths(
+        &self,
+        query: &str,
+    ) -> Result<Vec<LearningPathDto>, ApiError> {
+        self.get_with_query("/search/learning-paths", &[bounded_param("q", query)?])
+            .await
+    }
+
     // ── Media ─────────────────────────────────────────────────────────────────
 
     pub async fn list_media(
@@ -1035,6 +1043,27 @@ mod tests {
 
         let results = client(&server.uri()).search_catalogs("rust").await.unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_learning_paths() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/learning-paths"))
+            .and(query_param("q", "rust & friends"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": mock_id(), "name": "Rust Path", "description": "Learn Rust", "version": 1}
+            ])))
+            .mount(&server)
+            .await;
+
+        let results = client(&server.uri())
+            .search_learning_paths("rust & friends")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Rust Path");
+        assert_eq!(results[0].description.as_deref(), Some("Learn Rust"));
     }
 
     // ── Learning Paths ────────────────────────────────────────────────────────
@@ -2514,6 +2543,7 @@ mod tests {
         let errs = [
             c.search_global(&long).await.unwrap_err(),
             c.search_catalogs(&long).await.unwrap_err(),
+            c.search_learning_paths(&long).await.unwrap_err(),
             c.list_media(Some(&long), None, None).await.unwrap_err(),
         ];
         for err in errs {

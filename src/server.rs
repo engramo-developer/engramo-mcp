@@ -674,11 +674,14 @@ impl EngramoMcpServer {
 #[tool_router(router = search_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "Search across cards and catalogs (learning paths are NOT included — use \
-        list_learning_paths/get_learning_path for those). Each hit has item_type ('catalog' or \
-        'card'), title (the catalog's name, or the card's face text), subtitle (the catalog's \
+        description = "Searches cards and catalogs (newer API versions also return learning paths \
+        with item_type 'learning_path'). To search learning paths specifically, use \
+        search_learning_paths. Each hit has item_type ('catalog', 'card', 'learning_path', or a \
+        newer value not listed here), title (the catalog's name, or the card's face text), subtitle (the catalog's \
         description, or the card's back text), and parent_id, which for a card hit is its \
-        catalog's UUID (use it directly with get_catalog/list_cards). \
+        catalog's UUID (use it directly with get_catalog/list_cards). For a 'learning_path' hit, \
+        id is the path_id for get_learning_path (title = the path's name, subtitle = its \
+        description). \
         If the user gives you a catalog's short ID (the ~8-character code shown in the app/URL, e.g. \
         \"A7KX9QM2\" — NOT a UUID), search for that exact code here (or with search_catalogs) instead \
         of paginating through list_catalogs — the short ID is indexed for search and matches fast, \
@@ -705,6 +708,24 @@ impl EngramoMcpServer {
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(match self.client.search_catalogs(&p.query).await {
+            Ok(results) => ok_json(&results),
+            Err(e) => err_result(e),
+        })
+    }
+
+    #[tool(
+        description = "Search learning paths by name or description. Returns an array of \
+        {id, name, description, version}; pass `id` as path_id to get_learning_path (to see its \
+        catalogs), activate_learning_path, or deactivate_learning_path. Use this instead of \
+        search_global when you specifically want learning paths — search_global may not include \
+        them depending on the API version. If this tool reports Not Found for the endpoint \
+        itself (older API), fall back to list_learning_paths."
+    )]
+    pub async fn search_learning_paths(
+        &self,
+        Parameters(p): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(match self.client.search_learning_paths(&p.query).await {
             Ok(results) => ok_json(&results),
             Err(e) => err_result(e),
         })
@@ -1483,6 +1504,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_search_learning_paths_is_registered_on_the_real_server() {
+        // Regression guard for issue #49: the handler tests call the method directly, so assert the
+        // tool is actually reachable through the router a real MCP client sees.
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "search_learning_paths")
+            .expect("search_learning_paths not registered");
+        let description = tool.description.clone().unwrap_or_default();
+        assert!(description.contains("learning paths"), "{description}");
+        assert!(description.contains("search_global"), "{description}");
+        // Input schema is SearchParams — the query field must be exposed.
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(schema.contains("query"), "{schema}");
+    }
+
     #[tokio::test]
     async fn test_upload_media_end_to_end_on_real_server() {
         use wiremock::matchers::{method, path};
@@ -1819,22 +1859,22 @@ mod tests {
         assert!(description.contains("parent_id"), "{description}");
     }
 
-    /// Regression guard for issue #36's description change: `search_global` no longer
-    /// claims to cover learning paths, and points callers at `list_learning_paths`
-    /// instead. Nothing else pins this wording, so the old "cards, catalogs, and
-    /// learning paths" claim could silently come back.
+    /// Regression guard for issue #49's description change: `search_global` now says
+    /// learning paths *may* be included (with item_type 'learning_path') depending on
+    /// API version, and points callers who want them specifically at
+    /// `search_learning_paths`. Nothing else pins this wording, so that pointer could
+    /// silently disappear.
     #[test]
-    fn test_search_global_description_excludes_learning_paths() {
+    fn test_search_global_description_points_at_search_learning_paths() {
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, false);
         let tools = server.tool_router.list_all();
         let tool = tools.iter().find(|t| t.name == "search_global").unwrap();
         let description = tool.description.clone().unwrap_or_default();
         assert!(
-            description.contains("learning paths are NOT included"),
+            description.contains("search_learning_paths"),
             "{description}"
         );
-        assert!(description.contains("list_learning_paths"), "{description}");
         assert!(
             !description.contains("cards, catalogs, and learning paths"),
             "{description}"
@@ -1956,6 +1996,96 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
         assert_eq!(v[0]["id"], catalog_id);
         assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
+    /// issue #49: drives the `search_learning_paths` tool handler's success arm against
+    /// `GET /search/learning-paths`.
+    #[tokio::test]
+    async fn test_search_learning_paths_ok_returns_learning_path_json() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("GET"))
+            .and(path("/search/learning-paths"))
+            .and(query_param("q", "spanish"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": path_id,
+                    "name": "Spanish Basics",
+                    "description": "Beginner path",
+                    "version": 1
+                }])),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .search_learning_paths(Parameters(SearchParams {
+                query: "spanish".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v[0]["id"], path_id);
+        assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
+    /// issue #49: drives the `search_learning_paths` tool handler's error arm — mirrors
+    /// `test_search_global_unauthorized_returns_error` / `test_search_catalogs_unauthorized_returns_error`.
+    #[tokio::test]
+    async fn test_search_learning_paths_unauthorized_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/learning-paths"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .search_learning_paths(Parameters(SearchParams {
+                query: "spanish".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Unauthorized"), "{result:?}");
+    }
+
+    /// issue #49: the same oversized-query contract as `search_global` (finding F2) — an
+    /// over-long `q` must surface as `is_error: true`, never a raw `Err`, and never reach the
+    /// backend.
+    #[tokio::test]
+    async fn test_search_learning_paths_oversized_query_returns_is_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/learning-paths"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let long_query = "a".repeat(513);
+        let result = server
+            .search_learning_paths(Parameters(SearchParams { query: long_query }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("too long"), "{result:?}");
     }
 
     #[tokio::test]
