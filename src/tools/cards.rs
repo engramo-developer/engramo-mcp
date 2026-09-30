@@ -12,6 +12,15 @@ use crate::client::EngramoClient;
 use crate::dto::{CardContent, UpdateCardRequest};
 use crate::tools::catalogs::{err_result, ok_json, ok_text, parse_uuid};
 
+/// `update_card`'s `catalog_ids` is REQUIRED and must be non-empty: the underlying API accepts
+/// `catalogIds: []` without error and silently moves the card into the user's default catalog
+/// ("My Catalog") instead of removing it from every catalog (see engramo-mcp#64). Reject an
+/// empty list here, before any HTTP call, rather than forwarding it.
+pub(crate) const EMPTY_CATALOG_IDS_ERROR: &str = "catalog_ids must contain at least one catalog \
+    UUID — a card must belong to at least one catalog. Build the list from the `catalogs[].id` \
+    values in `get_card`/`list_cards`, plus/minus any intended changes; an empty list would \
+    silently move the card to your default catalog instead of removing it from every catalog.";
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListCardsParams {
     #[schemars(description = "UUID of the catalog to list cards from")]
@@ -44,10 +53,11 @@ pub struct UpdateCardParams {
     #[schemars(
         description = "Catalog UUIDs this card should belong to — REPLACES the memberships you \
         can see. Start from `catalogs[].id` in `get_card`/`list_cards` (which lists only \
-        catalogs visible to you), then add/remove as intended; an empty list moves the card to \
-        your default catalog. If the card JSON has no `catalogs` key, its memberships are \
-        unknown — call `get_card` first; never send an empty list unless you intend to move \
-        the card to the default catalog."
+        catalogs visible to you), then add/remove as intended. Must contain at least one UUID — \
+        a card must belong to at least one catalog, so an empty list is rejected (it is NOT a \
+        way to remove the card from all catalogs; the API would otherwise silently move it to \
+        your default catalog). If the card JSON has no `catalogs` key, its memberships are \
+        unknown — call `get_card` first."
     )]
     pub catalog_ids: Vec<String>,
     #[schemars(description = "Card order number within the catalog")]
@@ -121,10 +131,10 @@ impl CardTools {
         Requires the current version for optimistic locking — fetch the card first. \
         `catalog_ids` REPLACES the memberships you can see, so build it from the \
         `catalogs[].id` values in `get_card` or `list_cards`'s response (which lists only \
-        catalogs visible to you) plus/minus any intended changes — an empty list moves the \
-        card to the user's default catalog. If the card JSON has no `catalogs` key, its \
-        memberships are unknown — call `get_card` first; never send an empty list unless you \
-        intend to move the card to the default catalog. If you get a Conflict error, re-fetch and retry. \
+        catalogs visible to you) plus/minus any intended changes. Must contain at least one \
+        UUID — an empty list is rejected, since the API would otherwise silently move the card \
+        to the user's default catalog. If the card JSON has no `catalogs` key, its memberships \
+        are unknown — call `get_card` first. If you get a Conflict error, re-fetch and retry. \
         rich_text styling goes under a nested `style` object, e.g. \
         {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
@@ -136,6 +146,9 @@ impl CardTools {
             Ok(id) => id,
             Err(e) => return Ok(err_result(e)),
         };
+        if p.catalog_ids.is_empty() {
+            return Ok(err_result(EMPTY_CATALOG_IDS_ERROR));
+        }
         let catalog_ids: Result<Vec<Uuid>, _> =
             p.catalog_ids.iter().map(|s| parse_uuid(s)).collect();
         let catalog_ids = match catalog_ids {
@@ -562,19 +575,55 @@ mod tests {
         assert!(text.contains("deleted"), "{text}");
     }
 
-    /// Regression for F15: an empty `catalog_ids` list must be accepted (not rejected by
-    /// the parse/collect step) and forwarded as `"catalogIds": []` — the tool description
-    /// says this moves the card to the user's default catalog.
+    /// Regression for issue #64: an empty `catalog_ids` list must be rejected with a clear
+    /// validation error and NOT forwarded to the API — the API accepts `"catalogIds": []`
+    /// silently and moves the card into the user's default catalog ("My Catalog") instead of
+    /// removing it from every catalog.
     #[tokio::test]
-    async fn test_card_tools_update_card_empty_catalog_ids_forwarded_as_empty_array() {
-        use wiremock::matchers::body_partial_json;
+    async fn test_card_tools_update_card_empty_catalog_ids_rejected_without_http_call() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path(format!("/cards/{}", mock_id())))
-            .and(body_partial_json(json!({"catalogIds": []})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": mock_id(), "version": 2, "face": {"text": "Q"}, "back": {"text": "A"},
                 "catalogs": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let r = make_tools(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id: mock_id().to_string(),
+                face: None,
+                back: None,
+                catalog_ids: vec![],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(r.is_error.unwrap_or(false), "{r:?}");
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("at least one catalog"), "{text}");
+    }
+
+    /// A non-empty `catalog_ids` list still updates memberships normally.
+    #[tokio::test]
+    async fn test_card_tools_update_card_nonempty_catalog_ids_still_works() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{}", mock_id())))
+            .and(body_partial_json(json!({"catalogIds": [catalog_id]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "version": 2, "face": {"text": "Q"}, "back": {"text": "A"},
+                "catalogs": [{"id": catalog_id, "name": "Spanish"}]
             })))
             .expect(1)
             .mount(&server)
@@ -584,7 +633,7 @@ mod tests {
                 card_id: mock_id().to_string(),
                 face: None,
                 back: None,
-                catalog_ids: vec![],
+                catalog_ids: vec![catalog_id.to_string()],
                 order_number: 1,
                 version: 1,
             }))
