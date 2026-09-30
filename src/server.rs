@@ -1488,6 +1488,32 @@ mod tests {
     }
 
     #[test]
+    fn test_catalog_visibility_params_document_unlisted_on_the_real_server() {
+        // Regression guard for #61: `update_catalog`'s and `generate_catalog_with_cards`'s
+        // `visibility` params must list all three values the API accepts — including
+        // `unlisted` — and note the role limit, not just say "'public' or 'private'".
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+
+        for name in ["update_catalog", "generate_catalog_with_cards"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let schema = serde_json::to_string(&tool.input_schema)
+                .unwrap_or_else(|_| panic!("{name} input schema serializes"));
+            assert!(schema.contains("unlisted"), "{name}: {schema}");
+            assert!(schema.contains("public"), "{name}: {schema}");
+            assert!(schema.contains("private"), "{name}: {schema}");
+            assert!(
+                schema.contains("permission") || schema.contains("role"),
+                "{name}: {schema}"
+            );
+        }
+    }
+
+    #[test]
     fn test_search_tools_describe_short_id_resolution_on_the_real_server() {
         // Assert against the tools actually registered on EngramoMcpServer (search_tools_router).
         let client = EngramoClient::new("http://localhost", "engramo_test");
