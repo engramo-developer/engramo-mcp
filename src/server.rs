@@ -2977,6 +2977,64 @@ mod tests {
         assert!(first_text(&result).contains("Not found"), "{result:?}");
     }
 
+    /// Regression test for issue #63: `get_learning_path` must return `tags` and `visibility`
+    /// like `list_learning_paths`/`search_learning_paths`/`update_learning_path` already do,
+    /// so an agent can see the path's current values before calling `update_learning_path`.
+    #[tokio::test]
+    async fn test_get_learning_path_includes_tags_and_visibility() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "Spanish A1", "description": null, "version": 1,
+                "tags": ["mcp-test"], "visibility": "private", "catalogs": []
+            })))
+            .mount(&mock_server)
+            .await;
+        let result = mock_server_for(&mock_server.uri())
+            .get_learning_path(Parameters(GetLearningPathParams {
+                path_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = first_text(&result);
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["tags"], serde_json::json!(["mcp-test"]), "{text}");
+        assert_eq!(v["visibility"], "private", "{text}");
+    }
+
+    /// `tags`/`visibility` must stay optional: an older backend (or any response that omits
+    /// them) still decodes and the tool call still succeeds.
+    #[tokio::test]
+    async fn test_get_learning_path_without_tags_and_visibility_still_decodes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "Spanish A1", "description": null, "version": 1
+            })))
+            .mount(&mock_server)
+            .await;
+        let result = mock_server_for(&mock_server.uri())
+            .get_learning_path(Parameters(GetLearningPathParams {
+                path_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = first_text(&result);
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(v.get("tags").is_none(), "{text}");
+        assert!(v.get("visibility").is_none(), "{text}");
+    }
+
     #[tokio::test]
     async fn test_activate_learning_path_ok_and_invalid_uuid() {
         use wiremock::matchers::{method, path};
