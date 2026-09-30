@@ -543,8 +543,9 @@ doesn't fail the whole call.
 
 **Limits.** Up to 20 cards per `generate_card_audio` call, up to 500 characters of face text per
 card (longer cards are skipped, not truncated). Cards that already have face audio are skipped
-unless you pass `overwrite: true`, in which case the previous audio becomes unreferenced and is
-cleaned up server-side. Call `list_tts_voices` first to see the configured model and voice catalog.
+unless you pass `overwrite: true`, in which case the previous audio is **not** deleted — it stays
+in your EngrAmo media storage and keeps showing up in `list_media`. Call `list_tts_voices` first
+to see the configured model and voice catalog.
 
 **Getting a key.** Create one for free at [Google AI Studio](https://aistudio.google.com/apikey).
 

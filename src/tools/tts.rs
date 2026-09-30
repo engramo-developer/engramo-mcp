@@ -68,8 +68,8 @@ pub struct GenerateCardAudioParams {
     pub lang: Option<String>,
     #[schemars(
         description = "When true, replace a card's existing face audio instead of skipping it. \
-        Default false. The previous audio asset becomes unreferenced and is cleaned up \
-        server-side."
+        Default false. The previous audio asset is NOT deleted — it remains in your EngrAmo \
+        media storage and will keep showing up in list_media."
     )]
     pub overwrite: Option<bool>,
 }
@@ -506,8 +506,9 @@ impl EngramoMcpServer {
         it to your EngrAmo media, and attach it to each card. Uses YOUR OWN locally-configured \
         TTS key (ENGRAMO_TTS_GEMINI_API_KEYS) — this spends your own Gemini quota, never \
         EngrAmo's paid AI. Cards that already have face audio are skipped unless overwrite is \
-        true, in which case the previous audio asset becomes unused and is cleaned up \
-        server-side. Cards with empty face text, face text over 500 characters, or no catalog \
+        true, in which case the previous audio asset is NOT deleted — it remains in your \
+        EngrAmo media storage and will keep showing up in list_media. Cards with empty face \
+        text, face text over 500 characters, or no catalog \
         membership are skipped/failed without spending any quota. Partial failure across a \
         batch is normal — check each entry in `results` rather than assuming the whole call \
         succeeded or failed together. Use list_tts_voices first to see available voices and \
