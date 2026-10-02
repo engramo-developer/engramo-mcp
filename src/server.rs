@@ -1501,15 +1501,17 @@ mod tests {
                 .iter()
                 .find(|t| t.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let schema = serde_json::to_string(&tool.input_schema)
-                .unwrap_or_else(|_| panic!("{name} input schema serializes"));
-            assert!(schema.contains("unlisted"), "{name}: {schema}");
-            assert!(schema.contains("public"), "{name}: {schema}");
-            assert!(schema.contains("private"), "{name}: {schema}");
-            assert!(
-                schema.contains("permission") || schema.contains("role"),
-                "{name}: {schema}"
-            );
+            let description = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("visibility"))
+                .and_then(|v| v.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name}: visibility param has no description"));
+            for value in ["'public'", "'private'", "'unlisted'"] {
+                assert!(description.contains(value), "{name}: {description}");
+            }
+            assert!(description.contains("permission"), "{name}: {description}");
         }
     }
 
@@ -2740,6 +2742,38 @@ mod tests {
 
     fn mock_server_for(uri: &str) -> EngramoMcpServer {
         EngramoMcpServer::new(EngramoClient::new(uri, "engramo_test"), false)
+    }
+
+    #[tokio::test]
+    async fn test_update_catalog_forwards_unlisted_visibility_on_wire() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .and(body_partial_json(
+                serde_json::json!({"visibility": "unlisted", "version": 1}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "X", "version": 2, "visibility": "unlisted"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .update_catalog(Parameters(UpdateCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+                name: None,
+                description: None,
+                tags: None,
+                visibility: Some("unlisted".to_string()),
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
     }
 
     #[tokio::test]
