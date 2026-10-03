@@ -664,12 +664,22 @@ impl EngramoMcpServer {
                 Ok(()) => ok_text("Catalog removed from learning path."),
                 // The backend 404s both for a missing path and for a catalog that isn't in
                 // the path, with no reliable way to tell them apart from the body. Probe the
-                // path: if it exists, the catalog simply wasn't a member (idempotent no-op);
-                // otherwise surface the original error (#72, #62).
+                // path: only if it is readable AND does not list the catalog was the catalog
+                // simply not a member (idempotent no-op); otherwise surface the original
+                // error (#72, #62).
                 Err(ApiError::NotFound(msg)) => {
                     match self.client.get_learning_path(path_id).await {
-                        Ok(_) => ok_text("Catalog was not in learning path."),
-                        Err(_) => err_result(ApiError::NotFound(msg)),
+                        Ok(lp)
+                            if !lp
+                                .catalogs
+                                .as_deref()
+                                .unwrap_or_default()
+                                .iter()
+                                .any(|c| c.id == catalog_id) =>
+                        {
+                            ok_text("Catalog was not in learning path.")
+                        }
+                        _ => err_result(ApiError::NotFound(msg)),
                     }
                 }
                 Err(e) => err_result(e),
@@ -2962,6 +2972,13 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&missing)
             .await;
+        // The path probe also 404s, so the original Not found is surfaced.
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{path_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&missing)
+            .await;
         let result =
             EngramoMcpServer::new(EngramoClient::new(missing.uri(), "engramo_test"), false)
                 .remove_catalog_from_learning_path(Parameters(
@@ -2998,6 +3015,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": path_id, "name": "P", "version": 1
             })))
+            .expect(2)
             .mount(&mock_server)
             .await;
         let server =
@@ -3028,10 +3046,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "error": "Learning path not found"
             })))
+            .expect(1)
             .mount(&mock_server)
             .await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(404))
+            .expect(1)
             .mount(&mock_server)
             .await;
         let result =
@@ -3048,6 +3068,116 @@ mod tests {
         let text = first_text(&result);
         assert!(text.contains("Not found"), "{text}");
         assert!(text.contains("Learning path not found"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_remove_catalog_from_learning_path_still_member_stays_not_found() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let catalog_id = "00000000-0000-0000-0000-000000000002";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": path_id, "name": "P", "version": 1,
+                "catalogs": [{"id": catalog_id, "name": "C", "version": 1}]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .remove_catalog_from_learning_path(Parameters(
+                    RemoveCatalogFromLearningPathParams {
+                        path_id: path_id.to_string(),
+                        catalog_id: catalog_id.to_string(),
+                    },
+                ))
+                .await
+                .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Not found"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_remove_catalog_from_learning_path_non_not_found_error_skips_probe() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, needle) in [(403u16, "Permission denied"), (500, "")] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "00000000-0000-0000-0000-000000000001", "name": "P", "version": 1
+                })))
+                .expect(0)
+                .mount(&mock_server)
+                .await;
+            let result =
+                EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                    .remove_catalog_from_learning_path(Parameters(
+                        RemoveCatalogFromLearningPathParams {
+                            path_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                            catalog_id: "00000000-0000-0000-0000-000000000002".to_string(),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            assert_eq!(result.is_error, Some(true), "{status}: {result:?}");
+            assert!(first_text(&result).contains(needle), "{status}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_catalog_from_learning_path_probe_error_surfaces_original_not_found() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for probe_status in [403u16, 500] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "Learning path not found"
+                })))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(probe_status))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+            let result =
+                EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                    .remove_catalog_from_learning_path(Parameters(
+                        RemoveCatalogFromLearningPathParams {
+                            path_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                            catalog_id: "00000000-0000-0000-0000-000000000002".to_string(),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            assert_eq!(result.is_error, Some(true), "{probe_status}: {result:?}");
+            let text = first_text(&result);
+            assert!(text.contains("Not found"), "{probe_status}: {text}");
+            assert!(
+                text.contains("Learning path not found"),
+                "{probe_status}: {text}"
+            );
+            assert!(
+                !text.contains("Permission denied"),
+                "{probe_status}: {text}"
+            );
+        }
     }
 
     #[test]
