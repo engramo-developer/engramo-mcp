@@ -205,6 +205,12 @@ Run a reviewer pass with `feedback_path=<CACHE_DIR>/final.md` and `iteration=fin
 - TOTAL == 0 → outcome = `clean`.
 - Otherwise → outcome = `residual-blocked` (the fixes introduced new findings).
 
+**Docs-only residuals bypass `MAX_ITERATIONS`.** If every unchecked finding in `final.md` is documentation-only —
+the fix touches only `///`/`//` comments or Markdown, with **no code change at all** (no identifiers, logic, tests,
+or `Cargo.toml`) — run one extra `code-implementator` pass on `final.md` even when `IMPL_ITER >= MAX_ITERATIONS`.
+Do not increment `IMPL_ITER` or re-run reviewers afterwards; Step 4 confirms the result. If any finding needs a code
+change, this rule does not apply: the outcome stays `residual-blocked`. Report the extra pass in the Final Report.
+
 ### Step 4 — Orchestrator gate (only if an implementator pass changed files)
 
 Confirm the end state yourself, mirroring CI's format check:

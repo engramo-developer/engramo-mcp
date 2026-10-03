@@ -68,8 +68,9 @@ pub struct GenerateCardAudioParams {
     pub lang: Option<String>,
     #[schemars(
         description = "When true, replace a card's existing face audio instead of skipping it. \
-        Default false. The previous audio asset becomes unreferenced and is cleaned up \
-        server-side."
+        Default false. The previous audio asset is NOT deleted — it remains in your EngrAmo \
+        media storage and will keep showing up in list_media. Its id is returned as \
+        replaced_media_id on the corresponding result entry so it can be tracked or cleaned up."
     )]
     pub overwrite: Option<bool>,
 }
@@ -89,6 +90,11 @@ struct CardAudioResult {
     status: CardAudioStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     media_id: Option<Uuid>,
+    /// The id of the previous face audio asset that `overwrite: true` replaced, if any. Not
+    /// deleted server-side (see `GenerateCardAudioParams::overwrite`'s doc comment) — surfaced
+    /// here so a caller who wants to track or clean up orphaned assets can do so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replaced_media_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,11 +102,17 @@ struct CardAudioResult {
 }
 
 impl CardAudioResult {
-    fn generated(card_id: Uuid, media_id: Uuid, bytes: usize) -> Self {
+    fn generated(
+        card_id: Uuid,
+        media_id: Uuid,
+        bytes: usize,
+        replaced_media_id: Option<Uuid>,
+    ) -> Self {
         Self {
             card_id,
             status: CardAudioStatus::Generated,
             media_id: Some(media_id),
+            replaced_media_id,
             bytes: Some(bytes),
             reason: None,
         }
@@ -111,6 +123,7 @@ impl CardAudioResult {
             card_id,
             status: CardAudioStatus::Skipped,
             media_id: None,
+            replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
         }
@@ -121,6 +134,7 @@ impl CardAudioResult {
             card_id,
             status: CardAudioStatus::Skipped,
             media_id: Some(media_id),
+            replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
         }
@@ -131,6 +145,7 @@ impl CardAudioResult {
             card_id,
             status: CardAudioStatus::Failed,
             media_id: None,
+            replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
         }
@@ -141,6 +156,7 @@ impl CardAudioResult {
             card_id,
             status: CardAudioStatus::Failed,
             media_id: Some(media_id),
+            replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
         }
@@ -168,6 +184,10 @@ struct ParsedCard {
     catalog_ids: Vec<Uuid>,
     face: serde_json::Map<String, serde_json::Value>,
     has_audio: bool,
+    /// `face.audioId` parsed as a `Uuid`, when present and well-formed — `None` if absent, null,
+    /// or not a valid UUID (a malformed id here doesn't fail parsing; `has_audio` is still driven
+    /// by presence/non-null alone so the overwrite gate behaves the same as before).
+    previous_audio_id: Option<Uuid>,
     text: String,
 }
 
@@ -214,6 +234,10 @@ fn parse_card_shape(raw: &serde_json::Value) -> Result<ParsedCard, String> {
         .unwrap_or("")
         .to_string();
     let has_audio = face.get("audioId").is_some_and(|v| !v.is_null());
+    let previous_audio_id = face
+        .get("audioId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     Ok(ParsedCard {
         version,
@@ -221,6 +245,7 @@ fn parse_card_shape(raw: &serde_json::Value) -> Result<ParsedCard, String> {
         catalog_ids,
         face,
         has_audio,
+        previous_audio_id,
         text,
     })
 }
@@ -274,6 +299,7 @@ async fn attach_media(
     bytes: usize,
     overwrite: bool,
 ) -> CardAudioResult {
+    let previous_audio_id = parsed.previous_audio_id;
     let mut face = parsed.face;
     set_audio_id(&mut face, media_id);
     let body = build_patch_body(
@@ -284,7 +310,7 @@ async fn attach_media(
     );
 
     match client.patch_card_raw(card_id, &body).await {
-        Ok(_) => CardAudioResult::generated(card_id, media_id, bytes),
+        Ok(_) => CardAudioResult::generated(card_id, media_id, bytes, previous_audio_id),
         Err(ApiError::Conflict(_)) => {
             let raw = match client.get_card_raw(card_id).await {
                 Ok(v) => v,
@@ -337,6 +363,7 @@ async fn attach_media(
                     media_id,
                 );
             }
+            let refreshed_previous_audio_id = refreshed.previous_audio_id;
             let mut refreshed_face = refreshed.face;
             set_audio_id(&mut refreshed_face, media_id);
             let retry_body = build_patch_body(
@@ -346,7 +373,12 @@ async fn attach_media(
                 &refreshed_face,
             );
             match client.patch_card_raw(card_id, &retry_body).await {
-                Ok(_) => CardAudioResult::generated(card_id, media_id, bytes),
+                Ok(_) => CardAudioResult::generated(
+                    card_id,
+                    media_id,
+                    bytes,
+                    refreshed_previous_audio_id,
+                ),
                 Err(e) => CardAudioResult::failed_with_media(
                     card_id,
                     format!(
@@ -506,8 +538,10 @@ impl EngramoMcpServer {
         it to your EngrAmo media, and attach it to each card. Uses YOUR OWN locally-configured \
         TTS key (ENGRAMO_TTS_GEMINI_API_KEYS) — this spends your own Gemini quota, never \
         EngrAmo's paid AI. Cards that already have face audio are skipped unless overwrite is \
-        true, in which case the previous audio asset becomes unused and is cleaned up \
-        server-side. Cards with empty face text, face text over 500 characters, or no catalog \
+        true, in which case the previous audio asset is NOT deleted — it remains in your \
+        EngrAmo media storage and will keep showing up in list_media; its id is returned as \
+        replaced_media_id on that card's result entry. Cards with empty face \
+        text, face text over 500 characters, or no catalog \
         membership are skipped/failed without spending any quota. Partial failure across a \
         batch is normal — check each entry in `results` rather than assuming the whole call \
         succeeded or failed together. Use list_tts_voices first to see available voices and \
@@ -1035,6 +1069,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_card_audio_overwrite_true_does_not_delete_previous_media() {
+        let server = MockServer::start().await;
+        let card_id = Uuid::new_v4();
+        let cat = Uuid::new_v4();
+        let existing_media = Uuid::new_v4();
+        let new_media = Uuid::new_v4();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_id,
+                1,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": existing_media}),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "media_ids": {"ids": [new_media]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "face": {"audioId": new_media}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_id,
+                2,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": new_media}),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Overwrite must never delete the old asset — assert no DELETE reaches the media API.
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let srv = server_with_engine(&server.uri(), Arc::new(FakeTtsEngine::new()));
+        let result = srv
+            .generate_card_audio(Parameters(GenerateCardAudioParams {
+                card_ids: vec![card_id.to_string()],
+                voice: None,
+                lang: None,
+                overwrite: Some(true),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result_text(&result);
+        assert!(text.contains("\"generated\": 1"), "{text}");
+        assert!(text.contains(&new_media.to_string()), "{text}");
+        assert!(
+            text.contains(&format!("\"replaced_media_id\": \"{existing_media}\"")),
+            "{text}"
+        );
+        assert!(!text.contains("error"), "{text}");
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn test_generate_card_audio_empty_and_overlong_text_are_skipped_without_synth() {
         let server = MockServer::start().await;
         let empty_card = Uuid::new_v4();
@@ -1551,6 +1656,11 @@ mod tests {
             .unwrap();
         let text = result_text(&result);
         assert!(text.contains("\"generated\": 1"), "{text}");
+        assert!(
+            text.contains(&format!("\"replaced_media_id\": \"{other_old_media}\"")),
+            "retry must report the re-fetched audioId as replaced: {text}"
+        );
+        assert!(!text.contains(&old_media.to_string()), "{text}");
         assert_eq!(engine.call_count(), 1, "synthesis must happen exactly once");
 
         let requests = server.received_requests().await.unwrap();
