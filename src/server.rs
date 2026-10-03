@@ -232,7 +232,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships). A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
+        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships). A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn get_card(
         &self,
@@ -258,7 +258,7 @@ impl EngramoMcpServer {
         are unknown — call `get_card` first. If you get a Conflict error, re-fetch and retry. \
         rich_text styling goes under a nested `style` object, e.g. \
         {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
-        A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
+        A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn update_card(
         &self,
@@ -355,7 +355,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived; otherwise hard-deleted. A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
+        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived; otherwise hard-deleted. A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn delete_card(
         &self,
@@ -419,7 +419,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Add a single card to the learning queue. It will appear in due reviews. A card_id that doesn't exist or belongs to another user is reported as a permission error, not \"not found\"."
+        description = "Add a single card to the learning queue. It will appear in due reviews. A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn add_card_to_learning(
         &self,
@@ -3494,6 +3494,160 @@ mod tests {
         let text = first_text(&result);
         assert!(text.starts_with("Permission denied: Forbidden ("), "{text}");
         assert!(text.contains("may not exist"), "{text}");
+    }
+
+    #[test]
+    fn test_card_tool_descriptions_report_not_found_and_permission_on_the_real_server() {
+        // Regression guard for #73: the stale claim that a missing card is reported as a
+        // permission error "not \"not found\"" must be gone; a 404 is "Not found".
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        for name in [
+            "get_card",
+            "update_card",
+            "delete_card",
+            "add_card_to_learning",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let description = tool.description.as_deref().unwrap_or("");
+            assert!(
+                !description.contains("not \"not found\""),
+                "{name}: {description}"
+            );
+            assert!(
+                description.contains("\"Not found\""),
+                "{name}: {description}"
+            );
+            assert!(
+                description.contains("permission error"),
+                "{name}: {description}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_card_and_catalog_mutators_map_404_to_not_found_and_403_to_permission() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [404u16, 403] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/cards/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(format!("/cards/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path(format!("/catalogs/{TEST_ID}/cards/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(format!("/learning/cards/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path(format!("/catalogs/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(format!("/catalogs/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock)
+                .await;
+            let server = mock_server_for(&mock.uri());
+            let results = vec![
+                (
+                    "get_card",
+                    server
+                        .get_card(Parameters(GetCardParams {
+                            card_id: TEST_ID.to_string(),
+                        }))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "update_card",
+                    server
+                        .update_card(Parameters(UpdateCardParams {
+                            card_id: TEST_ID.to_string(),
+                            face: None,
+                            back: None,
+                            catalog_ids: vec![TEST_ID.to_string()],
+                            order_number: 1,
+                            version: 1,
+                        }))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "delete_card",
+                    server
+                        .delete_card(Parameters(DeleteCardParams {
+                            catalog_id: TEST_ID.to_string(),
+                            card_id: TEST_ID.to_string(),
+                        }))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "add_card_to_learning",
+                    server
+                        .add_card_to_learning(Parameters(AddCardToLearningParams {
+                            card_id: TEST_ID.to_string(),
+                        }))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "delete_catalog",
+                    server
+                        .delete_catalog(Parameters(DeleteCatalogParams {
+                            catalog_id: TEST_ID.to_string(),
+                        }))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "update_catalog",
+                    server
+                        .update_catalog(Parameters(UpdateCatalogParams {
+                            catalog_id: TEST_ID.to_string(),
+                            name: None,
+                            description: None,
+                            tags: None,
+                            visibility: None,
+                            version: 1,
+                        }))
+                        .await
+                        .unwrap(),
+                ),
+            ];
+            let expected = if status == 404 {
+                "Not found"
+            } else {
+                "Permission denied"
+            };
+            for (name, result) in &results {
+                assert_eq!(result.is_error, Some(true), "{name} {status}: {result:?}");
+                assert!(
+                    first_text(result).starts_with(expected),
+                    "{name} {status}: {}",
+                    first_text(result)
+                );
+            }
+        }
     }
 
     #[tokio::test]
