@@ -21,7 +21,9 @@ use crate::dto::{
     UpdateCardRequest, UpdateCatalogRequest, UpdateLearningPathRequest, UploadMediaResult,
 };
 use crate::error::ApiError;
-use crate::tools::cards::{DeleteCardParams, GetCardParams, ListCardsParams, UpdateCardParams};
+use crate::tools::cards::{
+    DeleteCardParams, GetCardParams, ListCardsParams, UpdateCardParams, parse_catalog_ids,
+};
 use crate::tools::catalogs::{
     DeleteCatalogParams, GetCatalogParams, ListCatalogsParams, UpdateCatalogParams, err_result,
     ok_json, ok_text, parse_uuid,
@@ -41,7 +43,6 @@ use crate::tools::media::{
 };
 use crate::tools::search::SearchParams;
 use crate::tts::TtsEngine;
-use uuid::Uuid;
 
 pub struct EngramoMcpServer {
     pub(crate) client: EngramoClient,
@@ -266,9 +267,10 @@ impl EngramoMcpServer {
             Ok(id) => id,
             Err(e) => return Ok(err_result(e)),
         };
-        if p.catalog_ids.is_empty() {
-            return Ok(err_result(crate::tools::cards::EMPTY_CATALOG_IDS_ERROR));
-        }
+        let catalog_ids = match parse_catalog_ids(&p.catalog_ids) {
+            Ok(ids) => ids,
+            Err(e) => return Ok(err_result(e)),
+        };
         // Normalize richText spans so text is derived before any further processing.
         if let Some(ref mut face) = p.face {
             normalize_card_content(face);
@@ -325,12 +327,6 @@ impl EngramoMcpServer {
                 Err(e) => return Ok(err_result(e)),
             }
         }
-        let catalog_ids: Result<Vec<Uuid>, _> =
-            p.catalog_ids.iter().map(|s| parse_uuid(s)).collect();
-        let catalog_ids = match catalog_ids {
-            Ok(ids) => ids,
-            Err(e) => return Ok(err_result(e)),
-        };
         let req = UpdateCardRequest {
             catalog_ids,
             order_number: p.order_number,
@@ -1801,6 +1797,42 @@ mod tests {
         assert!(result.is_error.unwrap_or(false), "{result:?}");
         assert!(
             first_text(&result).contains("at least one catalog"),
+            "{result:?}"
+        );
+    }
+
+    /// `update_card` with an invalid catalog UUID and `face` set must fail validation before the
+    /// `get_card` merge fetch, so the model sees the actionable UUID error.
+    #[tokio::test]
+    async fn test_update_card_invalid_catalog_uuid_rejected_without_http_call() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let card_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let result = server
+            .update_card(Parameters(UpdateCardParams {
+                card_id: card_id.to_string(),
+                face: Some(CardContent::plain("x")),
+                back: None,
+                catalog_ids: vec!["bad".into()],
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        assert!(
+            first_text(&result).to_lowercase().contains("uuid"),
             "{result:?}"
         );
     }

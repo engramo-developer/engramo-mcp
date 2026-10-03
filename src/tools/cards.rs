@@ -21,6 +21,14 @@ pub(crate) const EMPTY_CATALOG_IDS_ERROR: &str = "catalog_ids must contain at le
     values in `get_card`/`list_cards`, plus/minus any intended changes; an empty list would \
     silently move the card to your default catalog instead of removing it from every catalog.";
 
+/// Validates `update_card`'s `catalog_ids`: non-empty and every entry a valid UUID.
+pub(crate) fn parse_catalog_ids(raw: &[String]) -> Result<Vec<Uuid>, String> {
+    if raw.is_empty() {
+        return Err(EMPTY_CATALOG_IDS_ERROR.to_string());
+    }
+    raw.iter().map(|s| parse_uuid(s)).collect()
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListCardsParams {
     #[schemars(description = "UUID of the catalog to list cards from")]
@@ -146,12 +154,7 @@ impl CardTools {
             Ok(id) => id,
             Err(e) => return Ok(err_result(e)),
         };
-        if p.catalog_ids.is_empty() {
-            return Ok(err_result(EMPTY_CATALOG_IDS_ERROR));
-        }
-        let catalog_ids: Result<Vec<Uuid>, _> =
-            p.catalog_ids.iter().map(|s| parse_uuid(s)).collect();
-        let catalog_ids = match catalog_ids {
+        let catalog_ids = match parse_catalog_ids(&p.catalog_ids) {
             Ok(ids) => ids,
             Err(e) => return Ok(err_result(e)),
         };
