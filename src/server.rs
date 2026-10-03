@@ -43,6 +43,7 @@ use crate::tools::media::{
 };
 use crate::tools::search::SearchParams;
 use crate::tts::TtsEngine;
+use uuid::Uuid;
 
 pub struct EngramoMcpServer {
     pub(crate) client: EngramoClient,
