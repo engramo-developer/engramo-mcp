@@ -3539,11 +3539,13 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(format!("/cards/{TEST_ID}")))
                 .respond_with(ResponseTemplate::new(status))
+                .expect(2..) // get_card + update_card's merge fetch
                 .mount(&mock)
                 .await;
             Mock::given(method("PATCH"))
                 .and(path(format!("/cards/{TEST_ID}")))
                 .respond_with(ResponseTemplate::new(status))
+                .expect(1) // only the face-less update_card(patch) call reaches it
                 .mount(&mock)
                 .await;
             Mock::given(method("DELETE"))
@@ -3582,6 +3584,25 @@ mod tests {
                     server
                         .update_card(Parameters(UpdateCardParams {
                             card_id: TEST_ID.to_string(),
+                            // face set so the GET-before-PATCH merge fetch runs
+                            face: Some(
+                                serde_json::from_value(serde_json::json!({"text": "hello"}))
+                                    .unwrap(),
+                            ),
+                            back: None,
+                            catalog_ids: vec![TEST_ID.to_string()],
+                            order_number: 1,
+                            version: 1,
+                        }))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "update_card(patch)",
+                    server
+                        .update_card(Parameters(UpdateCardParams {
+                            card_id: TEST_ID.to_string(),
+                            // no face/back: skips the merge fetch, PATCH runs
                             face: None,
                             back: None,
                             catalog_ids: vec![TEST_ID.to_string()],
