@@ -354,8 +354,7 @@ async fn attach_media(
                 return CardAudioResult::failed_with_media(
                     card_id,
                     "audio was uploaded, but after a conflict the card now has no catalog \
-                    membership; refusing to update. Attach media_id manually via update_card"
-                        .to_string(),
+                    membership; refusing to update. Attach media_id manually via update_card",
                     media_id,
                 );
             }
@@ -541,9 +540,10 @@ impl EngramoMcpServer {
         it to your EngrAmo media, and attach it to each card. Uses YOUR OWN locally-configured \
         TTS key (ENGRAMO_TTS_GEMINI_API_KEYS) — this spends your own Gemini quota, never \
         EngrAmo's paid AI. Cards that already have face audio are skipped unless overwrite is \
-        true, in which case the previous audio asset is NOT deleted — it remains in your \
-        EngrAmo media storage and will keep showing up in list_media; its id is returned as \
-        replaced_media_id on that card's result entry. Cards with empty face \
+        true. When overwriting, current EngrAmo backends automatically delete the replaced \
+        audio asset (if no other card or catalog references it); older backends may leave it \
+        in list_media. This tool never deletes media itself — the replaced asset's id is \
+        returned as replaced_media_id on that card's result entry. Cards with empty face \
         text, face text over 500 characters, or no catalog \
         membership are skipped/failed without spending any quota. Partial failure across a \
         batch is normal — check each entry in `results` rather than assuming the whole call \
@@ -1071,83 +1071,6 @@ mod tests {
         assert!(text.contains("\"generated\": 1"), "{text}");
     }
 
-    #[tokio::test]
-    async fn test_generate_card_audio_overwrite_true_with_auto_deleting_backend() {
-        let server = MockServer::start().await;
-        let card_id = Uuid::new_v4();
-        let cat = Uuid::new_v4();
-        let existing_media = Uuid::new_v4();
-        let new_media = Uuid::new_v4();
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
-                card_id,
-                1,
-                1,
-                &[cat],
-                json!({"text": "hi", "audioId": existing_media}),
-            )))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/media"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-                "media_ids": {"ids": [new_media]}
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .and(wiremock::matchers::body_partial_json(json!({
-                "face": {"audioId": new_media}
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
-                card_id,
-                2,
-                1,
-                &[cat],
-                json!({"text": "hi", "audioId": new_media}),
-            )))
-            .expect(1)
-            .mount(&server)
-            .await;
-        // Fixed backend: the replaced asset is gone after the PATCH.
-        Mock::given(method("GET"))
-            .and(path(format!("/media/{existing_media}")))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        Mock::given(method("DELETE"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let srv = server_with_engine(&server.uri(), Arc::new(FakeTtsEngine::new()));
-        let result = srv
-            .generate_card_audio(Parameters(GenerateCardAudioParams {
-                card_ids: vec![card_id.to_string()],
-                voice: None,
-                lang: None,
-                overwrite: Some(true),
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false));
-        let text = result_text(&result);
-        assert!(text.contains("\"generated\": 1"), "{text}");
-        assert!(
-            text.contains(&format!("\"replaced_media_id\": \"{existing_media}\"")),
-            "{text}"
-        );
-        assert!(!text.contains("error"), "{text}");
-
-        let received = server.received_requests().await.unwrap();
-        assert!(received.iter().all(|r| r.method.as_str() != "DELETE"));
-        server.verify().await;
-    }
-
     #[test]
     fn test_generate_card_audio_overwrite_description_documents_auto_delete() {
         let schema = schemars::schema_for!(GenerateCardAudioParams);
@@ -1161,10 +1084,19 @@ mod tests {
             "{description}"
         );
         assert!(description.contains("replaced_media_id"), "{description}");
+
+        let tool = EngramoMcpServer::local_tts_tools_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "generate_card_audio")
+            .expect("generate_card_audio registered");
+        let tool_desc = tool.description.as_deref().unwrap_or("");
+        assert!(!tool_desc.contains("is NOT deleted"), "{tool_desc}");
+        assert!(tool_desc.contains("automatically delete"), "{tool_desc}");
     }
 
     #[tokio::test]
-    async fn test_generate_card_audio_overwrite_true_does_not_delete_previous_media() {
+    async fn test_generate_card_audio_overwrite_true_sends_no_delete_and_reports_replaced_id() {
         let server = MockServer::start().await;
         let card_id = Uuid::new_v4();
         let cat = Uuid::new_v4();
@@ -1204,7 +1136,8 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        // Overwrite must never delete the old asset — assert no DELETE reaches the media API.
+        // The tool itself never sends a DELETE — any cleanup of the replaced asset is the
+        // backend's job.
         Mock::given(method("DELETE"))
             .respond_with(ResponseTemplate::new(204))
             .expect(0)
@@ -1231,7 +1164,173 @@ mod tests {
         );
         assert!(!text.contains("error"), "{text}");
 
+        let received = server.received_requests().await.unwrap();
+        assert!(received.iter().all(|r| r.method.as_str() != "DELETE"));
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_audio_malformed_audio_id_gates_overwrite_without_replaced_id() {
+        let cat = Uuid::new_v4();
+        let new_media = Uuid::new_v4();
+
+        // Card A: malformed audioId, no overwrite -> skipped, nothing synthesized.
+        let server = MockServer::start().await;
+        let card_a = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_a}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_a,
+                1,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": "not-a-uuid"}),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let engine = Arc::new(FakeTtsEngine::new());
+        let srv = server_with_engine(&server.uri(), engine.clone());
+        let result = srv
+            .generate_card_audio(Parameters(GenerateCardAudioParams {
+                card_ids: vec![card_a.to_string()],
+                voice: None,
+                lang: None,
+                overwrite: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("\"skipped\": 1"), "{text}");
+        assert!(text.contains("already has face audio"), "{text}");
+        assert_eq!(engine.call_count(), 0);
+        server.verify().await;
+
+        // Card B: same face, overwrite true -> generated, no replaced_media_id.
+        let server = MockServer::start().await;
+        let card_b = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_b}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_b,
+                1,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": "not-a-uuid"}),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "media_ids": {"ids": [new_media]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_b}")))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "face": {"audioId": new_media}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_b,
+                2,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": new_media}),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let srv = server_with_engine(&server.uri(), Arc::new(FakeTtsEngine::new()));
+        let result = srv
+            .generate_card_audio(Parameters(GenerateCardAudioParams {
+                card_ids: vec![card_b.to_string()],
+                voice: None,
+                lang: None,
+                overwrite: Some(true),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("\"generated\": 1"), "{text}");
+        assert!(!text.contains("replaced_media_id"), "{text}");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_audio_no_previous_audio_omits_replaced_media_id() {
+        let server = MockServer::start().await;
+        let card_id = Uuid::new_v4();
+        let cat = Uuid::new_v4();
+        let new_media = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_id,
+                1,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": null}),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "media_ids": {"ids": [new_media]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_id,
+                2,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": new_media}),
+            )))
+            .mount(&server)
+            .await;
+        let srv = server_with_engine(&server.uri(), Arc::new(FakeTtsEngine::new()));
+        let result = srv
+            .generate_card_audio(Parameters(GenerateCardAudioParams {
+                card_ids: vec![card_id.to_string()],
+                voice: None,
+                lang: None,
+                overwrite: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("\"generated\": 1"), "{text}");
+        assert!(text.contains(&new_media.to_string()), "{text}");
+        assert!(!text.contains("replaced_media_id"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_list_tts_voices_reflects_injected_engine() {
+        let srv = server_with_engine("http://localhost", Arc::new(FakeTtsEngine::new()));
+        let result = srv.list_tts_voices().await.unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let v: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(v["engine"], "fake");
+        assert_eq!(v["model"], "fake-model");
+        assert_eq!(v["default_voice"], "Puck");
+        assert_eq!(v["voices"].as_array().unwrap().len(), 2);
+        assert_eq!(v["voices"][1]["name"], "Charon");
+        assert_eq!(v["voices"][1]["description"], "Informative");
     }
 
     #[tokio::test]
@@ -1495,10 +1594,9 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        // First upload succeeds, second fails — wiremock matches mounted mocks in
-        // registration order when priorities tie, so this simulates one card's upload
-        // failing without depending on request ordering by using distinct filenames is not
-        // possible with a generic path matcher; instead use up_to(1) plus a fallback.
+        // The first upload to arrive succeeds and every later one gets a 400
+        // (`up_to_n_times(1)` + fallback). Which card wins depends on scheduling, so assert
+        // only the aggregate counts.
         Mock::given(method("POST"))
             .and(path("/media"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
