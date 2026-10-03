@@ -528,6 +528,7 @@ impl EngramoMcpServer {
             match self.client.add_catalog_to_learning_path(path.id, id).await {
                 Ok(()) => added.push(raw_id),
                 Err(e) => {
+                    let e = disambiguate_catalog_forbidden(&self.client, id, e).await;
                     // Unauthorized/QuotaExceeded won't clear up on the next id in this same
                     // batch — stop instead of firing the rest of the requests under a token
                     // that's already known to be rejected/rate-limited.
@@ -609,7 +610,9 @@ impl EngramoMcpServer {
                 .await
             {
                 Ok(()) => ok_text("Catalog added to learning path."),
-                Err(e) => err_result(e),
+                Err(e) => {
+                    err_result(disambiguate_catalog_forbidden(&self.client, catalog_id, e).await)
+                }
             },
         )
     }
@@ -665,6 +668,33 @@ impl EngramoMcpServer {
             }
             Err(e) => err_result(e),
         })
+    }
+}
+
+/// Disambiguates a `Forbidden` from `add_catalog_to_learning_path`: the backend's `INSERT ...
+/// WHERE EXISTS` predicate can't tell "catalog doesn't exist" from "catalog exists but the
+/// caller lacks read access" apart and reports both as a bare 403 (see #62 — the backend fix is
+/// tracked separately). Only a `PermissionDenied` triggers the extra lookup; every other error
+/// passes through untouched.
+///
+/// `get_catalog` is the ground truth: a `NotFound` there means the catalog truly doesn't exist,
+/// so that (more actionable, and consistent with `get_catalog`'s own error) result replaces the
+/// original Forbidden. Anything else — the catalog exists (so the 403 likely stems from
+/// learning-path permissions), or the lookup itself fails (e.g. with its own 403) — returns the
+/// original error unchanged, so a genuine permission error is never masked.
+async fn disambiguate_catalog_forbidden(
+    client: &EngramoClient,
+    catalog_id: Uuid,
+    original: ApiError,
+) -> ApiError {
+    if !matches!(original, ApiError::PermissionDenied(_)) {
+        return original;
+    }
+    match client.get_catalog(catalog_id).await {
+        Err(ApiError::NotFound(_)) => {
+            ApiError::NotFound(format!("catalog {catalog_id} does not exist"))
+        }
+        _ => original,
     }
 }
 
@@ -1484,6 +1514,34 @@ mod tests {
             list_media_description.contains("get_card"),
             "{list_media_description}"
         );
+    }
+
+    #[test]
+    fn test_catalog_visibility_params_document_unlisted_on_the_real_server() {
+        // Regression guard for #61: `update_catalog`'s and `generate_catalog_with_cards`'s
+        // `visibility` params must list all three values the API accepts — including
+        // `unlisted` — and note the role limit, not just say "'public' or 'private'".
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+
+        for name in ["update_catalog", "generate_catalog_with_cards"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let description = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("visibility"))
+                .and_then(|v| v.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name}: visibility param has no description"));
+            for value in ["'public'", "'private'", "'unlisted'"] {
+                assert!(description.contains(value), "{name}: {description}");
+            }
+            assert!(description.contains("permission"), "{name}: {description}");
+        }
     }
 
     #[test]
@@ -2437,7 +2495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_catalog_to_learning_path_api_error_returns_is_error() {
+    async fn test_add_catalog_to_learning_path_non_forbidden_error_skips_catalog_lookup() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2448,6 +2506,213 @@ mod tests {
             .and(path(format!(
                 "/learning-paths/{path_id}/catalogs/{catalog_id}"
             )))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": format!("Learning path with id {path_id} not found")
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{catalog_id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .add_catalog_to_learning_path(Parameters(AddCatalogToLearningPathParams {
+                    path_id: path_id.to_string(),
+                    catalog_id: catalog_id.to_string(),
+                }))
+                .await
+                .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = first_text(&result);
+        assert!(text.contains("Not found"), "{text}");
+        assert!(text.contains(path_id), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_forbidden_missing_catalog_empty_body_names_catalog()
+    {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let catalog_id = "00000000-0000-0000-0000-000000000002";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{path_id}/catalogs/{catalog_id}"
+            )))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{catalog_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .add_catalog_to_learning_path(Parameters(AddCatalogToLearningPathParams {
+                    path_id: path_id.to_string(),
+                    catalog_id: catalog_id.to_string(),
+                }))
+                .await
+                .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = first_text(&result);
+        assert!(text.contains("Not found"), "{text}");
+        assert!(text.contains(catalog_id), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_forbidden_missing_catalog_reported_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let bad_catalog = "00000000-0000-0000-0000-000000000003";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": path_id, "name": "Spanish A1", "version": 1
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{path_id}/catalogs/{bad_catalog}"
+            )))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{bad_catalog}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .create_learning_path(Parameters(CreateLearningPathParams {
+                    name: "Spanish A1".to_string(),
+                    description: None,
+                    catalog_ids: Some(vec![bad_catalog.to_string()]),
+                }))
+                .await
+                .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        let err = v["catalogs_failed"][0]["error"].as_str().unwrap();
+        assert!(err.contains("Not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_forbidden_with_existing_catalog_stays_forbidden() {
+        // #62: a 403 on the add itself, but the disambiguating `get_catalog` lookup succeeds
+        // (the catalog exists and is readable, so the 403 is about the path or catalog-level
+        // policy) — the original Forbidden must pass through unchanged.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let catalog_id = "00000000-0000-0000-0000-000000000002";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{path_id}/catalogs/{catalog_id}"
+            )))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{catalog_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": catalog_id, "name": "Spanish", "version": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .add_catalog_to_learning_path(Parameters(AddCatalogToLearningPathParams {
+                    path_id: path_id.to_string(),
+                    catalog_id: catalog_id.to_string(),
+                }))
+                .await
+                .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            first_text(&result).contains("Permission denied"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_forbidden_with_missing_catalog_becomes_not_found() {
+        // #62: a 403 on the add, and the disambiguating `get_catalog` lookup reports the
+        // catalog doesn't exist — the caller should see `Not found`, not a bare `Forbidden`.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let catalog_id = "00000000-0000-0000-0000-000000000002";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{path_id}/catalogs/{catalog_id}"
+            )))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{catalog_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": format!("Catalog with id {catalog_id} not found")
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let result =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false)
+                .add_catalog_to_learning_path(Parameters(AddCatalogToLearningPathParams {
+                    path_id: path_id.to_string(),
+                    catalog_id: catalog_id.to_string(),
+                }))
+                .await
+                .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = first_text(&result);
+        assert!(text.contains("Not found"), "{text}");
+        assert!(!text.contains("Permission denied"), "{text}");
+        assert!(text.contains(catalog_id), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_add_catalog_to_learning_path_forbidden_stays_forbidden_when_catalog_lookup_also_forbidden()
+     {
+        // #62: the disambiguating `get_catalog` lookup itself comes back 403 (e.g. a catalog
+        // the caller can't even see exists) rather than 404 — the original Forbidden from the
+        // add must still be what's reported, never a fabricated Not found.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let catalog_id = "00000000-0000-0000-0000-000000000002";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/learning-paths/{path_id}/catalogs/{catalog_id}"
+            )))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{catalog_id}")))
             .respond_with(ResponseTemplate::new(403))
             .mount(&mock_server)
             .await;
@@ -2802,6 +3067,38 @@ mod tests {
 
     fn mock_server_for(uri: &str) -> EngramoMcpServer {
         EngramoMcpServer::new(EngramoClient::new(uri, "engramo_test"), false)
+    }
+
+    #[tokio::test]
+    async fn test_update_catalog_forwards_unlisted_visibility_on_wire() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .and(body_partial_json(
+                serde_json::json!({"visibility": "unlisted", "version": 1}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "X", "version": 2, "visibility": "unlisted"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .update_catalog(Parameters(UpdateCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+                name: None,
+                description: None,
+                tags: None,
+                visibility: Some("unlisted".to_string()),
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
     }
 
     #[tokio::test]
