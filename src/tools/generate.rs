@@ -370,6 +370,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_catalog_with_cards_forwards_unlisted_visibility_on_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"name": "Deck", "visibility": "unlisted"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Deck".to_string(),
+                description: None,
+                image_id: None,
+                tags: None,
+                visibility: Some("unlisted".to_string()),
+                cards: vec![CardInputParams {
+                    face: CardContent::plain("a"),
+                    back: CardContent::plain("b"),
+                }],
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    }
+
+    #[tokio::test]
     async fn test_generate_catalog_with_cards_omits_image_id_when_none() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

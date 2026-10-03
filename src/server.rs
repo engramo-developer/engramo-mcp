@@ -1488,6 +1488,34 @@ mod tests {
     }
 
     #[test]
+    fn test_catalog_visibility_params_document_unlisted_on_the_real_server() {
+        // Regression guard for #61: `update_catalog`'s and `generate_catalog_with_cards`'s
+        // `visibility` params must list all three values the API accepts — including
+        // `unlisted` — and note the role limit, not just say "'public' or 'private'".
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+
+        for name in ["update_catalog", "generate_catalog_with_cards"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let description = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("visibility"))
+                .and_then(|v| v.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name}: visibility param has no description"));
+            for value in ["'public'", "'private'", "'unlisted'"] {
+                assert!(description.contains(value), "{name}: {description}");
+            }
+            assert!(description.contains("permission"), "{name}: {description}");
+        }
+    }
+
+    #[test]
     fn test_search_tools_describe_short_id_resolution_on_the_real_server() {
         // Assert against the tools actually registered on EngramoMcpServer (search_tools_router).
         let client = EngramoClient::new("http://localhost", "engramo_test");
@@ -2714,6 +2742,38 @@ mod tests {
 
     fn mock_server_for(uri: &str) -> EngramoMcpServer {
         EngramoMcpServer::new(EngramoClient::new(uri, "engramo_test"), false)
+    }
+
+    #[tokio::test]
+    async fn test_update_catalog_forwards_unlisted_visibility_on_wire() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .and(body_partial_json(
+                serde_json::json!({"visibility": "unlisted", "version": 1}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "X", "version": 2, "visibility": "unlisted"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .update_catalog(Parameters(UpdateCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+                name: None,
+                description: None,
+                tags: None,
+                visibility: Some("unlisted".to_string()),
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
     }
 
     #[tokio::test]
