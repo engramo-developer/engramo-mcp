@@ -68,9 +68,11 @@ pub struct GenerateCardAudioParams {
     pub lang: Option<String>,
     #[schemars(
         description = "When true, replace a card's existing face audio instead of skipping it. \
-        Default false. The previous audio asset is NOT deleted — it remains in your EngrAmo \
-        media storage and will keep showing up in list_media. Its id is returned as \
-        replaced_media_id on the corresponding result entry so it can be tracked or cleaned up."
+        Default false. Current EngrAmo backends automatically delete the replaced audio asset \
+        when the card is updated (if no other card or catalog references it); on older backends \
+        it may remain in list_media. This tool never deletes media itself. The replaced asset's \
+        id is returned as replaced_media_id on the corresponding result entry so it can be \
+        tracked or verified/cleaned up."
     )]
     pub overwrite: Option<bool>,
 }
@@ -90,9 +92,10 @@ struct CardAudioResult {
     status: CardAudioStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     media_id: Option<Uuid>,
-    /// The id of the previous face audio asset that `overwrite: true` replaced, if any. Not
-    /// deleted server-side (see `GenerateCardAudioParams::overwrite`'s doc comment) — surfaced
-    /// here so a caller who wants to track or clean up orphaned assets can do so.
+    /// The id of the previous face audio asset that `overwrite: true` replaced, if any. Current
+    /// backends delete it automatically when the card is updated (if orphaned); older ones may
+    /// leave it in `list_media`. This tool never sends a DELETE itself — the id is surfaced here
+    /// so a caller can track it or verify/clean up.
     #[serde(skip_serializing_if = "Option::is_none")]
     replaced_media_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1066,6 +1069,98 @@ mod tests {
             .unwrap();
         let text = result_text(&result);
         assert!(text.contains("\"generated\": 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_audio_overwrite_true_with_auto_deleting_backend() {
+        let server = MockServer::start().await;
+        let card_id = Uuid::new_v4();
+        let cat = Uuid::new_v4();
+        let existing_media = Uuid::new_v4();
+        let new_media = Uuid::new_v4();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_id,
+                1,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": existing_media}),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "media_ids": {"ids": [new_media]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "face": {"audioId": new_media}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card_id,
+                2,
+                1,
+                &[cat],
+                json!({"text": "hi", "audioId": new_media}),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Fixed backend: the replaced asset is gone after the PATCH.
+        Mock::given(method("GET"))
+            .and(path(format!("/media/{existing_media}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let srv = server_with_engine(&server.uri(), Arc::new(FakeTtsEngine::new()));
+        let result = srv
+            .generate_card_audio(Parameters(GenerateCardAudioParams {
+                card_ids: vec![card_id.to_string()],
+                voice: None,
+                lang: None,
+                overwrite: Some(true),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result_text(&result);
+        assert!(text.contains("\"generated\": 1"), "{text}");
+        assert!(
+            text.contains(&format!("\"replaced_media_id\": \"{existing_media}\"")),
+            "{text}"
+        );
+        assert!(!text.contains("error"), "{text}");
+
+        let received = server.received_requests().await.unwrap();
+        assert!(received.iter().all(|r| r.method.as_str() != "DELETE"));
+        server.verify().await;
+    }
+
+    #[test]
+    fn test_generate_card_audio_overwrite_description_documents_auto_delete() {
+        let schema = schemars::schema_for!(GenerateCardAudioParams);
+        let v = serde_json::to_value(&schema).unwrap();
+        let description = v["properties"]["overwrite"]["description"]
+            .as_str()
+            .expect("overwrite description");
+        assert!(!description.contains("is NOT deleted"), "{description}");
+        assert!(
+            description.contains("automatically delete"),
+            "{description}"
+        );
+        assert!(description.contains("replaced_media_id"), "{description}");
     }
 
     #[tokio::test]
