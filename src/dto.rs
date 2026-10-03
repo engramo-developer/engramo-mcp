@@ -113,7 +113,7 @@ pub struct RichTextSpanStyle {
     /// Font size in points.
     #[serde(rename = "fontSize", skip_serializing_if = "Option::is_none")]
     pub font_size: Option<i32>,
-    /// CSS color string, e.g. "#E74C3C".
+    /// Hex color "#RGB", "#RRGGBB" or "#RRGGBBAA", e.g. "#E74C3C". Other CSS color forms are dropped.
     #[serde(rename = "fontColor", skip_serializing_if = "Option::is_none")]
     pub font_color: Option<String>,
     /// Font family. Use "monospace" for code snippets.
@@ -235,14 +235,19 @@ impl From<RawRichTextSpan> for RichTextSpan {
 /// Card-level text style defaults.
 #[derive(Debug, Serialize, Deserialize, Clone, schemars::JsonSchema)]
 pub struct CardStyle {
+    /// Font size in points.
     #[serde(rename = "fontSize", skip_serializing_if = "Option::is_none")]
     pub font_size: Option<i32>,
+    /// Hex color "#RGB", "#RRGGBB" or "#RRGGBBAA". Other CSS color forms are dropped.
     #[serde(rename = "fontColor", skip_serializing_if = "Option::is_none")]
     pub font_color: Option<String>,
+    /// Font family: only letters, digits, space, comma and hyphen (no quotes).
     #[serde(rename = "fontFamily", skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    /// Hex color "#RGB", "#RRGGBB" or "#RRGGBBAA". Other CSS color forms are dropped.
     #[serde(rename = "backgroundColor", skip_serializing_if = "Option::is_none")]
     pub background_color: Option<String>,
+    /// One of left, right, center, justify.
     #[serde(rename = "textAlign", skip_serializing_if = "Option::is_none")]
     pub text_align: Option<String>,
 }

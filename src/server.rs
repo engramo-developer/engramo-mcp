@@ -272,6 +272,11 @@ impl EngramoMcpServer {
             Ok(ids) => ids,
             Err(e) => return Ok(err_result(e)),
         };
+        for content in [&p.face, &p.back].into_iter().flatten() {
+            if let Err(e) = check_card_content(content) {
+                return Ok(err_result(e));
+            }
+        }
         // Normalize richText spans so text is derived before any further processing.
         if let Some(ref mut face) = p.face {
             normalize_card_content(face);
@@ -285,7 +290,7 @@ impl EngramoMcpServer {
             updating_back = p.back.is_some(),
             "update_card: normalized"
         );
-        // Preserve server-managed fields (audio_id, dictionary) the LLM cannot know about.
+        // Preserve server-managed fields (audio_id, visual, dictionary) the LLM cannot know about.
         // Fetch the current card and merge them into the update if not explicitly set.
         if p.face.is_some() || p.back.is_some() {
             match self.client.get_card(card_id).await {
@@ -306,6 +311,10 @@ impl EngramoMcpServer {
                             face.audio_id = existing.face.audio_id;
                             debug!(audio_id = ?face.audio_id, "update_card: merged face.audio_id from existing");
                         }
+                        if face.visual_id.is_none() && face.visual_type.is_none() {
+                            face.visual_id = existing.face.visual_id;
+                            face.visual_type = existing.face.visual_type;
+                        }
                         if face.dictionary.is_none() {
                             face.dictionary = existing.face.dictionary;
                             debug!(
@@ -319,6 +328,10 @@ impl EngramoMcpServer {
                         if back.audio_id.is_none() {
                             back.audio_id = existing.back.audio_id;
                             debug!(audio_id = ?back.audio_id, "update_card: merged back.audio_id from existing");
+                        }
+                        if back.visual_id.is_none() && back.visual_type.is_none() {
+                            back.visual_id = existing.back.visual_id;
+                            back.visual_type = existing.back.visual_type;
                         }
                         if back.dictionary.is_none() {
                             back.dictionary = existing.back.dictionary;
@@ -459,7 +472,10 @@ impl EngramoMcpServer {
         )
     }
 
-    #[tool(description = "Get full details of a learning path, including its catalogs.")]
+    #[tool(
+        description = "Get full details of a learning path, including its catalogs, tags, \
+        visibility, and current version (needed by update_learning_path)."
+    )]
     pub async fn get_learning_path(
         &self,
         Parameters(p): Parameters<GetLearningPathParams>,
@@ -745,7 +761,8 @@ impl EngramoMcpServer {
 
     #[tool(
         description = "Search learning paths by name or description. Returns an array of \
-        {id, name, description, version}; pass `id` as path_id to get_learning_path (to see its \
+        {id, name, description, tags, visibility, version} (tags/visibility are omitted when the API \
+        does not send them); pass `id` as path_id to get_learning_path (to see its \
         catalogs), activate_learning_path, or deactivate_learning_path. Use this instead of \
         search_global when you specifically want learning paths — search_global may not include \
         them depending on the API version. If this tool reports Not Found for the endpoint \
@@ -812,12 +829,26 @@ impl EngramoMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Base64 expands data by 4/3 — reject on the encoded length before decoding so an
         // oversized payload doesn't get allocated in full just to be rejected afterward.
-        if p.content_base64.len() > MAX_UPLOAD_BASE64_LEN {
+        // The raw bound is loose enough to admit CRLF line-wrapping (every 76 chars); the
+        // exact bound is re-checked below once whitespace is stripped.
+        if p.content_base64.len() > MAX_UPLOAD_BASE64_LEN + MAX_UPLOAD_BASE64_LEN / 38 {
             return Ok(err_result(
                 "Encoded content exceeds the 10MB upload limit".to_string(),
             ));
         }
-        let content = match base64::engine::general_purpose::STANDARD.decode(&p.content_base64) {
+        // Line-wrapped `base64` output is explicitly recommended above, so drop ASCII
+        // whitespace before checking the length and decoding.
+        let encoded: String = p
+            .content_base64
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        if encoded.len() > MAX_UPLOAD_BASE64_LEN {
+            return Ok(err_result(
+                "Encoded content exceeds the 10MB upload limit".to_string(),
+            ));
+        }
+        let content = match base64::engine::general_purpose::STANDARD.decode(&encoded) {
             Ok(bytes) => bytes,
             Err(e) => return Ok(err_result(format!("Invalid base64 content_base64: {e}"))),
         };
@@ -955,15 +986,19 @@ impl ServerHandler for EngramoMcpServer {
 /// synthesis, the same way `normalize_card_content` does for card creation/update.
 pub(crate) fn sanitize_text(s: &str) -> String {
     s.chars()
-        .filter(|&c| (!c.is_control() || c == '\n') && !is_emoji_char(c))
+        .filter(|&c| (!c.is_control() || c == '\n') && c != '\u{FE0F}' && !is_emoji_char(c))
         .collect()
 }
 
 fn is_emoji_char(c: char) -> bool {
     matches!(c as u32,
         0x1F000..=0x1FAFF | // All emoji/symbol blocks (Mahjong through Extended-A)
-        0x2600..=0x27BF     // Misc Symbols (☀…) + Dingbats (✈ at U+2708, …)
+        0x2600..=0x2653 | // Misc Symbols (☀…) up to the zodiac signs
+        0x2670..=0x2712 | // rest of Misc Symbols + Dingbats (✈ at U+2708, …)
+        0x2718..=0x27BF   // rest of Dingbats
     )
+    // Deliberately kept: chess pieces/card suits/music signs (U+2654–266F) and check/ballot
+    // marks (U+2713–2717) carry meaning in flashcard text (e.g. "C♯ major").
 }
 
 fn is_cjk(c: char) -> bool {
@@ -980,7 +1015,9 @@ fn is_cjk(c: char) -> bool {
 /// markers (e.g. ✈ at U+2708 in the Dingbats block).
 fn is_symbol_char(c: char) -> bool {
     matches!(c as u32,
-        0x2190..=0x27BF | // Arrows through Dingbats (✈ is U+2708)
+        // Arrows through Dingbats (✈ is U+2708), minus the ranges `is_emoji_char`
+        // preserves as real content (music/chess/suits U+2654–266F, check marks U+2713–2717).
+        0x2190..=0x2653 | 0x2670..=0x2712 | 0x2718..=0x27BF |
         0x2B00..=0x2BFF   // Miscellaneous Symbols and Arrows
     )
 }
@@ -1056,26 +1093,108 @@ fn strip_span_boundary_markers(spans: &mut [crate::dto::RichTextSpan]) {
         }
     }
 
-    for marker in candidates {
-        // Accept only if the marker never appears in the interior of any span.
-        let only_at_boundaries = spans.iter().all(|s| {
-            let char_count = s.text.chars().count();
-            s.text
-                .chars()
-                .enumerate()
-                .all(|(i, c)| c != marker || i == 0 || i == char_count - 1)
-        });
-
-        if only_at_boundaries {
-            for span in spans.iter_mut() {
-                if span.text.starts_with(marker) {
-                    span.text = span.text[marker.len_utf8()..].to_owned();
-                }
-                if span.text.ends_with(marker) {
-                    let trim_len = span.text.len() - marker.len_utf8();
-                    span.text.truncate(trim_len);
-                }
+    // One pass: every char that appears in an interior (non-boundary) position of any span.
+    let mut interior = std::collections::HashSet::new();
+    for s in spans.iter() {
+        let n = s.text.chars().count();
+        for (i, c) in s.text.chars().enumerate() {
+            if i != 0 && i + 1 != n {
+                interior.insert(c);
             }
+        }
+    }
+    // Accept a marker only if it never appears in the interior of any span.
+    let markers: Vec<char> = candidates
+        .into_iter()
+        .filter(|c| !interior.contains(c))
+        .collect();
+
+    for span in spans.iter_mut() {
+        for &marker in &markers {
+            if span.text.starts_with(marker) {
+                span.text = span.text[marker.len_utf8()..].to_owned();
+            }
+            if span.text.ends_with(marker) {
+                let trim_len = span.text.len() - marker.len_utf8();
+                span.text.truncate(trim_len);
+            }
+        }
+    }
+}
+
+const MAX_SPANS_PER_CONTENT: usize = 1_000;
+const MAX_CONTENT_CHARS: usize = 20_000;
+
+/// Reject oversized or malformed card content before `normalize_card_content` does any
+/// work on it (bounds the cost of normalization) and before untrusted media ids go upstream.
+fn check_card_content(content: &crate::dto::CardContent) -> Result<(), String> {
+    let span_count = content.rich_text.as_ref().map_or(0, Vec::len);
+    let span_chars: usize = content
+        .rich_text
+        .iter()
+        .flatten()
+        .map(|s| s.text.chars().count())
+        .sum();
+    if span_count > MAX_SPANS_PER_CONTENT
+        || content.text.chars().count() > MAX_CONTENT_CHARS
+        || span_chars > MAX_CONTENT_CHARS
+    {
+        return Err(format!(
+            "card content too large (max {MAX_SPANS_PER_CONTENT} spans / {MAX_CONTENT_CHARS} chars)"
+        ));
+    }
+    for (name, id) in [
+        ("audio_id", &content.audio_id),
+        ("visual_id", &content.visual_id),
+    ] {
+        if let Some(id) = id
+            && let Err(e) = parse_uuid(id)
+        {
+            return Err(format!("Invalid {name}: {e}"));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_color(s: &str) -> bool {
+    let h = s.strip_prefix('#').unwrap_or("");
+    matches!(h.len(), 3 | 6 | 8) && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_safe_font_family(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | ',' | '-'))
+}
+
+fn is_safe_text_align(s: &str) -> bool {
+    matches!(s, "left" | "right" | "center" | "justify")
+}
+
+/// Drop style values that are not plain colors / font names / alignments, so a
+/// prompt-injected value can't reach a CSS renderer as an injection payload.
+fn drop_unsafe(name: &'static str, field: &mut Option<String>, ok: fn(&str) -> bool) {
+    if field.as_deref().is_some_and(|v| !ok(v)) {
+        debug!(field = name, "sanitize_styles: dropped unsafe style value");
+        *field = None;
+    }
+}
+
+fn sanitize_styles(content: &mut crate::dto::CardContent) {
+    if let Some(style) = &mut content.style {
+        drop_unsafe("fontColor", &mut style.font_color, is_safe_color);
+        drop_unsafe(
+            "backgroundColor",
+            &mut style.background_color,
+            is_safe_color,
+        );
+        drop_unsafe("fontFamily", &mut style.font_family, is_safe_font_family);
+        drop_unsafe("textAlign", &mut style.text_align, is_safe_text_align);
+    }
+    for span in content.rich_text.iter_mut().flatten() {
+        if let Some(style) = &mut span.style {
+            drop_unsafe("fontColor", &mut style.font_color, is_safe_color);
+            drop_unsafe("fontFamily", &mut style.font_family, is_safe_font_family);
         }
     }
 }
@@ -1083,20 +1202,25 @@ fn strip_span_boundary_markers(spans: &mut [crate::dto::RichTextSpan]) {
 fn normalize_card_content(content: &mut crate::dto::CardContent) {
     // Save sanitized original text as a validation anchor. An empty anchor means the LLM
     // omitted `text`, so skip validation and derive from spans (backward-compatible path).
-    let anchor = sanitize_text(content.text.trim());
+    let anchor = sanitize_text(&content.text).trim().to_owned();
 
     if let Some(spans) = &mut content.rich_text {
         for span in spans.iter_mut() {
             span.text = sanitize_text(&span.text);
         }
         strip_span_boundary_markers(spans);
+        spans.retain(|s| !s.text.is_empty());
+        if spans.is_empty() {
+            content.rich_text = None;
+        }
     }
+    sanitize_styles(content);
 
     if let Some(spans) = &content.rich_text
         && !spans.is_empty()
     {
         let derived: String = spans.iter().map(|s| s.text.as_str()).collect();
-        if !anchor.is_empty() && derived != anchor {
+        if !anchor.is_empty() && derived.trim() != anchor {
             // Span concatenation doesn't match the provided text — LLM corrupted them.
             // Discard richText and fall back to plain text.
             warn!(
@@ -1136,6 +1260,11 @@ impl EngramoMcpServer {
         &self,
         Parameters(mut p): Parameters<GenerateCardParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        for content in [&p.face, &p.back] {
+            if let Err(e) = check_card_content(content) {
+                return Ok(err_result(e));
+            }
+        }
         normalize_card_content(&mut p.face);
         normalize_card_content(&mut p.back);
         debug!(
@@ -1182,6 +1311,18 @@ impl EngramoMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         if let Err(e) = check_batch_size(p.cards.len()) {
             return Ok(err_result(e));
+        }
+        if let Some(ref image_id) = p.image_id
+            && let Err(e) = parse_uuid(image_id)
+        {
+            return Ok(err_result(format!("Invalid image_id: {e}")));
+        }
+        for card in &p.cards {
+            for content in [&card.face, &card.back] {
+                if let Err(e) = check_card_content(content) {
+                    return Ok(err_result(e));
+                }
+            }
         }
         for card in &mut p.cards {
             normalize_card_content(&mut card.face);
@@ -1246,6 +1387,13 @@ impl EngramoMcpServer {
             Ok(id) => id,
             Err(e) => return Ok(err_result(e)),
         };
+        for card in &p.cards {
+            for content in [&card.face, &card.back] {
+                if let Err(e) = check_card_content(content) {
+                    return Ok(err_result(e));
+                }
+            }
+        }
         for card in &mut p.cards {
             normalize_card_content(&mut card.face);
             normalize_card_content(&mut card.back);
@@ -1256,7 +1404,8 @@ impl EngramoMcpServer {
             "generate_cards: after normalization"
         );
         // Create cards individually in the existing catalog.
-        let mut created_cards = Vec::with_capacity(p.cards.len());
+        let total = p.cards.len();
+        let mut created_cards = Vec::with_capacity(total);
         for card in p.cards {
             let req = CreateCardRequest {
                 catalog_id: Some(catalog_id),
@@ -1265,7 +1414,29 @@ impl EngramoMcpServer {
             };
             match self.client.create_card(&req).await {
                 Ok(created) => created_cards.push(created),
-                Err(e) => return Ok(err_result(e)),
+                Err(e) => {
+                    if created_cards.is_empty() {
+                        return Ok(err_result(e));
+                    }
+                    let ids: Vec<String> = created_cards.iter().map(|c| c.id.to_string()).collect();
+                    let sep = if e.to_string().ends_with('.') {
+                        " "
+                    } else {
+                        ". "
+                    };
+                    let n = created_cards.len();
+                    let advice =
+                        if matches!(e, ApiError::Unauthorized | ApiError::QuotaExceeded { .. }) {
+                            "do not retry until the error above is resolved".to_string()
+                        } else {
+                            format!("retry only the remaining cards starting at index {n}")
+                        };
+                    return Ok(err_result(format!(
+                        "{e}{sep}{n} of {total} cards were created before this failure and \
+                         were NOT rolled back (ids: {}); {advice}.",
+                        ids.join(", ")
+                    )));
+                }
             }
         }
         Ok(ok_json(&created_cards))
@@ -3775,5 +3946,334 @@ mod tests {
         c.rich_text = Some(vec![]);
         normalize_card_content(&mut c);
         assert_eq!(c.text, "Holaamigo");
+        assert!(c.rich_text.is_none());
+    }
+
+    // ── review follow-ups ────────────────────────────────────────────────────
+
+    fn content_with(text: &str, spans: Vec<RichTextSpan>) -> CardContent {
+        let mut c = CardContent::plain(text);
+        c.rich_text = Some(spans);
+        c
+    }
+
+    #[test]
+    fn test_trailing_emoji_keeps_rich_text() {
+        let mut c = content_with(
+            "Hola amigo 😀",
+            vec![span("Hola "), bold_span("amigo"), span(" 😀")],
+        );
+        normalize_card_content(&mut c);
+        let spans = c.rich_text.expect("rich_text kept");
+        assert_eq!(spans[1].style.as_ref().unwrap().bold, Some(true));
+    }
+
+    #[test]
+    fn test_music_sharp_and_checkmark_spans_keep_rich_text() {
+        let mut c = content_with("C♯ major", vec![bold_span("C♯"), span(" major")]);
+        normalize_card_content(&mut c);
+        let spans = c.rich_text.expect("rich_text kept");
+        assert_eq!(spans[0].text, "C♯");
+
+        let mut c = content_with("Answer: ✓", vec![span("Answer: "), bold_span("✓")]);
+        normalize_card_content(&mut c);
+        let spans = c.rich_text.expect("rich_text kept");
+        assert_eq!(spans[1].text, "✓");
+    }
+
+    #[test]
+    fn test_strip_cjk_leading_marker_from_non_first_spans() {
+        let mut spans = vec![
+            span("Me "),
+            bold_span("极estoy muriendo"),
+            span("极 de ganas."),
+        ];
+        strip_span_boundary_markers(&mut spans);
+        assert_eq!(spans[0].text, "Me ");
+        assert_eq!(spans[1].text, "estoy muriendo");
+        assert_eq!(spans[2].text, " de ganas.");
+    }
+
+    #[test]
+    fn test_strip_preserves_leading_cjk_word_on_non_first_span() {
+        let mut spans = vec![span("hello "), bold_span("力量 world")];
+        strip_span_boundary_markers(&mut spans);
+        assert_eq!(spans[1].text, "力量 world");
+    }
+
+    #[test]
+    fn test_strip_trailing_arrow_marker_from_non_final_spans() {
+        let mut spans = vec![span("Me →"), bold_span("gusta→"), span(" el café.")];
+        strip_span_boundary_markers(&mut spans);
+        assert_eq!(spans[0].text, "Me ");
+        assert_eq!(spans[1].text, "gusta");
+        assert_eq!(spans[2].text, " el café.");
+    }
+
+    #[test]
+    fn test_normalize_strips_marker_that_survives_sanitize() {
+        let mut content = content_with(
+            "Me gusta el café.",
+            vec![span("Me "), bold_span("⬛gusta"), span("⬛ el café.")],
+        );
+        normalize_card_content(&mut content);
+        assert_eq!(content.text, "Me gusta el café.");
+        let spans = content.rich_text.as_ref().expect("rich_text kept");
+        assert_eq!(spans[1].text, "gusta");
+    }
+
+    #[test]
+    fn test_strip_boundary_candidate_kept_when_also_in_interior() {
+        let mut spans = vec![span("A →"), bold_span("B → C"), span(" D")];
+        strip_span_boundary_markers(&mut spans);
+        assert_eq!(spans[0].text, "A →");
+        assert_eq!(spans[1].text, "B → C");
+        assert_eq!(spans[2].text, " D");
+    }
+
+    #[test]
+    fn test_strip_many_markers_many_spans_finishes_quickly() {
+        let markers: Vec<char> = ('\u{2190}'..='\u{21FF}').collect();
+        let mut spans: Vec<RichTextSpan> = (0..MAX_SPANS_PER_CONTENT)
+            .map(|i| span(&format!("ab{}", markers[i % markers.len()])))
+            .collect();
+        spans.push(span("end"));
+        let start = std::time::Instant::now();
+        strip_span_boundary_markers(&mut spans);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(spans[0].text, "ab");
+    }
+
+    #[test]
+    fn test_check_card_content_rejects_too_many_spans() {
+        let spans = (0..=MAX_SPANS_PER_CONTENT).map(|_| span("a")).collect();
+        let err = check_card_content(&content_with("a", spans)).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn test_check_card_content_rejects_too_many_chars() {
+        let c = CardContent::plain("a".repeat(MAX_CONTENT_CHARS + 1));
+        assert!(check_card_content(&c).is_err());
+        assert!(check_card_content(&CardContent::plain("ok")).is_ok());
+    }
+
+    #[test]
+    fn test_check_card_content_rejects_non_uuid_media_ids() {
+        let mut c = CardContent::plain("x");
+        c.audio_id = Some("../etc/passwd".to_string());
+        assert!(check_card_content(&c).unwrap_err().contains("audio_id"));
+        let mut c = CardContent::plain("x");
+        c.visual_id = Some("nope".to_string());
+        assert!(check_card_content(&c).unwrap_err().contains("visual_id"));
+        let mut c = CardContent::plain("x");
+        c.audio_id = Some("3fa85f64-5717-4562-b3fc-2c963f66afa7".to_string());
+        assert!(check_card_content(&c).is_ok());
+    }
+
+    #[test]
+    fn test_normalize_ignores_surrounding_whitespace_in_anchor() {
+        let mut c = content_with("Hola amigo ", vec![span("Hola "), bold_span("amigo ")]);
+        normalize_card_content(&mut c);
+        assert!(c.rich_text.is_some());
+    }
+
+    #[test]
+    fn test_normalize_clears_rich_text_when_all_spans_empty() {
+        let mut c = content_with("Hola", vec![span("\t"), span("")]);
+        normalize_card_content(&mut c);
+        assert!(c.rich_text.is_none());
+        assert_eq!(c.text, "Hola");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_music_and_chess_symbols() {
+        assert_eq!(sanitize_text("C♯ major ♞ ✓"), "C♯ major ♞ ✓");
+        assert_eq!(sanitize_text("\u{2764}\u{FE0F}"), "");
+        assert_eq!(sanitize_text("a ✈ b"), "a  b");
+    }
+
+    #[test]
+    fn test_normalize_drops_unsafe_style_values() {
+        let mut c = content_with(
+            "Hi",
+            vec![RichTextSpan {
+                text: "Hi".to_string(),
+                style: Some(RichTextSpanStyle {
+                    font_color: Some("red;background:url(https://x)".to_string()),
+                    font_family: Some("monospace".to_string()),
+                    ..Default::default()
+                }),
+            }],
+        );
+        c.style = Some(crate::dto::CardStyle {
+            font_size: None,
+            font_color: Some("#27AE60".to_string()),
+            font_family: Some("a;b".to_string()),
+            background_color: Some("javascript:1".to_string()),
+            text_align: Some("center".to_string()),
+        });
+        normalize_card_content(&mut c);
+        let st = c.style.as_ref().unwrap();
+        assert_eq!(st.font_color.as_deref(), Some("#27AE60"));
+        assert!(st.font_family.is_none());
+        assert!(st.background_color.is_none());
+        assert_eq!(st.text_align.as_deref(), Some("center"));
+        let sp = c.rich_text.as_ref().unwrap()[0].style.as_ref().unwrap();
+        assert!(sp.font_color.is_none());
+        assert_eq!(sp.font_family.as_deref(), Some("monospace"));
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_accepts_line_wrapped_base64() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "media_ids": { "ids": ["00000000-0000-0000-0000-000000000001"] }
+            })))
+            .expect(1)
+            .mount(&ms)
+            .await;
+        let raw = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 300]);
+        let wrapped: Vec<&str> = raw
+            .as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let result = mock_server_for(&ms.uri())
+            .upload_media(Parameters(UploadMediaParams {
+                content_base64: wrapped.join("\n") + "\n",
+                content_type: "audio/mpeg".to_string(),
+                filename: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    }
+
+    async fn mount_path_create(ms: &wiremock::MockServer, path_id: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": path_id, "name": "P", "version": 1
+            })))
+            .mount(ms)
+            .await;
+    }
+
+    async fn assert_fatal_status_skips_remaining(status: u16, expect_text: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let c1 = "00000000-0000-0000-0000-000000000002";
+        let c2 = "00000000-0000-0000-0000-000000000003";
+        let c3 = "00000000-0000-0000-0000-000000000004";
+        let ms = MockServer::start().await;
+        mount_path_create(&ms, path_id).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{path_id}/catalogs/{c1}")))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&ms)
+            .await;
+        for c in [c2, c3] {
+            Mock::given(method("POST"))
+                .and(path(format!("/learning-paths/{path_id}/catalogs/{c}")))
+                .respond_with(ResponseTemplate::new(201))
+                .expect(0)
+                .mount(&ms)
+                .await;
+        }
+        let result = mock_server_for(&ms.uri())
+            .create_learning_path(Parameters(CreateLearningPathParams {
+                name: "P".into(),
+                description: None,
+                catalog_ids: Some(vec![c1.into(), c2.into(), c3.into()]),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v["catalogs_added"], serde_json::json!([]));
+        let failed = v["catalogs_failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 3);
+        assert_eq!(failed[0]["catalog_id"], c1);
+        assert!(
+            failed[0]["error"].as_str().unwrap().contains(expect_text),
+            "{failed:?}"
+        );
+        for (i, c) in [(1, c2), (2, c3)] {
+            assert_eq!(failed[i]["catalog_id"], c);
+            assert!(failed[i]["error"].as_str().unwrap().starts_with("skipped:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_unauthorized_catalog_add_skips_remaining_ids() {
+        assert_fatal_status_skips_remaining(401, "nauthorized").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_quota_exceeded_catalog_add_skips_remaining_ids() {
+        assert_fatal_status_skips_remaining(429, "").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_too_many_catalog_ids_rejected_without_request() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&ms)
+            .await;
+        let ids: Vec<String> = (0..=MAX_PATH_CATALOG_IDS)
+            .map(|i| format!("00000000-0000-0000-0000-{:012}", i + 1))
+            .collect();
+        let result = mock_server_for(&ms.uri())
+            .create_learning_path(Parameters(CreateLearningPathParams {
+                name: "P".into(),
+                description: None,
+                catalog_ids: Some(ids),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Too many catalog_ids"));
+        assert!(first_text(&result).contains(&format!("max {MAX_PATH_CATALOG_IDS}")));
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_duplicate_catalog_ids_added_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let path_id = "00000000-0000-0000-0000-000000000001";
+        let c1 = "00000000-0000-0000-0000-000000000002";
+        let ms = MockServer::start().await;
+        mount_path_create(&ms, path_id).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{path_id}/catalogs/{c1}")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&ms)
+            .await;
+        let result = mock_server_for(&ms.uri())
+            .create_learning_path(Parameters(CreateLearningPathParams {
+                name: "P".into(),
+                description: None,
+                catalog_ids: Some(vec![c1.into(), c1.into(), c1.into()]),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v["catalogs_added"], serde_json::json!([c1]));
+        assert_eq!(v["catalogs_failed"], serde_json::json!([]));
     }
 }
