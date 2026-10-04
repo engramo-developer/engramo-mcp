@@ -119,7 +119,7 @@ impl CardTools {
     }
 
     #[tool(
-        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships)."
+        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships). A card that was archived (e.g. deleted after learning started) is reported as Not found even if it still appears in get_due_cards."
     )]
     async fn get_card(
         &self,

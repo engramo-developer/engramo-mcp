@@ -49,7 +49,7 @@ impl LearningTools {
     }
 
     #[tool(
-        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). A returned card may be archived (deleted after learning started): it stays reviewable here, but get_card/update_card report it as Not found."
     )]
     async fn get_due_cards(
         &self,
@@ -68,7 +68,7 @@ impl LearningTools {
     }
 
     #[tool(
-        description = "Get all cards currently in the learning queue (due and future), with pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "Get all cards currently in the learning queue (due and future), with pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). A returned card may be archived (deleted after learning started): it stays reviewable here, but get_card/update_card report it as Not found."
     )]
     async fn get_all_learning_cards(
         &self,
