@@ -376,8 +376,13 @@ impl EngramoMcpServer {
                 if let Some(cats) = &card.catalogs
                     && !cats.iter().any(|c| c.id == catalog_id)
                 {
+                    let in_cats = cats
+                        .iter()
+                        .map(|c| c.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     return Ok(err_result(ApiError::NotFound(format!(
-                        "Card {card_id} is not in catalog {catalog_id}"
+                        "Card {card_id} is not in catalog {catalog_id} (it is in: [{in_cats}]); nothing was deleted"
                     ))));
                 }
             }
@@ -3805,6 +3810,7 @@ mod tests {
             Mock::given(method("DELETE"))
                 .and(path(format!("/catalogs/{TEST_ID}/cards/{TEST_ID}")))
                 .respond_with(ResponseTemplate::new(status))
+                .expect(0) // delete_card's GET membership probe fails first (#79/#80)
                 .mount(&mock)
                 .await;
             Mock::given(method("POST"))
@@ -4784,7 +4790,9 @@ mod tests {
         assert_eq!(r.is_error, Some(true));
         assert_eq!(
             first_text(&r),
-            format!("Not found: Card {TEST_ID} is not in catalog {DEL_CATALOG}")
+            format!(
+                "Not found: Card {TEST_ID} is not in catalog {DEL_CATALOG} (it is in: [{DEL_OTHER}]); nothing was deleted"
+            )
         );
     }
 
@@ -4817,5 +4825,230 @@ mod tests {
             "{}",
             first_text(&r)
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_card_delete_404_after_membership_check_is_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mock = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{TEST_ID}")))
+            .respond_with(del_card_body(Some(vec![DEL_CATALOG])))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/catalogs/{DEL_CATALOG}/cards/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let r = run_delete_card(&mock).await;
+        assert_eq!(r.is_error, Some(true));
+        assert!(
+            first_text(&r).starts_with("Not found:"),
+            "{}",
+            first_text(&r)
+        );
+    }
+
+    // ── review follow-ups: upload_media rejections ───────────────────────────
+
+    async fn run_upload_rejected(content_base64: String) -> String {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .upload_media(Parameters(UploadMediaParams {
+                content_base64,
+                content_type: "audio/mpeg".to_string(),
+                filename: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        first_text(&r).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_raw_length_over_bound_rejected_without_request() {
+        let text =
+            run_upload_rejected("A".repeat(MAX_UPLOAD_BASE64_LEN + MAX_UPLOAD_BASE64_LEN / 38 + 1))
+                .await;
+        assert_eq!(text, "Encoded content exceeds the 10MB upload limit");
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_stripped_length_over_bound_rejected_without_request() {
+        let text =
+            run_upload_rejected("A".repeat(MAX_UPLOAD_BASE64_LEN + 4) + &"\n".repeat(4)).await;
+        assert_eq!(text, "Encoded content exceeds the 10MB upload limit");
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_invalid_base64_rejected_without_request() {
+        let text = run_upload_rejected("!!!not base64!!!".to_string()).await;
+        assert!(text.starts_with("Invalid base64 content_base64:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_decoded_over_max_bytes_rejected_without_request() {
+        let text = run_upload_rejected(base64::engine::general_purpose::STANDARD.encode(vec![
+                0u8;
+                MAX_UPLOAD_BYTES
+                    + 1
+            ]))
+        .await;
+        assert!(text.contains("exceeds the 10MB limit"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_upstream_500_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/media"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "boom"})),
+            )
+            .expect(1)
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .upload_media(Parameters(UploadMediaParams {
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"abc"),
+                content_type: "audio/mpeg".to_string(),
+                filename: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+    }
+
+    // ── review follow-ups: learning / learning-path / media list handlers ────
+
+    #[tokio::test]
+    async fn test_list_style_learning_handlers_ok_and_unauthorized_on_real_server() {
+        use crate::tools::learning::DueCardsParams;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (route, name) in [
+            ("/learning/cards", "get_due_cards"),
+            ("/learning/cards/all", "get_all_learning_cards"),
+            ("/learning-paths", "list_learning_paths"),
+        ] {
+            for ok in [true, false] {
+                let ms = MockServer::start().await;
+                let template = if ok {
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"data": [], "items": [], "cursor": null, "total": 0}),
+                    )
+                } else {
+                    ResponseTemplate::new(401)
+                };
+                Mock::given(method("GET"))
+                    .and(path(route))
+                    .respond_with(template)
+                    .expect(1)
+                    .mount(&ms)
+                    .await;
+                let server = mock_server_for(&ms.uri());
+                let r = match name {
+                    "get_due_cards" => {
+                        server
+                            .get_due_cards(Parameters(DueCardsParams {
+                                limit: None,
+                                cursor: None,
+                            }))
+                            .await
+                    }
+                    "get_all_learning_cards" => {
+                        server
+                            .get_all_learning_cards(Parameters(DueCardsParams {
+                                limit: None,
+                                cursor: None,
+                            }))
+                            .await
+                    }
+                    _ => {
+                        server
+                            .list_learning_paths(Parameters(ListLearningPathsParams {
+                                limit: None,
+                                cursor: None,
+                            }))
+                            .await
+                    }
+                }
+                .unwrap();
+                if ok {
+                    assert_ne!(r.is_error, Some(true), "{name}: {r:?}");
+                } else {
+                    assert_eq!(r.is_error, Some(true), "{name}: {r:?}");
+                    assert!(
+                        first_text(&r).starts_with("Unauthorized"),
+                        "{name}: {}",
+                        first_text(&r)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_media_unauthorized_returns_error_on_real_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .list_media(Parameters(ListMediaParams {
+                media_type: None,
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+    }
+
+    // ── review follow-ups: content / style validators ────────────────────────
+
+    #[test]
+    fn test_check_card_content_rejects_oversized_span_text_with_short_anchor() {
+        let spans = vec![
+            span(&"a".repeat(MAX_CONTENT_CHARS / 2 + 1)),
+            span(&"b".repeat(MAX_CONTENT_CHARS / 2 + 1)),
+        ];
+        let err = check_card_content(&content_with("short", spans)).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn test_style_value_validators_boundaries() {
+        for ok in ["#abc", "#AABBCC", "#11223344"] {
+            assert!(is_safe_color(ok), "{ok}");
+        }
+        for bad in ["abc", "#ab", "#abcd", "#abcde", "#abcdeff", "#ggg", ""] {
+            assert!(!is_safe_color(bad), "{bad}");
+        }
+        assert!(is_safe_font_family(&"a".repeat(64)));
+        assert!(!is_safe_font_family(&"a".repeat(65)));
+        assert!(!is_safe_font_family(""));
+        assert!(is_safe_font_family("Arial, sans-serif"));
+        assert!(!is_safe_text_align("start"));
     }
 }

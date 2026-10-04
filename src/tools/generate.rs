@@ -2046,13 +2046,15 @@ mod tests {
         let catalog_id = mock_id();
         let card_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
 
+        let card_body = json!({
+            "id": card_id, "version": 1,
+            "face": {"text": "Q?"}, "back": {"text": "A."}, "orderNumber": 1,
+            "catalogs": [{"id": catalog_id, "name": "n"}]
+        });
         Mock::given(method("GET"))
             .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": card_id, "version": 1,
-                "face": {"text": "Q?"}, "back": {"text": "A."}, "orderNumber": 1,
-                "catalogs": [{"id": catalog_id, "name": "n"}]
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_body.clone()))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
@@ -2080,11 +2082,8 @@ mod tests {
         let server2 = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": card_id, "version": 1,
-                "face": {"text": "Q?"}, "back": {"text": "A."}, "orderNumber": 1,
-                "catalogs": [{"id": catalog_id, "name": "n"}]
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_body))
+            .expect(1)
             .mount(&server2)
             .await;
         Mock::given(method("DELETE"))
@@ -2165,5 +2164,243 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty()
         );
+    }
+
+    // ── review follow-ups: generate_cards / generate_catalog_with_cards / update_card ──
+
+    #[tokio::test]
+    async fn test_generate_cards_mid_batch_fatal_error_advises_no_retry() {
+        for (status, body) in [
+            (401u16, json!({"error": "unauthorized"})),
+            (
+                402,
+                json!({"error":"quota_exceeded","resource_type":"cards_total","used":100,"limit":100}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/cards"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/cards"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            let result = make_server(&server.uri())
+                .generate_cards(Parameters(GenerateCardsParams {
+                    catalog_id: mock_id().to_string(),
+                    cards: n_cards(3),
+                }))
+                .await
+                .unwrap();
+            assert!(result.is_error.unwrap_or(false), "{status}: {result:?}");
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str())
+                .unwrap_or("");
+            assert!(
+                text.contains("1 of 3 cards were created"),
+                "{status}: {text}"
+            );
+            assert!(
+                text.contains("do not retry until the error above is resolved"),
+                "{status}: {text}"
+            );
+            assert!(
+                !text.contains("retry only the remaining cards"),
+                "{status}: {text}"
+            );
+            assert!(!text.contains(".."), "{status}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_cards_mid_batch_non_fatal_error_advises_retry_from_index() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "boom"})))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .generate_cards(Parameters(GenerateCardsParams {
+                catalog_id: mock_id().to_string(),
+                cards: n_cards(3),
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            text.contains("retry only the remaining cards starting at index 1"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_invalid_image_id_rejected_without_request() {
+        let server = MockServer::start().await;
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "X".to_string(),
+                description: None,
+                image_id: Some("../etc/passwd".to_string()),
+                tags: None,
+                visibility: None,
+                cards: n_cards(1),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.starts_with("Invalid image_id:"), "{text}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_card_content_validation_rejects_before_any_request_in_all_mutators() {
+        use crate::tools::cards::UpdateCardParams;
+        let server = MockServer::start().await;
+        let s = make_server(&server.uri());
+        let mut bad = CardContent::plain("x");
+        bad.visual_id = Some("nope".into());
+        let text_of = |r: &rmcp::model::CallToolResult| {
+            r.content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap_or_default()
+        };
+
+        let r = s
+            .update_card(Parameters(UpdateCardParams {
+                card_id: mock_id().to_string(),
+                catalog_ids: vec![mock_id().to_string()],
+                face: None,
+                back: Some(bad.clone()),
+                order_number: 1,
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert!(text_of(&r).contains("Invalid visual_id"), "{r:?}");
+
+        let r = s
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "X".to_string(),
+                description: None,
+                image_id: None,
+                tags: None,
+                visibility: None,
+                cards: vec![CardInputParams {
+                    face: CardContent::plain("a"),
+                    back: bad.clone(),
+                }],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert!(text_of(&r).contains("Invalid visual_id"), "{r:?}");
+
+        let mut cards = n_cards(2);
+        cards[1].face = bad.clone();
+        let r = s
+            .generate_cards(Parameters(GenerateCardsParams {
+                catalog_id: mock_id().to_string(),
+                cards,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert!(text_of(&r).contains("Invalid visual_id"), "{r:?}");
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_card_does_not_overwrite_explicit_visual() {
+        use crate::tools::cards::UpdateCardParams;
+        let card_id = mock_id();
+        let v_old = "00000000-0000-0000-0000-0000000000bb";
+        let v_new = "00000000-0000-0000-0000-0000000000cc";
+
+        for (face_json, expect_id, expect_type) in [
+            (
+                json!({"text": "Quedo", "visualId": v_new, "visualType": "video"}),
+                Some(v_new),
+                Some("video"),
+            ),
+            (
+                json!({"text": "Quedo", "visualType": "video"}),
+                None,
+                Some("video"),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/cards/{card_id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": card_id, "version": 1,
+                    "face": { "text": "Quedo", "visualId": v_old, "visualType": "image" },
+                    "back": { "text": "Чекаю" },
+                    "orderNumber": 1
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(format!("/cards/{card_id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
+                .mount(&server)
+                .await;
+
+            let result = make_server(&server.uri())
+                .update_card(Parameters(UpdateCardParams {
+                    card_id: card_id.to_string(),
+                    face: Some(serde_json::from_value(face_json).unwrap()),
+                    back: None,
+                    catalog_ids: vec![mock_id().to_string()],
+                    order_number: 1,
+                    version: 1,
+                }))
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false), "{result:?}");
+            let patch_req = server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.method == wiremock::http::Method::PATCH)
+                .expect("PATCH request not made");
+            let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
+            assert_eq!(body["face"]["visualId"].as_str(), expect_id, "{body}");
+            assert_eq!(body["face"]["visualType"].as_str(), expect_type, "{body}");
+        }
     }
 }
