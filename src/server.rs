@@ -355,7 +355,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived; otherwise hard-deleted. A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
+        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived; otherwise hard-deleted. A card_id that doesn't exist, or a catalog_id the card is not in, is reported as \"Not found\" and nothing is deleted; a card that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn delete_card(
         &self,
@@ -369,6 +369,20 @@ impl EngramoMcpServer {
             Ok(id) => id,
             Err(e) => return Ok(err_result(e)),
         };
+        // The backend DELETE returns 2xx for a missing card or a catalog the card isn't in, so
+        // verify first (#79, #80). `catalogs: None` = memberships unreported: don't block.
+        match self.client.get_card(card_id).await {
+            Ok(card) => {
+                if let Some(cats) = &card.catalogs
+                    && !cats.iter().any(|c| c.id == catalog_id)
+                {
+                    return Ok(err_result(ApiError::NotFound(format!(
+                        "Card {card_id} is not in catalog {catalog_id}"
+                    ))));
+                }
+            }
+            Err(e) => return Ok(err_result(e)),
+        }
         Ok(match self.client.delete_card(catalog_id, card_id).await {
             Ok(()) => ok_text("Card deleted successfully."),
             Err(e) => err_result(e),
@@ -4690,5 +4704,118 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
         assert_eq!(v["catalogs_added"], serde_json::json!([c1]));
         assert_eq!(v["catalogs_failed"], serde_json::json!([]));
+    }
+
+    // ── delete_card verification (#79, #80) ──────────────────────────────────
+
+    const DEL_CATALOG: &str = "00000000-0000-0000-0000-0000000000c1";
+    const DEL_OTHER: &str = "00000000-0000-0000-0000-0000000000c2";
+
+    /// Mounts `GET /cards/{TEST_ID}` (given response) and `DELETE` with an expected call count.
+    async fn mount_delete_card_mocks(
+        mock: &wiremock::MockServer,
+        get: wiremock::ResponseTemplate,
+        delete_calls: u64,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{TEST_ID}")))
+            .respond_with(get)
+            .expect(1)
+            .mount(mock)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/catalogs/{DEL_CATALOG}/cards/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(delete_calls)
+            .mount(mock)
+            .await;
+    }
+
+    async fn run_delete_card(mock: &wiremock::MockServer) -> CallToolResult {
+        mock_server_for(&mock.uri())
+            .delete_card(Parameters(DeleteCardParams {
+                catalog_id: DEL_CATALOG.to_string(),
+                card_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap()
+    }
+
+    fn del_card_body(catalogs: Option<Vec<&str>>) -> wiremock::ResponseTemplate {
+        let mut v = serde_json::json!({
+            "id": TEST_ID, "version": 1,
+            "face": {"text": "Q?"}, "back": {"text": "A."}, "orderNumber": 1
+        });
+        if let Some(c) = catalogs {
+            v["catalogs"] = c
+                .into_iter()
+                .map(|id| serde_json::json!({"id": id, "name": "n"}))
+                .collect();
+        }
+        wiremock::ResponseTemplate::new(200).set_body_json(v)
+    }
+
+    #[tokio::test]
+    async fn test_delete_card_missing_card_is_not_found_and_skips_delete() {
+        let mock = wiremock::MockServer::start().await;
+        mount_delete_card_mocks(
+            &mock,
+            wiremock::ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"error": "Card not found"})),
+            0,
+        )
+        .await;
+        let r = run_delete_card(&mock).await;
+        assert_eq!(r.is_error, Some(true));
+        assert!(
+            first_text(&r).starts_with("Not found:"),
+            "{}",
+            first_text(&r)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_card_not_in_catalog_is_not_found_and_skips_delete() {
+        let mock = wiremock::MockServer::start().await;
+        mount_delete_card_mocks(&mock, del_card_body(Some(vec![DEL_OTHER])), 0).await;
+        let r = run_delete_card(&mock).await;
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(
+            first_text(&r),
+            format!("Not found: Card {TEST_ID} is not in catalog {DEL_CATALOG}")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_card_member_of_catalog_deletes() {
+        let mock = wiremock::MockServer::start().await;
+        mount_delete_card_mocks(&mock, del_card_body(Some(vec![DEL_OTHER, DEL_CATALOG])), 1).await;
+        let r = run_delete_card(&mock).await;
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(first_text(&r), "Card deleted successfully.");
+    }
+
+    #[tokio::test]
+    async fn test_delete_card_memberships_omitted_still_deletes() {
+        let mock = wiremock::MockServer::start().await;
+        mount_delete_card_mocks(&mock, del_card_body(None), 1).await;
+        let r = run_delete_card(&mock).await;
+        assert_ne!(r.is_error, Some(true));
+        assert_eq!(first_text(&r), "Card deleted successfully.");
+    }
+
+    #[tokio::test]
+    async fn test_delete_card_permission_error_on_get_passes_through() {
+        let mock = wiremock::MockServer::start().await;
+        mount_delete_card_mocks(&mock, wiremock::ResponseTemplate::new(403), 0).await;
+        let r = run_delete_card(&mock).await;
+        assert_eq!(r.is_error, Some(true));
+        assert!(
+            first_text(&r).starts_with("Permission denied:"),
+            "{}",
+            first_text(&r)
+        );
     }
 }

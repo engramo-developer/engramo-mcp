@@ -2046,6 +2046,15 @@ mod tests {
         let catalog_id = mock_id();
         let card_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
 
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": card_id, "version": 1,
+                "face": {"text": "Q?"}, "back": {"text": "A."}, "orderNumber": 1,
+                "catalogs": [{"id": catalog_id, "name": "n"}]
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("DELETE"))
             .and(path(format!("/catalogs/{catalog_id}/cards/{card_id}")))
             .respond_with(ResponseTemplate::new(204))
@@ -2069,6 +2078,15 @@ mod tests {
         assert_eq!(text, "Card deleted successfully.");
 
         let server2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": card_id, "version": 1,
+                "face": {"text": "Q?"}, "back": {"text": "A."}, "orderNumber": 1,
+                "catalogs": [{"id": catalog_id, "name": "n"}]
+            })))
+            .mount(&server2)
+            .await;
         Mock::given(method("DELETE"))
             .and(path(format!("/catalogs/{catalog_id}/cards/{card_id}")))
             .respond_with(
