@@ -232,7 +232,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships). A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
+        description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships). A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way). A card that was archived (e.g. deleted after learning started) is reported as Not found even if it still appears in get_due_cards."
     )]
     pub async fn get_card(
         &self,
@@ -381,7 +381,7 @@ impl EngramoMcpServer {
 #[tool_router(router = learning_tools_router)]
 impl EngramoMcpServer {
     #[tool(
-        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "Get flashcards due for review today, sorted by priority. Use this to start a study session. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). A returned card may be archived (deleted after learning started): it stays reviewable here, but get_card/update_card report it as Not found."
     )]
     pub async fn get_due_cards(
         &self,
@@ -400,7 +400,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Get all cards currently in the learning queue (due and future), with pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "Get all cards currently in the learning queue (due and future), with pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). A returned card may be archived (deleted after learning started): it stays reviewable here, but get_card/update_card report it as Not found."
     )]
     pub async fn get_all_learning_cards(
         &self,
