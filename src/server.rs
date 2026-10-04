@@ -191,7 +191,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Delete a catalog. Catalogs with no cards are hard-deleted; catalogs with cards are archived. Quota decrements automatically."
+        description = "Delete a catalog. It is archived (not hard-deleted) if it has cards, a cover image, or is in an active learning path; otherwise it is hard-deleted. There is no restore/unarchive tool. Cards also in another live catalog are unaffected (they only lose this membership); cards only in this catalog stay reachable by id via get_card but show `catalogs: []`, disappear from search and list_cards, and are archived later by backend cleanup. To keep them, move them to another catalog with update_card (catalog_ids) BEFORE deleting. Catalog quota decrements automatically."
     )]
     pub async fn delete_catalog(
         &self,
