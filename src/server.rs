@@ -191,7 +191,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Delete a catalog. It is archived (not hard-deleted) if it has cards, a cover image, or is in an active learning path; otherwise it is hard-deleted. There is no restore/unarchive tool. Cards also in another live catalog are unaffected (they only lose this membership); cards only in this catalog stay reachable by id via get_card but show `catalogs: []`, disappear from search and list_cards, and are archived later by backend cleanup. To keep them, move them to another catalog with update_card (catalog_ids) BEFORE deleting. Catalog quota decrements automatically."
+        description = "Delete a catalog. It is archived (not hard-deleted) if it has cards, a cover image, or is in an active learning path; otherwise it is hard-deleted. There is no restore/unarchive tool. Cards also in another live catalog are unaffected (they only lose this membership); cards only in this catalog stay reachable by id via get_card (showing `catalogs: []`) only until backend cleanup archives them; they disappear from search and list_cards immediately, and once archived get_card/update_card report them as Not found (cards with learning progress still appear in get_due_cards). To keep them, move them to another catalog with update_card (catalog_ids) BEFORE deleting. Catalog quota decrements automatically."
     )]
     pub async fn delete_catalog(
         &self,
@@ -258,7 +258,8 @@ impl EngramoMcpServer {
         are unknown — call `get_card` first. If you get a Conflict error, re-fetch and retry. \
         rich_text styling goes under a nested `style` object, e.g. \
         {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
-        A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
+        A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way). \
+        A card that was archived (e.g. deleted after learning started) is reported as Not found even if it still appears in get_due_cards — do not retry."
     )]
     pub async fn update_card(
         &self,
@@ -355,7 +356,7 @@ impl EngramoMcpServer {
     }
 
     #[tool(
-        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived; otherwise hard-deleted. A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
+        description = "Delete a flashcard from a catalog. If the card has learning progress it is archived (it stays in get_due_cards/get_all_learning_cards and remains reviewable, but get_card/update_card then report it as Not found); otherwise hard-deleted. A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn delete_card(
         &self,
@@ -3734,6 +3735,69 @@ mod tests {
         let text = first_text(&result);
         assert!(text.starts_with("Permission denied: Forbidden ("), "{text}");
         assert!(text.contains("may not exist"), "{text}");
+    }
+
+    #[test]
+    fn test_delete_catalog_description_documents_archive_semantics_on_the_real_server() {
+        // Regression guard for #81: delete_catalog must spell out when it archives and what
+        // happens to the catalog's cards, not the stale "no cards -> hard-deleted" summary.
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "delete_catalog")
+            .expect("delete_catalog not registered");
+        let description = tool.description.as_deref().unwrap_or("");
+        for needle in [
+            "cover image",
+            "active learning path",
+            "no restore",
+            "`catalogs: []`",
+            "update_card",
+            "BEFORE deleting",
+        ] {
+            assert!(
+                description.contains(needle),
+                "missing {needle:?}: {description}"
+            );
+        }
+        assert!(
+            !description.contains(
+                "Catalogs with no cards are hard-deleted; catalogs with cards are archived"
+            ),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn test_archived_card_caveat_documented_on_learning_and_get_card_tools_on_the_real_server() {
+        // Regression guard for #81: archived cards remain in the learning queue, but get_card
+        // reports them as Not found; all three tools must say so on the registered router.
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, false);
+        let tools = server.tool_router.list_all();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"))
+                .description
+                .clone()
+                .unwrap_or_default()
+        };
+        for name in ["get_due_cards", "get_all_learning_cards"] {
+            let d = find(name);
+            assert!(d.contains("archived"), "{name}: {d}");
+            assert!(d.contains("stays reviewable here"), "{name}: {d}");
+            assert!(
+                d.contains("get_card/update_card report it as Not found"),
+                "{name}: {d}"
+            );
+        }
+        let d = find("get_card");
+        assert!(d.contains("archived"), "get_card: {d}");
+        assert!(d.contains("get_due_cards"), "get_card: {d}");
     }
 
     #[test]
