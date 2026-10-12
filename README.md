@@ -62,7 +62,7 @@ Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key)
 
 | Client | Models | Local TTS | Setup |
 |---|---|---|---|
-| Claude Desktop | Claude | ✅ | [Claude Desktop](#claude-desktop) — recommended for non-technical users: the free plan supports local MCP servers, and setup is one JSON file (Settings → Developer → Edit Config) |
+| Claude Desktop | Claude | ✅ | [Claude Desktop](#claude-desktop) — recommended for non-technical users: one-click extension, no Node.js or config editing; the free plan supports local extensions |
 | Claude Code | Claude | ✅ | [Claude Code](#claude-code) |
 | Codex (CLI / IDE extension) | OpenAI models — sign in with your ChatGPT account | ✅ | [Codex](#codex) |
 | VS Code (GitHub Copilot) | GPT / Claude / Gemini | ✅ | [VS Code](#vs-code-github-copilot-agent-mode) |
@@ -73,6 +73,22 @@ Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key)
 | ChatGPT | OpenAI models | ❌ — remote connector only; local TTS intentionally unavailable | [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http) |
 
 ## Claude Desktop
+
+### One-click extension (recommended)
+
+1. Download [`engramo.mcpb`](https://github.com/engramo-developer/engramo-mcp/releases/latest/download/engramo.mcpb)
+   from the latest release (macOS — Intel and Apple Silicon — and Windows).
+2. Double-click it (or drag it onto Claude Desktop) and click **Install**. Claude Desktop warns that the
+   developer isn't verified by Anthropic; it shows this for every extension installed from a file.
+3. Paste your **EngrAmo API token**, and optionally your Gemini API keys (comma-separated) to enable
+   [card audio](#text-to-speech-bring-your-own-key). Claude Desktop stores both in the OS keychain.
+
+No Node.js and no config file. Change the token or keys later under **Settings → Extensions → EngrAmo →
+Configure**. The extension doesn't auto-update: install the new `engramo.mcpb` to upgrade. Its tools are
+available in **Chat** conversations, not in Claude Desktop's Code mode. The bundle is built from
+[`mcpb/manifest.json`](mcpb/manifest.json) by the release workflow.
+
+### Manual config
 
 Open **Settings → Developer → Edit Config**, or edit the file directly:
 `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
