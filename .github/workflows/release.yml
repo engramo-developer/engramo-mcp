@@ -219,7 +219,7 @@ jobs:
         run: npm ci --ignore-scripts --prefix mcpb/tools
 
       - name: Audit mcpb CLI
-        run: npm audit --prefix mcpb/tools --audit-level=high
+        run: node mcpb/tools/audit.mjs
 
       - name: Validate and pack
         run: |
