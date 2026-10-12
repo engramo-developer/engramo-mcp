@@ -86,7 +86,10 @@ Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key)
 No Node.js and no config file. Change the token or keys later under **Settings → Extensions → EngrAmo →
 Configure**. The extension doesn't auto-update: install the new `engramo.mcpb` to upgrade. Its tools are
 available in **Chat** conversations, not in Claude Desktop's Code mode. The bundle is built from
-[`mcpb/manifest.json`](mcpb/manifest.json) by the release workflow.
+[`mcpb/manifest.json`](mcpb/manifest.json) by the release workflow. Verify a download with
+`gh attestation verify engramo.mcpb -R engramo-developer/engramo-mcp --signer-workflow engramo-developer/engramo-mcp/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z`
+(substituting the release tag), or compare it with the release's
+`engramo.mcpb.sha256`.
 
 ### Manual config
 

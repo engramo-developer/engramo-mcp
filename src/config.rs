@@ -488,4 +488,50 @@ mod tests {
         assert_eq!(cfg.require_token().unwrap(), "engramo_tok");
         assert!(cfg.paid_ai_enabled);
     }
+
+    #[test]
+    fn mcpb_manifest_matches_env_contract() {
+        let raw = include_str!("../mcpb/manifest.json");
+        let m: serde_json::Value = serde_json::from_str(raw).expect("manifest.json is valid JSON");
+
+        // The version is a placeholder that release.yml rewrites.
+        assert_eq!(m["version"], "0.0.0");
+
+        let env = m["server"]["mcp_config"]["env"]
+            .as_object()
+            .expect("env object");
+        let mut keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        keys.sort();
+        let mut expected = vec!["ENGRAMO_API_URL", "ENGRAMO_API_TOKEN", crate::tts::ENV_KEYS];
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        // stdio mode requires a token: it must come from a required user_config field.
+        assert_eq!(env["ENGRAMO_API_TOKEN"], "${user_config.api_token}");
+        assert_eq!(m["user_config"]["api_token"]["required"], true);
+        assert_eq!(m["user_config"]["api_token"]["sensitive"], true);
+        assert_eq!(m["user_config"]["gemini_keys"]["sensitive"], true);
+        // An unset optional field must resolve to "", never a leftover placeholder.
+        assert_eq!(m["user_config"]["gemini_keys"]["default"], "");
+
+        // Every ${user_config.X} reference names a defined user_config key.
+        let uc = m["user_config"].as_object().expect("user_config object");
+        for v in env.values() {
+            let s = v.as_str().expect("env values are strings");
+            if let Some(name) = s
+                .strip_prefix("${user_config.")
+                .and_then(|r| r.strip_suffix('}'))
+            {
+                assert!(uc.contains_key(name), "undefined user_config key: {name}");
+            }
+        }
+
+        // http-only / paid-AI vars must never be wired into the stdio extension.
+        for forbidden in ["ENGRAMO_ENABLE_PAID_AI", "MCP_BIND_ADDR", "GEMINI_API_KEY"] {
+            assert!(
+                !env.contains_key(forbidden),
+                "{forbidden} must not be in manifest env"
+            );
+        }
+    }
 }

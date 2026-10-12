@@ -46,6 +46,7 @@
       "title": "Gemini API keys for card audio (optional)",
       "description": "Free keys from aistudio.google.com, one per Google Cloud project. Separate several keys with commas. Leave empty to turn audio off.",
       "required": false,
+      "default": "",
       "sensitive": true
     }
   }

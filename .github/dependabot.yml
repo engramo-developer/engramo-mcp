@@ -27,7 +27,17 @@ updates:
         patterns:
           - "*"
 
-  # No npm entry: npm/engramo-mcp declares no third-party dependencies. Its
+  # Pinned mcpb packer used by release.yml (locked tree under mcpb/tools).
+  - package-ecosystem: npm
+    directory: /mcpb/tools
+    schedule:
+      interval: weekly
+    groups:
+      mcpb-tools:
+        patterns:
+          - "*"
+
+  # No npm entry for npm/engramo-mcp: it declares no third-party dependencies. Its
   # @engramo/mcp-* optionalDependencies are 0.0.0 placeholders that the
   # npm-publish job in release.yml rewrites to the release tag at publish time,
   # so Dependabot bumping them just produces churn that never ships.
