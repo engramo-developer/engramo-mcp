@@ -1,0 +1,12 @@
+{
+  "name": "engramo-mcpb-tools",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Pinned packer for the Claude Desktop extension",
+  "dependencies": {
+    "@anthropic-ai/mcpb": "2.1.2"
+  },
+  "overrides": {
+    "tmp": "^0.2.7"
+  }
+}

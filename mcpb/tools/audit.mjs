@@ -1,0 +1,62 @@
+// `npm audit --audit-level=high` with a reviewed allowlist. npm has no native
+// way to ignore an advisory, and one with no upstream fix would otherwise block
+// every release. Fails on any high/critical advisory not listed below.
+import { execFileSync } from "node:child_process";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Each entry needs a reason; drop it as soon as a fixed version ships.
+const ALLOWED = {
+  // node-forge: PKCS#1 v1.5 signature verification accepts malformed
+  // DigestAlgorithm (no fixed version). mcpb uses node-forge only in
+  // node/sign.js; we never run `sign`/`verify`, and `info` only "verifies" the
+  // unsigned bundle we just packed — no signature result is trusted anywhere.
+  "GHSA-86w9-cpqp-85rv": "node-forge signature verification, unused",
+};
+const BLOCKING = new Set(["high", "critical"]);
+
+let raw;
+try {
+  raw = execFileSync("npm", ["audit", "--json"], {
+    cwd: dirname(fileURLToPath(import.meta.url)),
+    encoding: "utf8",
+    shell: process.platform === "win32",
+  });
+} catch (e) {
+  // npm audit exits non-zero when it finds anything; the report is on stdout.
+  if (!e.stdout) throw e;
+  raw = e.stdout;
+}
+const report = JSON.parse(raw);
+if (report.error) {
+  console.error("npm audit failed:", report.error.summary ?? report.error);
+  process.exit(2);
+}
+
+const advisories = new Map();
+for (const vuln of Object.values(report.vulnerabilities ?? {})) {
+  // String entries are transitive "depends on <pkg>" links; objects are advisories.
+  for (const via of vuln.via) {
+    if (typeof via === "object") advisories.set(via.url, via);
+  }
+}
+
+let failed = false;
+for (const adv of advisories.values()) {
+  const id = adv.url.split("/").pop();
+  const blocking = BLOCKING.has(adv.severity);
+  const status = !blocking ? "ok (below high)" : ALLOWED[id] ? "allowed" : "FAIL";
+  if (status === "FAIL") failed = true;
+  console.log(`${status.padEnd(16)} ${adv.severity.padEnd(8)} ${adv.name}: ${adv.title} (${adv.url})`);
+}
+
+const present = new Set([...advisories.values()].map((a) => a.url.split("/").pop()));
+for (const id of Object.keys(ALLOWED)) {
+  if (!present.has(id)) console.log(`note: allowlisted ${id} no longer reported — remove it`);
+}
+
+if (failed) {
+  console.error("Unallowed high/critical npm advisories in mcpb/tools.");
+  process.exit(1);
+}
+console.log("mcpb tools audit passed.");

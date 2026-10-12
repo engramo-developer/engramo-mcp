@@ -68,6 +68,14 @@ jobs:
             exit 1
           fi
 
+          # The version is later used in file contents and npm commands; accept
+          # only plain semver so nothing hostile can ride in on a tag name or
+          # a dispatch input.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::invalid version: $VERSION"
+            exit 1
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
           echo "Resolved version=$VERSION dry_run=$DRY_RUN"
@@ -160,9 +168,102 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
+  # Claude Desktop extension (.mcpb): a zip of mcpb/manifest.json plus the
+  # binaries, installed by double-click with the API token and Gemini keys
+  # entered in Claude Desktop's own form (stored in the OS keychain), so users
+  # need neither Node.js nor a hand-edited config. macOS gets one universal
+  # binary because the manifest's command path can't vary by CPU arch, only by
+  # OS. Runs on macOS for `lipo`, and holds no secrets or write permissions
+  # (attestation is a separate job): the packer comes from npm (installed from a committed
+  # lockfile), so it never shares a job with NPM_TOKEN.
+  mcpb:
+    name: Claude Desktop extension (.mcpb)
+    needs: [build, resolve]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: engramo-mcp-*
+          merge-multiple: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20'
+
+      - name: Stage bundle
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage/server
+          lipo -create engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 -output stage/server/engramo-mcp
+          lipo stage/server/engramo-mcp -verify_arch arm64 x86_64
+          cp engramo-mcp-win32-x64.exe stage/server/engramo-mcp.exe
+          chmod 755 stage/server/engramo-mcp stage/server/engramo-mcp.exe
+          cp mcpb/icon.png LICENSE THIRD_PARTY_LICENSES stage/
+          # The manifest's version is a 0.0.0 placeholder, like the npm packages.
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("mcpb/manifest.json", "utf8"));
+            m.version = process.env.VERSION;
+            fs.writeFileSync("stage/manifest.json", JSON.stringify(m, null, 2) + "\n");
+          '
+
+      - name: Install mcpb CLI (locked)
+        run: npm ci --ignore-scripts --prefix mcpb/tools
+
+      - name: Audit mcpb CLI
+        run: node mcpb/tools/audit.mjs
+
+      - name: Validate and pack
+        run: |
+          set -euo pipefail
+          MCPB=mcpb/tools/node_modules/.bin/mcpb
+          "$MCPB" validate stage/manifest.json
+          "$MCPB" pack stage engramo.mcpb
+          "$MCPB" info engramo.mcpb
+          shasum -a 256 engramo.mcpb > engramo.mcpb.sha256
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engramo.mcpb
+          path: |
+            engramo.mcpb
+            engramo.mcpb.sha256
+
+  # Attestation lives in its own job so the OIDC token is never exposed to the
+  # job that runs third-party npm code. Skipped on dry runs so only real
+  # releases get a signed provenance record.
+  mcpb-attest:
+    name: Attest .mcpb provenance
+    needs: [mcpb, resolve]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: engramo.mcpb
+
+      - name: Verify checksum
+        run: shasum -a 256 -c engramo.mcpb.sha256
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: needs.resolve.outputs.dry_run != 'true'
+        with:
+          subject-path: engramo.mcpb
+
   github-release:
     name: GitHub Release
-    needs: [build, resolve]
+    needs: [build, resolve, mcpb, mcpb-attest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -174,13 +275,13 @@ jobs:
       - name: Verify downloaded artifacts
         run: |
           set -euo pipefail
-          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe; do
+          for f in engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe engramo.mcpb engramo.mcpb.sha256; do
             if [ ! -s "$f" ]; then
               echo "::error::missing or empty artifact: $f"
               exit 1
             fi
           done
-          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe
+          ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe engramo.mcpb engramo.mcpb.sha256
 
       # Real tag release: unchanged from before this workflow gained
       # workflow_dispatch. Same inputs, same behavior.
@@ -189,12 +290,15 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             engramo-mcp-linux-x64
             engramo-mcp-linux-arm64
             engramo-mcp-darwin-arm64
             engramo-mcp-darwin-x64
             engramo-mcp-win32-x64.exe
+            engramo.mcpb
+            engramo.mcpb.sha256
 
       # Dry run: creates a draft release (deletable, not visible to normal
       # users) so the action, including asset upload, still gets exercised.
@@ -211,6 +315,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
+          fail_on_unmatched_files: true
           tag_name: dry-run-${{ needs.resolve.outputs.version }}-${{ github.run_id }}
           name: "DRY RUN v${{ needs.resolve.outputs.version }} (run ${{ github.run_id }}) — delete me"
           generate_release_notes: true
@@ -220,10 +325,12 @@ jobs:
             engramo-mcp-darwin-arm64
             engramo-mcp-darwin-x64
             engramo-mcp-win32-x64.exe
+            engramo.mcpb
+            engramo.mcpb.sha256
 
   npm-publish:
     name: Publish to npm
-    needs: [build, resolve]
+    needs: [build, resolve, mcpb, mcpb-attest]
     runs-on: ubuntu-latest
     permissions:
       contents: read

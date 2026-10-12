@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/dist/mcpb-manifest-v0.3.schema.json",
+  "manifest_version": "0.3",
+  "name": "engramo",
+  "display_name": "EngrAmo",
+  "version": "0.0.0",
+  "description": "Create and study EngrAmo flashcards from Claude, with optional card audio.",
+  "long_description": "Connects Claude to your EngrAmo account: create catalogs and cards, search, and track spaced-repetition progress. Add your own free Gemini API keys from Google AI Studio to generate card audio.",
+  "author": { "name": "EngrAmo", "url": "https://engramo.app" },
+  "repository": { "type": "git", "url": "https://github.com/engramo-developer/engramo-mcp" },
+  "homepage": "https://engramo.app",
+  "support": "https://github.com/engramo-developer/engramo-mcp/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/engramo-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/engramo-mcp",
+      "args": [],
+      "env": {
+        "ENGRAMO_API_URL": "https://api.engramo.app",
+        "ENGRAMO_API_TOKEN": "${user_config.api_token}",
+        "ENGRAMO_TTS_GEMINI_API_KEYS": "${user_config.gemini_keys}"
+      },
+      "platform_overrides": {
+        "win32": { "command": "${__dirname}/server/engramo-mcp.exe" }
+      }
+    }
+  },
+  "tools_generated": true,
+  "keywords": ["flashcards", "spaced-repetition", "language-learning", "engramo"],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["darwin", "win32"]
+  },
+  "user_config": {
+    "api_token": {
+      "type": "string",
+      "title": "EngrAmo API token",
+      "description": "From study.engramo.app: person icon (top right) → API token → Generate.",
+      "required": true,
+      "sensitive": true
+    },
+    "gemini_keys": {
+      "type": "string",
+      "title": "Gemini API keys for card audio (optional)",
+      "description": "Free keys from aistudio.google.com, one per Google Cloud project. Separate several keys with commas. Leave empty to turn audio off.",
+      "required": false,
+      "default": "",
+      "sensitive": true
+    }
+  }
+}
