@@ -1,11 +1,11 @@
 # TDD: List engramo-mcp in public MCP directories (Claude, ChatGPT, MCP Registry, Antigravity)
 
-> **Status:** DRAFT for review, 2026-10-13. Nothing in it has been implemented yet.
+> **Status:** REVIEWED, 2026-10-13. Open questions resolved (section 1). Nothing in it has been implemented yet.
 > **Goal:** EngrAmo installs in one click with OAuth from Claude (web, desktop, mobile, Code), ChatGPT, and
 > MCP-aware dev tools (VS Code/Copilot, Cursor, Antigravity), and shows up in their official directories.
 > **Origin:** a first-pass plan drafted outside this repo ("Let's prepare comprehensive plan to do this step b….md").
-> We checked it against this codebase, engram-api, the live prod endpoints, and the directories' current
-> documentation. Section 2 lists what changed.
+> We checked it against this codebase, engram-api, engram_app, engramo-landing, the live prod endpoints, and the
+> directories' current documentation. Section 2 lists what changed.
 
 ---
 
@@ -16,7 +16,13 @@
 | Has engram-api's OAuth authorization server (Track 3 Phase 3) had its security review? | **Yes, it's done.** We treat OAuth as production-ready, and this TDD only closes the remaining gaps. |
 | Scope of the first execution wave | **All platforms, in order:** code gaps → MCP Registry → Claude directory → ChatGPT directory → Antigravity. |
 | ChatGPT integration style | **Native MCP app** (Apps SDK / app directory). We are **not** building an OpenAPI gateway or a Custom GPT. |
-| Branching | Feature branches and PRs only, never `main`. Releases stay user-driven (`/release` runs separately). |
+| Branching | engramo-mcp: feature branches and PRs only, never `main`. engram-api: changes go **uncommitted on the branch the user names**; no branches, commits, or PRs unless asked. Releases stay user-driven (`/release` runs separately). |
+| 4.3: cache token validation? | **No cache.** Every session open costs one engram-api call, behind a free `engram_` prefix pre-filter. |
+| 4.3: which endpoint validates a token? | **A new `GET /me` in engram-api** (Phase A), built before 4.3. 4.3 waits for it; there is no interim probe. |
+| Terms of Service / privacy policy | ToS exists (`engramo-landing/src/pages/policy/terms.astro`). The privacy policy needs fixes before submitting; see 6.1. |
+| Paid AI on the public prod endpoint | **Stays off** while listed. The quota error's "Upgrade your plan" wording is reworded anyway (4.5). |
+| Revoking OAuth tokens | **engram-api endpoints plus a "Connected apps" section in engram_app** (Phases A and B), done **before** the Claude and ChatGPT submissions. |
+| MCP Registry namespace | **Branded `app.engramo/mcp`**, with DNS verification on `engramo.app` and an Ed25519 key held as a CI secret (section 5). |
 
 ---
 
@@ -28,7 +34,7 @@ The original draft assumed everything still had to be built. Most of the infrast
 |---|---|
 | **Phase 1.1:** implement dynamic per-request auth instead of a startup env token | **Done** (Track 3 Phase 1). `engramo-mcp http` is multi-tenant. `bearer_auth_middleware` (`src/http_auth.rs`) scopes each session's bearer into `CURRENT_BEARER_TOKEN`; the session factory in `build_app` (`src/main.rs`) builds one `EngramoClient` per MCP session; `SessionTokens` binds each session id to the token that opened it. |
 | The endpoint is `/mcp` | It is served at **root** `/` (rmcp `StreamableHttpService` via `fallback_service`). Prod is `https://mcp.engramo.app/` and dev is `https://mcp-engramo.volmyr.com/` (`docs/gcp_deployment_guide.md`). |
-| **Phase 1.2:** provide OAuth 2.0 endpoints / DCR | **Done and reviewed** (Track 3 Phase 3, `engram-ws/tdds/track3-mcp-chatgpt-app.md`). engram-api is the authorization server: `/.well-known/oauth-authorization-server`, `/oauth/register` (DCR), `/oauth/authorize` (Supabase login bridge page), `/oauth/token`, PKCE S256 only, public clients (`token_endpoint_auth_methods_supported: ["none"]`). engramo-mcp is the resource server and serves `/.well-known/oauth-protected-resource` (`src/well_known.rs`). |
+| **Phase 1.2:** provide OAuth 2.0 endpoints / DCR | **Done and reviewed** (Track 3 Phase 3, `engram-ws/tdds/track3-mcp-chatgpt-app.md`). engram-api is the authorization server: `/.well-known/oauth-authorization-server`, `/oauth/register` (DCR), `/oauth/authorize` (Supabase login bridge page), `/oauth/token`, PKCE S256 only, public clients (`token_endpoint_auth_methods_supported: ["none"]`). engramo-mcp is the resource server and serves `/.well-known/oauth-protected-resource` (`src/well_known.rs`). **But OAuth has never been run end to end by a real client**: Track 3 validated ChatGPT only with a pasted token. Phase 0 closes that. |
 | **Claude:** fork `modelcontextprotocol/servers` and PR a listing | That repo stopped accepting third-party server listings. The two real channels are the **official MCP Registry** (`registry.modelcontextprotocol.io`, published with the `mcp-publisher` CLI and a `server.json`) and Anthropic's **Connectors Directory** (developer portal at `claude.ai/directory/manage`). |
 | **Smithery:** add `smithery.yaml` | Smithery only needs that file for servers it hosts or builds. For an already hosted remote server, you register the URL in the Smithery UI. Glama auto-indexes public GitHub MCP repos, and you claim the listing. |
 | **Antigravity:** a "standard Antigravity schema" with `transport`/`auth.oauth2` blocks, plus a Google partner intake | The schema is invented. Antigravity reads `mcp_config.json`, using `serverUrl` for remote servers and `command`/`args` for local ones. Its MCP Store is curated, and we found **no public submission process**. |
@@ -52,21 +58,30 @@ POST https://mcp.engramo.app/   (no Authorization header)
 → HTTP/2 401, content-type: text/plain — and **no `WWW-Authenticate` header**  ← gap, see 4.2
 ```
 
+Note: `resource` is advertised **without** a trailing slash, while connectors are configured with
+`https://mcp.engramo.app/`. Lenient clients normalize the two to the same URL; strict RFC 9728 clients may not. Phase 0 checks this.
+
 ### 2.2 Other relevant facts found during research
 
 - **Redirect URIs:** `engram-api/service/src/oauth_service.rs::validate_redirect_uri_format` accepts any
   `https://` URI and loopback `http://` URIs at DCR time. Claude's callback (`https://claude.ai/api/mcp/auth_callback`) and
   ChatGPT's (a `chatgpt.com` https URL) therefore both register without an allowlist change.
-- **Token model:** each OAuth access token is a minted 90-day `engram_` PAT, and there is **no refresh token**. When it expires the
-  user must redo OAuth. Clients only do that when the server answers with HTTP 401. See 4.3.
-- **Tool annotations:** `grep` finds **no** `annotations(...)` on any `#[tool(...)]` in the crate. Counts per file:
-  `server.rs` 29, `ai.rs` 5, `cards.rs` 4, `learning.rs` 4, `learning_paths.rs` 5, `media.rs` 2, `tts.rs` 2. Both
-  Claude's and OpenAI's reviews require annotations.
+- **Token model:** each OAuth access token is a minted 90-day `engram_` PAT, stored with `source = 'oauth'`
+  (`api_token_service.rs`, `TokenSource::Oauth`), and there is **no refresh token**. When it expires the user must redo
+  OAuth. Clients only do that when the server answers with HTTP 401. See 4.3.
+- **Token revocation gap:** `GET`/`DELETE /auth/api-tokens` (used by engram_app's API-token page) are hard-scoped to
+  `source = 'user'` (`db/src/repo/api_token/api_token_repo_pg.rs:266, 308, 331`; `mod.rs:174`: "cannot delete
+  OAuth-issued rows"). **OAuth tokens can't be listed or revoked anywhere today.** Phases A and B fix this.
+- **Live tool surface:** **36 tools**: 29 in `server.rs`, 5 in `tools/ai.rs` (paid AI, off in prod), 2 in `tools/tts.rs`
+  (stdio only). None has `annotations(...)` or a `title`. The `#[tool]`s in `tools/{cards,learning,learning_paths,media}.rs`
+  belong to `CardTools`, `LearningTools`, `LearningPathTools`, and `MediaTools`, which are **unused duplicates** (see the regression
+  guards at `server.rs:1626`, `:1870`, `:1912`). They are out of scope here, so don't annotate them.
+- **Session storage:** rmcp sessions live in memory (`LocalSessionManager`). Cloud Run runs up to 5 instances
+  (`cloudbuild.yaml`) with no session affinity, and MCP clients don't keep cookies anyway. A request that lands on another
+  instance gets 404, and the client re-initializes. That works, but it adds churn during a reviewer's "call every tool" run.
 - **MCPB:** the Claude directory **no longer accepts local servers packaged as MCPB** (desktop-extension listings
-  are deprecated, and local servers now go into the directory only inside a *plugin*). The `.mcpb` from the `feat/mcpb-bundle`
-  branch is still worth shipping. It's a GitHub-release download, and the MCP Registry accepts it as a package type.
-- **Known gap carried over from Track 3:** OAuth-minted PATs are not visible or revocable in the web-app dashboard. Reviewers
-  may ask how users revoke access. That work belongs to engram-api and engram-web-app and is out of scope here, but it should be flagged.
+  are deprecated, and local servers now go into the directory only inside a *plugin*). The `.mcpb` already ships as a
+  GitHub-release asset (#88), and the MCP Registry accepts it as a package type.
 
 ---
 
@@ -94,7 +109,8 @@ Source: <https://developers.openai.com/apps-sdk/deploy/submission>
 - OpenAI **organization or developer identity verification** must be complete first. Only one app can be in review per org at a time.
 - **Domain verification:** serve the exact challenge token as plain text at
   `https://<mcp host or eligible parent>/.well-known/openai-apps-challenge`.
-- Automated tool scan. Tool annotations need a justification, and tool names should be verb-style and unique.
+- Automated tool scan. Each tool's `readOnlyHint`, `destructiveHint`, and `openWorldHint` need a justification, and tool names should
+  be verb-style and unique. *(Confirm the exact required set against the form at submission time.)*
 - Assets: a square logo (48×48 minimum), a dark variant (recommended), brand colors, display name (30 chars max), subtitle (30 max), long
   description (4000 max), category, and up to 20 capabilities.
 - **Website, support, privacy policy, and Terms of Service URLs are all required.**
@@ -106,10 +122,11 @@ Sources: <https://modelcontextprotocol.info/tools/registry/publishing/>,
 <https://www.stackone.com/blog/mcp-registry-how-to-get-listed/>
 
 - Publish with the `mcp-publisher` CLI (`init`, `login`, `validate`, `publish`) and a `server.json`.
-- Namespace auth: `io.github.<owner>/…` through GitHub login or **GitHub OIDC in Actions** (no secret needed), or a
-  reverse-DNS namespace through DNS or HTTP verification.
-- `remotes[]` lists remote endpoints, and the URL itself is the proof of ownership.
-- `packages[]` covers npm and others. An npm package needs `"mcpName": "<server name>"` in its `package.json`.
+- Namespace auth: `io.github.<owner>/…` through GitHub login or GitHub OIDC in Actions, or a **reverse-DNS namespace
+  (`app.engramo/…`) through DNS or HTTP verification** with an Ed25519 key. We use DNS (section 5).
+- `remotes[]` lists remote endpoints. Our remote (`mcp.engramo.app`) sits under the verified domain.
+- `packages[]` covers npm and others. An npm package needs `"mcpName": "<server name>"` in its `package.json`, and the registry
+  checks it against the **published** npm version.
 - An **MCPB** package must be hosted on GitHub or GitLab releases with "mcp" in the URL, and it is verified by a `fileSha256` in the record.
 - Downstream, the registry feeds VS Code/Copilot's MCP gallery and aggregators such as PulseMCP, Smithery, and Glama.
 
@@ -125,38 +142,36 @@ Sources: Antigravity custom MCP guides (Google Developer Experts on Medium, Goog
 
 ## 4. Design: code changes in engramo-mcp
 
-Everything below goes on a single branch, for example `feat/directory-readiness`. The `/review` loop runs before the PR is opened.
+4.1, 4.2, 4.4, and 4.5 go on one branch, `feat/directory-readiness`. 4.3 waits for Phase A (`GET /me` deployed to dev) and lands as
+its own small PR (`feat/session-open-token-check`). The `/review` loop runs before each PR is opened.
 
-### 4.0 Prerequisite: land `feat/mcpb-bundle`
-That branch has uncommitted work:
-- `release.yml` hardening: semver validation, a locked `mcpb` CLI, `npm audit`, a SHA-256 file, and a separate
-  `mcpb-attest` provenance job.
-- The README verification note.
-- The manifest `default: ""`.
-- The `mcpb_manifest_matches_env_contract` test in `src/config.rs`.
-
-Finish it, run the gate, and open its PR first. Phase 2's registry entry depends on the `.mcpb` and `.sha256` release assets.
+### 4.0 Prerequisite: the leftover `feat/mcpb-bundle` commit
+The bundle itself landed in #88 (release hardening, `.sha256`, `mcpb-attest`, `mcpb_manifest_matches_env_contract`). One commit
+is still only on the branch: `73a59d5 fix(ci): unblock mcpb tools npm audit` (`tmp` override plus `mcpb/tools/audit.mjs` with a
+reviewed allowlist). Cherry-pick it onto a fresh branch from `main`, run the gate, and open the PR. Nothing else depends on it, except
+that the next release's `mcpb` job needs it to pass `npm audit`.
 
 ### 4.1 Tool annotations (hard requirement for both directories)
-- Add `annotations(...)` to every `#[tool(...)]` in `src/server.rs` and `src/tools/{cards,learning,learning_paths,media,ai,tts}.rs`:
-  - `title`: a human-readable name, for example "List catalogs".
-  - `read_only_hint`: `true` for tools that only read.
-  - `destructive_hint`: `true` for delete and archive tools. Set it to `false` explicitly for non-destructive writes.
-  - `idempotent_hint`: where it is meaningful, for example `update_*`.
-  - `open_world_hint: false`. The tools only touch the user's own EngrAmo account. `ai.rs` and local TTS call external
-    AI providers, so they are a per-tool judgment call.
-- Starting classification, to confirm per tool during implementation:
+- Scope: the **36 live tools**, meaning the `#[tool(...)]`s in `src/server.rs`, `src/tools/ai.rs`, and `src/tools/tts.rs`. Leave the
+  unused `*Tools` duplicates alone (2.2).
+- For each tool, set:
+  - Top-level `title = "..."` (rmcp-macros 3.5 `#[tool(title = ...)]`; clients show it first), and the same string as
+    `annotations(title = ...)`.
+  - `read_only_hint`, `destructive_hint`, `idempotent_hint`, and `open_world_hint`, **all explicitly**. For read-only tools,
+    set `destructive_hint = false` and `idempotent_hint = true`.
+- Classification. Per the MCP spec, `destructiveHint` means "may perform destructive updates", so **overwriting content counts**.
+  Confirm each row during implementation:
 
-| Class | Tools (pattern) | Hints |
+| Class | Tools | Hints |
 |---|---|---|
-| Read | `list_*`, `get_*`, `search*`, due-cards, `list_tts_voices`, `get_server_version` | `read_only_hint = true` |
-| Destructive write | `delete_*`, including `delete_catalog`'s archive path (see #81) | `destructive_hint = true` |
-| Additive/updating write | `create_*`, `update_*`, `add_*_to_learning`, `generate_*` (whatever it persists), `generate_card_audio` | `read_only_hint = false, destructive_hint = false` |
-| Paid AI (`ai.rs`) | TTS, translate, dictionary, agent chat, `translate_batch_import` | Classify each tool by whether it persists anything |
+| Read (14) | `get_server_version`, `list_catalogs`, `get_catalog`, `list_cards`, `get_card`, `get_due_cards`, `get_all_learning_cards`, `list_learning_paths`, `get_learning_path`, `search_global`, `search_catalogs`, `search_learning_paths`, `list_media`, `list_tts_voices` | `read_only = true`, `open_world = false` |
+| Additive write (9) | `create_learning_path`, `add_card_to_learning`, `add_catalog_to_learning`, `activate_learning_path`, `add_catalog_to_learning_path`, `upload_media`, `generate_card`, `generate_catalog_with_cards`, `generate_cards` | `read_only = false`, `destructive = false`, `open_world = false`; `idempotent = true` for `add_*`/`activate_*` if the API treats repeats as no-ops |
+| Destructive / overwriting write (8) | `delete_card`, `delete_catalog` (including the archive path, #81), `update_card`, `update_catalog`, `update_learning_path`, `remove_catalog_from_learning_path`, `deactivate_learning_path`, `generate_card_audio` (overwrite deletes the old audio, #60) | `read_only = false`, `destructive = true`, `idempotent = true` (except `generate_card_audio`); `open_world = true` only for `generate_card_audio` (calls Gemini) |
+| Paid AI (5, off in prod) | `generate_tts_for_cards`, `translate_cards`, `generate_dictionary_for_cards`, `ai_agent_chat`, `translate_batch_import` | `open_world = true`. Destructive if the tool overwrites existing card fields or audio, otherwise additive |
 
-- **Regression test** in `src/server.rs` tests: build the server with paid AI and local TTS enabled, so all routers
-  are summed. For each tool in `list_all()`, assert that `annotations.title` is set and that at least one of
-  `read_only_hint`/`destructive_hint` is `Some`. This way a future tool can't ship without annotations.
+- **Regression test** in `src/server.rs` tests: build the server with paid AI and local TTS enabled, so all three routers are
+  summed (assert 36 tools). For each tool in `list_all()`, assert that `title` and `annotations.title` are set and that
+  `read_only_hint`, `destructive_hint`, and `open_world_hint` are all `Some`. This way a future tool can't ship without them.
 - While editing, check tool names and descriptions against review criteria: verb-style, unique, accurate, and with no
   instructions aimed at the model in descriptions (the prompt-injection policy).
 
@@ -165,29 +180,47 @@ MCP's authorization spec expects a 401 from the resource server to carry
 `WWW-Authenticate: Bearer resource_metadata="<url of .well-known/oauth-protected-resource>"`. Clients use it to start discovery.
 Some clients fall back to probing `.well-known` themselves, but relying on that is fragile.
 
-- `bearer_auth_middleware` (`src/http_auth.rs`, around line 186) has two 401 paths: a missing or malformed bearer, and a
-  session/token mismatch. Both should send the header.
-- The middleware state is currently `SessionTokens`. Replace it with a small `AuthState { sessions, resource_metadata_url }`, or
-  something similar. Build the URL in `build_app` (`src/main.rs`) from the same value used for
-  `ProtectedResourceState.resource` (`MCP_PUBLIC_URL`, falling back to the localhost placeholder).
-- Tests in `http_auth.rs`: both 401 paths send the header with the exact URL. The existing 401 tests keep passing.
+- `bearer_auth_middleware` (`src/http_auth.rs`) has two 401 paths today:
+  - **Missing or malformed bearer** → keep 401 and **add** the header (no `error=` parameter, per RFC 6750 §3.1).
+  - **Session/token mismatch** → change it to **404** ("session not found"), **without** the header. Sending the header here
+    causes a loop: a client that re-runs OAuth retries with the **same** `Mcp-Session-Id`, hits the mismatch again, and re-auths
+    forever. 404 is the spec's "unknown session, start a new one" signal (rmcp already returns 404 for unknown ids), so the
+    client re-initializes with its new token. It reveals nothing beyond what the 401 did. Update the existing mismatch tests.
+- 4.3's invalid-token 401 carries the header with `error="invalid_token"`.
+- The middleware state is currently `SessionTokens`. Replace it with an `AuthState { sessions, resource_metadata_url }`
+  (extended in 4.3). Build the URL in `build_app` (`src/main.rs`) from the same value used for `ProtectedResourceState.resource`,
+  with any trailing `/` trimmed before appending `/.well-known/oauth-protected-resource`.
+- **Fail fast:** in `http` mode, refuse to start when `MCP_PUBLIC_URL` is unset, instead of falling back to the
+  `http://localhost:8080` placeholder. Otherwise a misconfigured prod would send every client to localhost. Local runs set it
+  explicitly (section 8). Update `config.rs` tests and the startup warning.
+- Tests in `http_auth.rs`: the missing-bearer 401 carries the header with the exact URL, the mismatch returns 404 with no header,
+  and the trailing-slash case. The remaining existing tests keep passing.
 
 ### 4.3 Expired or revoked token → HTTP 401 at session open
-- **Problem:** OAuth tokens are 90-day PATs with no refresh. Today any bearer that isn't empty opens a session, and a dead
-  token only fails later inside a tool call as `is_error: true`. Claude and ChatGPT only re-run OAuth on an HTTP 401, so
-  after 90 days a user silently gets errors on every call.
-- **Design:** when a request has **no `Mcp-Session-Id`** (it is opening a session), validate the bearer with one cheap
-  engram-api call before passing the request to rmcp:
-  - Reuse an existing lightweight authenticated endpoint already wrapped in `client.rs`, such as the subscription
-    resource. Use the shared `HardenedClient`.
-  - On `ApiError` unauthorized or forbidden → 401 with the 4.2 header.
-  - On network or 5xx errors → 502 or 503, **not** 401, so a transient API outage doesn't force a re-login.
-- Cost: one extra API call per session, not per request. Requests on an existing session are unchanged.
+**Depends on Phase A** (`GET /me` deployed to dev).
+
+- **Problem:** OAuth tokens are 90-day PATs with no refresh, and with Phase A users can also revoke them. Today any bearer that
+  isn't empty opens a session, and a dead token only fails later inside a tool call as `is_error: true`. Claude and ChatGPT only
+  re-run OAuth on an HTTP 401.
+- **Design:** for a **POST without an `Mcp-Session-Id`** (a session open), validate the bearer before passing the request to rmcp.
+  GET or DELETE without a session id is rejected by rmcp anyway, so it isn't checked.
+  1. **Pre-filter, at no cost:** if the bearer doesn't start with `engram_`, return 401 with `error="invalid_token"` and make no
+     upstream call. This takes the cost out of junk-bearer floods (otherwise each unauthenticated request causes one engram-api call).
+  2. **Probe:** `EngramoClient::get_me()` → `GET /me` through the shared `HardenedClient`.
+     - `ApiError::Unauthorized` (upstream 401) → **401** + `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"`.
+     - **403 counts as valid.** The backend turns every 403 into a bare `"Forbidden"` (`error.rs:346`), so a 403 doesn't prove
+       the token is dead, and a 401 would send the user back through OAuth for nothing.
+     - Network or 5xx errors → **503**, **not** 401, so a transient API outage doesn't force a re-login.
+  3. **No cache** (decided). Sessions are short: rmcp closes idle sessions after 5 minutes, and Cloud Run scales to zero. So a token
+     that dies mid-session is caught at the next session open within minutes. Until then, tool calls return the `Unauthorized`
+     error below.
+- `AuthState` gains `http: HardenedClient` and `api_url`.
+- **Error text:** `ApiError::Unauthorized`'s message (`error.rs:52`) says "Check your ENGRAMO_API_TOKEN", which is wrong for OAuth users.
+  Make it work for both modes: "EngrAmo authorization is invalid, expired, or revoked. Reconnect EngrAmo in your AI app (local
+  installs: update ENGRAMO_API_TOKEN)." This change goes in with 4.1/4.2.
 - Security: the token is never logged. The rule against logging the session id is unchanged.
-- Tests: wiremock covering valid → session opens, 401 from the API → 401 with the header, 500 from the API → 503, and a request with a
-  session id → no validation call.
-- Open question for review: is "every session open costs an API call" acceptable, or should we cache positive results
-  (token hash → expiry, for example 5 min)? The proposal is no cache at first, to keep it simple.
+- Tests: wiremock covering valid → session opens; non-`engram_` bearer → 401 with no upstream call; upstream 401 → 401 with the header;
+  upstream 403 → session opens; upstream 500 → 503; a request with a session id → no `/me` call; GET without a session id → no `/me` call.
 
 ### 4.4 ChatGPT domain verification route
 - New unauthenticated route `GET /.well-known/openai-apps-challenge` on the outer router in `build_app`, next to
@@ -200,21 +233,65 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
 - The token is a public value, not a secret, so a plain env var is fine.
 
 ### 4.5 Public endpoint posture
-- Confirm that prod Cloud Run has `ENGRAMO_ENABLE_PAID_AI` **off**. If it's on, make sure no tool sells or upsells a subscription
-  in-app, per OpenAI policy. The `engramo://subscription` resource is read-only info, which is fine.
+- Prod Cloud Run keeps `ENGRAMO_ENABLE_PAID_AI` **off** while listed (decided). Confirm the prod trigger's substitution, since
+  `cloudbuild.yaml`'s default is the dev value `false`.
+- **No commerce wording:** the quota error (`error.rs:41`) says "Upgrade your plan or delete unused resources." It reaches
+  ChatGPT even with paid AI off. Reword it neutrally, e.g. "…limit reached ({used}/{limit}). Delete unused resources, or manage
+  your plan in the EngrAmo app." The `engramo://subscription` resource is read-only info, which is fine.
 - Local TTS is already stdio-only by design (see CLAUDE.md), so it is never exposed on the public endpoint.
+- During the review window, consider deploying prod with `--max-instances 1` so sessions don't hop between instances (2.2).
+  Revert once the reviews are done.
 
 ### 4.6 Not changing
-- OAuth server logic in engram-api: reviewed, and DCR plus https redirects already cover Claude and ChatGPT.
+- OAuth server logic in engram-api: reviewed, and DCR plus https redirects already cover Claude and ChatGPT (pending
+  Phase 0 confirmation that `/oauth/authorize` and `/oauth/token` accept the RFC 8707 `resource` parameter).
 - Endpoint path: stays at `/`. Directories accept any https URL. *Check during the ChatGPT submission:* some guides say the URL "ends
   with /mcp". If OpenAI insists, add `/mcp` as an alias route instead of moving root.
 
 ---
 
+## 4A. Design: engram-api (Phase A)
+
+Implemented directly in `/Users/vova/work/workspace/volmyr/github/engram-api`, **uncommitted on the branch the user names**.
+Unblocks 4.3 and the revocation story.
+
+### 4A.1 `GET /me`
+- Route next to the existing `/me/subscription` and `/me/usage` (`app/src/routes/mod.rs:272`). Handler in a new or existing
+  route module, using the `AuthUser` extractor, so it accepts both Supabase JWTs and `X-Api-Key` PATs.
+- Response `200 {"user_id": "<uuid>"}`. **No email or other PII.** Its job is "is this credential alive, and whose is it".
+- It must do no work beyond authentication: no DB query beyond what `AuthUser` already does.
+- An expired, revoked, or unknown token → 401, as for any route. Add a `utoipa` path entry and route tests.
+
+### 4A.2 Connected apps: list and revoke OAuth tokens
+- `GET /auth/connected-apps` → the caller's `source = 'oauth'`, non-one-time tokens:
+  `[{ "id", "client_name", "created_at", "last_used_at", "expires_at" }]`. Never return the token or its hash.
+  `client_name` is whatever OAuth issuance stores (the DCR `client_name`); confirm the column during implementation.
+- `DELETE /auth/connected-apps/{id}` → deletes that row only when `user_id` matches **and** `source = 'oauth'`. Otherwise 404,
+  mirroring how the existing personal-token delete is scoped to `source = 'user'`.
+- The existing `/auth/api-tokens` routes stay as they are (personal token only).
+- Effect on MCP: a revoked token gets 401 on the next API call, so the next session open gets 401 (4.3) and the client re-runs OAuth.
+- Repo, service, and route tests, including "can't delete another user's row" and "can't delete a `source = 'user'` row through this route".
+
+## 4B. Design: engram_app (Phase B)
+
+- A "Connected apps" section in settings next to `api_token_page.dart`. It lists 4A.2's entries (client name, connected date,
+  last used) with a revoke action and a confirmation dialog. Uses the existing bloc and data-source pattern (`api_token_bloc.dart`,
+  `api_token_data_source.dart`).
+- The empty state explains how to connect Claude or ChatGPT.
+- The workflow for that repo follows its own conventions. Ask before branching or committing.
+
+---
+
 ## 5. Design: MCP Registry publication
 
-- **Name:** `io.github.engramo-developer/engramo-mcp`. GitHub OIDC from Actions means no new secret. A reverse-DNS
-  name (`app.engramo/…`) would need DNS verification and a signing key held as a secret, which we're avoiding.
+- **Name:** `app.engramo/mcp` (decided: branded). Authenticated by **DNS verification** on `engramo.app`:
+  - Generate an Ed25519 keypair once, offline (`openssl genpkey -algorithm ed25519`). Publish the public key as a TXT record on
+    `engramo.app` in the format `mcp-publisher` documents (`v=MCPv1; k=ed25519; p=<base64 public key>`; verify the exact format
+    at implementation time).
+  - Store the private key as a GitHub Actions secret, `MCP_REGISTRY_PRIVATE_KEY`, scoped to a protected **environment**
+    (`mcp-registry`) that only release tags can use.
+  - Rotation: a new keypair, a new TXT record, then the new secret. Remove the old TXT record after the next successful publish.
+  - The remote (`mcp.engramo.app`) is a subdomain of the verified domain.
 - **New `server.json`** (repo root), with schema-pinned `version` placeholder `0.0.0` like the other manifests:
   - `remotes`: `[{ "type": "streamable-http", "url": "https://mcp.engramo.app/" }]`.
   - `packages`:
@@ -222,17 +299,19 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
       `ENGRAMO_API_URL` (default `https://api.engramo.app`), `ENGRAMO_TTS_GEMINI_API_KEYS` (optional, secret).
     - mcpb: `https://github.com/engramo-developer/engramo-mcp/releases/download/v<ver>/engramo.mcpb` with
       `fileSha256`.
-- `npm/engramo-mcp/package.json`: add `"mcpName": "io.github.engramo-developer/engramo-mcp"`.
+- `npm/engramo-mcp/package.json`: add `"mcpName": "app.engramo/mcp"`.
 - **`release.yml`:** add a new job `mcp-registry`:
   - `needs: [resolve, github-release, npm-publish]`, skipped when `dry_run == 'true'`.
-  - `permissions: { contents: read, id-token: write }`.
+  - `environment: mcp-registry`, `permissions: { contents: read }`.
   - Download the release's `engramo.mcpb.sha256`, then rewrite `version` and `fileSha256` into a staged `server.json` with
     `process.env` (same pattern as the hardened manifest rewrite).
   - Install `mcp-publisher` pinned to a version **and checksum**, matching the repo's pinning discipline.
-  - Run `mcp-publisher validate`, `mcp-publisher login github-oidc`, and `mcp-publisher publish`.
-  - It keeps no other secrets and never shares a job with `NPM_TOKEN`.
+  - Run `mcp-publisher validate`, `mcp-publisher login dns --domain engramo.app --private-key "$MCP_REGISTRY_PRIVATE_KEY"`, and
+    `mcp-publisher publish`. Retry `publish` a few times with a backoff, because the registry checks `mcpName` against the
+    just-published npm version, which can take a moment to appear.
+  - The registry key is the only secret this job sees, and it never shares a job with `NPM_TOKEN`.
 - **Test** in the same style as `mcpb_manifest_matches_env_contract`: the env var names in `server.json` match `McpConfig` and
-  `tts::ENV_KEYS`, and secret fields are marked secret. The http-only and paid-AI vars must be absent.
+  `tts::ENV_KEYS`, secret fields are marked secret, `name` equals `package.json`'s `mcpName`, and the http-only and paid-AI vars are absent.
 - **Aggregators**, after the first publish:
   - Register `https://mcp.engramo.app/` on Smithery (UI).
   - Claim the Glama listing.
@@ -245,10 +324,17 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
 ### 6.1 Shared prerequisites
 - A **prod reviewer test account** with email and password login through the Supabase bridge and no MFA. Populate it with several
   catalogs, cards, due cards, and a learning path.
-- **Public pages on engramo.app:**
-  - A docs or how-to-connect page.
-  - Privacy policy. It must list Anthropic and OpenAI as sub-processors; Track 3 already added OpenAI.
-  - **Terms of Service.** Confirm it exists, since OpenAI requires it.
+- **Public pages on engramo.app** (`engramo-landing`):
+  - A docs or how-to-connect page, including how to disconnect (4B).
+  - **Terms of Service:** exists at `/policy/terms` (`src/pages/policy/terms.astro`). Record the URL.
+  - **Privacy policy** (`src/pages/policy/privacy.astro`), a submission blocker. It needs:
+    - **Anthropic** added as a processor, worded like the OpenAI entry (line 80). It should cover claude.ai connectors and the
+      Claude Desktop/Code stdio and `.mcpb` installs.
+    - **Google (Gemini)** added. engram-api's prod config sends content to `generativelanguage.googleapis.com` and to the
+      Gemini-based premium-TTS service. The lines saying "No other third-party services receive your personal data" (81) and
+      "only… our own servers and Supabase" (67) are currently inaccurate.
+    - Line 92 updated: access also works with API tokens and OAuth access tokens (`engram_` PATs), not only Supabase sessions.
+    - A sentence on revoking connected apps (4B), and a new "Last updated" date.
   - Support contact, using the GitHub issues URL or an email.
 - **Brand assets:** a square icon (reuse `mcpb/icon.png`), a dark variant, and brand hex colors.
 
@@ -261,7 +347,7 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
    - Listing.
    - Use cases: reads and writes.
    - Auth: OAuth with DCR.
-   - Data handling: our own first-party API.
+   - Data handling: our own first-party API; revocation via Connected apps (4B).
    - Test & launch: the test account.
    - Compliance: all seven acknowledgments.
 3. Monitor the portal. After the automated scan, the connector goes live as **Community**.
@@ -274,7 +360,8 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
 4. Prepare 5 positive and 3 negative test cases.
    - Positive examples: make a deck from a topic, list due cards, add a catalog to learning, search cards, update a card.
    - Negative examples: requests to delete everything without confirmation, actions on another user's data, purchase or upgrade requests.
-5. Record the demo video, fill in the metadata, and submit. Iterate on the email feedback, then publish when approved.
+5. Record the demo video, fill in the metadata (including the per-tool hint justifications from 4.1), and submit. Iterate on the
+   email feedback, then publish when approved.
 
 ### 6.4 Google Antigravity
 1. Add an "Antigravity" section to the README with an `mcp_config.json` snippet:
@@ -292,13 +379,17 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
 
 | # | Deliverable | Repo / owner | Depends on |
 |---|---|---|---|
-| 0 | Land `feat/mcpb-bundle` PR | engramo-mcp / agent + user merge | — |
-| 1 | 4.1–4.5 on `feat/directory-readiness` → `/review` → PR | engramo-mcp / agent | 0 |
-| 1r | `/release`, deploy dev → prod, set `MCP_PUBLIC_URL` (already set) | user | 1 |
-| 2 | `server.json`, `mcpName`, registry job, test → PR → next release publishes | engramo-mcp / agent; user releases | 1r |
-| 3 | Test account, legal pages, assets | user / engramo.app | — (parallel) |
-| 4 | Claude directory submission | user | 1r, 3 |
-| 5 | ChatGPT verification, challenge env, submission | user (+ env change in 4.4) | 1r, 3 |
+| 0 | **OAuth spike (no code):** connect dev (`https://mcp-engramo.volmyr.com/`) as a custom connector in claude.ai, in ChatGPT developer mode, and in MCP Inspector, **using OAuth**. Record whether each client gets past the missing `WWW-Authenticate`, whether `/oauth/authorize` and `/oauth/token` accept the `resource` parameter, and whether the slash-less `resource` is accepted. Findings update 4.2 and 4.6. | user + agent | — |
+| 0b | PR the leftover `73a59d5` (4.0) | engramo-mcp / agent | — |
+| A | `GET /me` + connected-apps endpoints (4A), deployed to dev, then prod | engram-api / agent (uncommitted on the user's branch); user commits and deploys | — |
+| B | "Connected apps" section (4B) | engram_app / agent; user ships | A |
+| 1 | 4.1, 4.2, 4.4, 4.5 + `Unauthorized` text on `feat/directory-readiness` → `/review` → PR | engramo-mcp / agent | 0 |
+| 1b | 4.3 on `feat/session-open-token-check` → `/review` → PR | engramo-mcp / agent | 1, A on dev |
+| 1r | `/release`, deploy dev → prod (`MCP_PUBLIC_URL` is already set; now required) | user | 1, 1b |
+| 2 | DNS TXT record + `mcp-registry` environment secret (user); `server.json`, `mcpName`, registry job, test → PR (agent) → the next release publishes | engramo-mcp / agent; user DNS, secret, release | 1r |
+| 3 | Test account, privacy policy fixes (6.1), assets | user / engramo-landing (agent can draft the policy diff) | — (parallel) |
+| 4 | Claude directory submission | user | 1r, 3, A + B in prod |
+| 5 | ChatGPT verification, challenge env, submission | user (+ env change in 4.4) | 1r, 3, A + B in prod |
 | 6 | Antigravity README section + outreach | agent (docs), user (outreach) | 1r, 2 |
 
 ---
@@ -306,33 +397,38 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
 ## 8. Verification
 
 - **Gate after every code change:** `cargo fmt --all && cargo check && cargo clippy && cargo test`, plus `cargo sort` if
-  deps change.
+  deps change. engram-api and engram_app run their own gates.
 - **Local http mode against dev:**
   `ENGRAMO_API_URL=https://api-engram.volmyr.com MCP_PUBLIC_URL=http://localhost:8080 cargo run -- http`, then:
   - `curl -i -X POST localhost:8080/` → `401` with
     `WWW-Authenticate: Bearer resource_metadata="http://localhost:8080/.well-known/oauth-protected-resource"`.
-  - `initialize` with a bogus bearer → `401` with the header.
-  - `initialize` with a valid dev `engram_` token, then `tools/list` → every tool has `annotations.title` and a hint.
+  - Unset `MCP_PUBLIC_URL` → http mode refuses to start.
+  - `initialize` with a bearer like `foo` → `401` with `error="invalid_token"`, and no `/me` call in the logs.
+  - `initialize` with a revoked `engram_` token → `401` with `error="invalid_token"`.
+  - `initialize` with a valid dev `engram_` token, then `tools/list` → 36 tools minus paid AI and TTS (29), each with `title`,
+    `annotations.title`, and all three hints.
+  - Reuse that session id with a different valid token → `404`.
   - `curl localhost:8080/.well-known/openai-apps-challenge` → 404 when unset, and the token when `OPENAI_APPS_CHALLENGE` is set.
 - **MCP Inspector against dev** (`https://mcp-engramo.volmyr.com/`): the full OAuth flow starts from the 401, and every tool
   can be called.
-- **Registry:** run `mcp-publisher validate server.json` locally. After the release, check
-  `curl "https://registry.modelcontextprotocol.io/v0/servers?search=engramo"`.
+- **Registry:** run `mcp-publisher validate server.json` locally, and check the DNS TXT record with `dig TXT engramo.app`. After
+  the release, check `curl "https://registry.modelcontextprotocol.io/v0/servers?search=engramo"`.
 - **End-to-end on each platform** (claude.ai custom connector, ChatGPT developer mode, Antigravity config): "make me a deck of 5
   Spanish verbs", then confirm the cards land in the test account at `study.engramo.app`.
-- **Token expiry path:** revoke or expire the PAT in the DB on dev. The next session open should get a 401, and the client should re-run OAuth.
+- **Revocation path:** connect Claude on dev, revoke it in engram_app's Connected apps, wait for the session to idle out (or start a
+  new chat). The next session open gets 401, and Claude re-runs OAuth.
 
 ---
 
-## 9. Open questions for review
+## 9. Resolved questions (2026-10-13)
 
-1. 4.3: validate at session open with no cache (proposed), or cache positive results for a few minutes?
-2. 4.3: which existing engram-api endpoint is the cheapest authenticated probe? Is there a `/me`, or is subscription good enough?
-3. Does engramo.app have a Terms of Service page, and does the privacy policy name Anthropic as a sub-processor?
-4. Should the prod MCP endpoint ever enable paid AI? If so, re-check OpenAI's no-in-app-commerce rule.
-5. OAuth PAT revocation in the dashboard (the Track 3 known gap): do we need it before directory review, or is it a follow-up?
-6. Registry namespace: is `io.github.engramo-developer/engramo-mcp` acceptable, or do we want the branded `app.engramo/…`, which
-   needs DNS verification and a key secret?
+1. **4.3 cache:** none. An `engram_` prefix pre-filter handles junk tokens (4.3).
+2. **4.3 probe:** a new `GET /me` in engram-api (4A.1). 4.3 waits for it.
+3. **Legal pages:** ToS exists. The privacy policy needs Anthropic, Google/Gemini, and token-wording fixes (6.1).
+4. **Paid AI in prod:** stays off. The quota wording is neutralized regardless (4.5).
+5. **OAuth token revocation:** engram-api endpoints (4A.2) plus engram_app "Connected apps" (4B) before the submissions. The
+   earlier assumption that the mobile app already covered it was wrong: its token page only manages the `source = 'user'` token.
+6. **Registry namespace:** branded `app.engramo/mcp` with DNS verification (section 5).
 
 ---
 
@@ -344,4 +440,6 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
 - Registry listing guide: <https://www.stackone.com/blog/mcp-registry-how-to-get-listed/>
 - Antigravity custom MCP: <https://medium.com/google-developer-experts/google-antigravity-custom-mcp-server-integration-to-improve-vibe-coding-f92ddbc1c22d>
 - Internal: `engram-ws/tdds/track3-mcp-chatgpt-app.md`, `docs/gcp_deployment_guide.md`,
-  `engram-api/app/src/routes/oauth.rs`, `engram-api/service/src/oauth_service.rs`
+  `engram-api/app/src/routes/oauth.rs`, `engram-api/service/src/oauth_service.rs`,
+  `engram-api/db/src/repo/api_token/api_token_repo_pg.rs`, `engram_app/lib/presentation/screens/settings/api_token_page.dart`,
+  `engramo-landing/src/pages/policy/privacy.astro`
