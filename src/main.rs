@@ -5,7 +5,10 @@ use clap::{Parser, Subcommand};
 use engramo_mcp::{
     client::{EngramoClient, HardenedClient},
     config::McpConfig,
-    http_auth::{SessionTokens, bearer_auth_middleware, current_bearer_token},
+    http_auth::{
+        AuthState, MAX_BODY_BYTES, SESSION_KEEP_ALIVE, SessionTokens, bearer_auth_middleware,
+        current_bearer_token,
+    },
     server::{EngramoMcpServer, build_session_server},
     tts, well_known,
 };
@@ -44,13 +47,6 @@ enum Command {
 /// credential-equivalent value and must not be shipped to Cloud Logging — see
 /// `engramo_mcp::http_auth`.
 const DEFAULT_LOG_FILTER: &str = "info,rmcp::transport::streamable_http_server::session=warn";
-
-/// Largest request body accepted in `http` mode. rmcp buffers the whole body in memory
-/// before parsing it (`expect_json`) and axum's `DefaultBodyLimit` does not apply to a
-/// `fallback_service`, so without this an unauthenticated caller can drive the process
-/// out of memory with one POST. 16 MiB leaves room for the ~13.4 MiB of base64 a maximum
-/// 10 MB `upload_media` produces, plus JSON-RPC framing.
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -201,6 +197,14 @@ fn attach_tts(
 async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = McpConfig::from_env()
         .map_err(|e| format!("{e}\n\nSet ENGRAMO_API_URL before running `engramo-mcp http`."))?;
+    let public_url = cfg.require_public_url().map_err(|e| {
+        format!(
+            "{e}\n\nSet MCP_PUBLIC_URL to this server's public URL (e.g. https://mcp.engramo.app) \
+             before running `engramo-mcp http`: it is advertised in OAuth metadata and \
+             WWW-Authenticate challenges."
+        )
+    })?;
+    let public_url = public_url.to_string();
 
     // Local TTS is stdio-only (see `tts` module doc comment) — this reads only the env var's
     // *name*, never its value, and never builds a TtsConfig/engine. This is the only place
@@ -220,7 +224,7 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     // no-redirect policy that keeps a session's bearer token from following a 3xx to
     // another host can't be dropped by a future edit to this function.
     let http = EngramoClient::build_http_client();
-    let app = build_app(&cfg, http);
+    let app = build_app(&cfg, &public_url, http)?;
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -235,15 +239,37 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// rmcp's session manager with its idle timeout pinned to [`SESSION_KEEP_ALIVE`], the
+/// constant the session-binding table is derived from.
+fn session_manager() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
+    manager
+}
+
 /// Builds the `http` mode axum `Router`: the auth-guarded MCP endpoint at `/` (bearer-auth
 /// middleware + `MAX_BODY_BYTES` request body limit + rmcp's `StreamableHttpService`), plus
-/// the unauthenticated `/version` and `/.well-known/oauth-protected-resource` routes. Pulled
-/// out of `run_http` (a pure move, no behavior change) so tests can drive the router directly
-/// with `tower::ServiceExt::oneshot` instead of binding a real listener.
-fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
+/// the unauthenticated `/version` and `/.well-known/oauth-protected-resource` routes. Kept
+/// separate from `run_http` so tests can drive the router directly with
+/// `tower::ServiceExt::oneshot` instead of binding a real listener.
+///
+/// `public_url` is the validated `MCP_PUBLIC_URL` (`McpConfig::require_public_url`). Fails
+/// when it cannot be embedded in a `WWW-Authenticate` challenge.
+fn build_app(
+    cfg: &McpConfig,
+    public_url: &str,
+    http: HardenedClient,
+) -> Result<axum::Router, String> {
+    let public_url = public_url.to_string();
+    let resource_metadata_url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        public_url.trim_end_matches('/')
+    );
     let api_url = cfg.api_url.clone();
     let paid_ai_enabled = cfg.paid_ai_enabled;
     let allowed_hosts = cfg.allowed_hosts();
+    let auth_http = http.clone();
+    let auth_api_url = api_url.clone();
     let factory = move || {
         let token = current_bearer_token().ok_or_else(|| {
             // Invariant violation: `bearer_auth_middleware` already rejects any
@@ -272,10 +298,11 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
         ?allowed_hosts,
         "Configured Host-header allowlist for http mode"
     );
-    let session_manager = Arc::new(LocalSessionManager::default());
+    // Pin rmcp's idle timeout to the constant the session-binding table is derived from.
+    let session_manager = Arc::new(session_manager());
     let service = StreamableHttpService::new(
         factory,
-        session_manager,
+        session_manager.clone(),
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
@@ -283,36 +310,40 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
     // `.well-known/oauth-protected-resource` (RFC 9728, Track 3 Phase 3) must be
     // fetchable *without* a token, since its whole purpose is telling an
     // unauthenticated client where to go get one.
-    let sessions = SessionTokens::new();
+    let auth = AuthState::new(
+        SessionTokens::new(),
+        resource_metadata_url,
+        auth_http,
+        auth_api_url,
+    )?
+    .with_session_manager(session_manager);
     let mcp_router = axum::Router::new()
         .fallback_service(service)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             MAX_BODY_BYTES,
         ))
         .layer(middleware::from_fn_with_state(
-            sessions.clone(),
+            auth.clone(),
             bearer_auth_middleware,
         ))
-        .with_state(sessions);
+        .with_state(auth);
 
     let protected_resource_state = well_known::ProtectedResourceState {
-        resource: cfg.public_url.clone().unwrap_or_else(|| {
-            tracing::warn!(
-                "MCP_PUBLIC_URL is not set — .well-known/oauth-protected-resource will \
-                 advertise a placeholder \"resource\" value. Set MCP_PUBLIC_URL to this \
-                 server's real public URL (e.g. https://mcp.engramo.app) before \
-                 deploying for OAuth."
-            );
-            "http://localhost:8080".to_string()
-        }),
+        resource: public_url,
         authorization_server: cfg.api_url.clone(),
     };
-    axum::Router::new()
+    Ok(axum::Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             axum::routing::get(well_known::protected_resource_metadata),
         )
         .with_state(protected_resource_state)
+        // OpenAI domain verification — unauthenticated, outside the bearer middleware.
+        .route(
+            "/.well-known/openai-apps-challenge",
+            axum::routing::get(well_known::openai_apps_challenge)
+                .with_state(cfg.openai_apps_challenge.clone()),
+        )
         // Unauthenticated by design — it returns only this deployment's public build
         // version (name + version), nothing user- or token-scoped. Lives on the outer
         // router so it sits outside `bearer_auth_middleware`, like the `.well-known` route.
@@ -320,7 +351,7 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
             "/version",
             axum::routing::get(engramo_mcp::version::version_endpoint),
         )
-        .merge(mcp_router)
+        .merge(mcp_router))
 }
 
 #[cfg(test)]
@@ -330,40 +361,154 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    #[test]
+    fn test_session_manager_pins_keep_alive() {
+        assert_eq!(
+            session_manager().session_config.keep_alive,
+            Some(SESSION_KEEP_ALIVE)
+        );
+    }
+
+    fn test_app(cfg: &McpConfig) -> axum::Router {
+        let url = cfg.require_public_url().unwrap().to_string();
+        build_app(cfg, &url, EngramoClient::build_http_client()).unwrap()
+    }
+
+    #[test]
+    fn test_build_app_rejects_unusable_public_url_instead_of_falling_back() {
+        // `require_public_url` (what `run_http` calls) errors on an unset or unusable
+        // value, and `build_app` itself refuses a URL that cannot be a header parameter.
+        let unset = McpConfig::new("http://localhost", None, false).unwrap();
+        assert!(unset.require_public_url().is_err());
+        let err = build_app(
+            &unset,
+            "https://x.example/\"bad",
+            EngramoClient::build_http_client(),
+        )
+        .unwrap_err();
+        assert!(err.contains("quote"), "{err}");
+    }
+
     fn test_cfg() -> McpConfig {
-        McpConfig::new("http://localhost", None, false).unwrap()
+        McpConfig::new("http://localhost", None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080")
     }
 
     #[tokio::test]
     async fn test_http_app_rejects_body_over_max_body_bytes() {
-        // `RequestBodyLimitLayer` does reject a body over `MAX_BODY_BYTES` — it never lets
-        // rmcp buffer the whole oversized body into memory — but because rmcp reads the body
-        // itself (axum's `DefaultBodyLimit` machinery, which would map this to a clean 413,
-        // never reaches a `fallback_service`), the rejection surfaces as a 500 with a
-        // "length limit exceeded" message rather than 413. This pins that real, current
-        // behavior so a regression that instead buffers/accepts the oversized body (e.g. a
-        // layer reordered or dropped) still fails this test.
-        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
+        // Session-less POSTs are capped at MAX_INITIALIZE_BYTES by the auth middleware
+        // (covered in http_auth.rs). This pins the outer MAX_BODY_BYTES limit that guards
+        // session-bearing POSTs, which rmcp buffers in full.
+        let api = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/me"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"user_id": "11111111-2222-3333-4444-555555555555"}),
+            ))
+            .mount(&api)
+            .await;
+        let cfg = McpConfig::new(api.uri(), None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080");
+        let app = test_app(&cfg);
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let req = Request::post("/")
+            .header("authorization", "Bearer engramo_t")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "localhost")
+            .body(Body::from(init))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sid = resp.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+
         let body = vec![b'a'; MAX_BODY_BYTES + 1];
         let req = Request::post("/")
-            .header("authorization", "Bearer t")
+            .header("authorization", "Bearer engramo_t")
+            .header("mcp-session-id", sid)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("host", "localhost")
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 10_000)
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 10_000)
             .await
             .unwrap();
-        let body_text = String::from_utf8_lossy(&body_bytes);
-        assert!(body_text.contains("length limit exceeded"), "{body_text}");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            status == StatusCode::PAYLOAD_TOO_LARGE
+                || (status == StatusCode::INTERNAL_SERVER_ERROR
+                    && text.contains("length limit exceeded")),
+            "{status} {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_app_session_is_bound_to_the_opening_token() {
+        let api = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/me"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"user_id": "11111111-2222-3333-4444-555555555555"}),
+            ))
+            .mount(&api)
+            .await;
+        let cfg = McpConfig::new(api.uri(), None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080");
+        let app = test_app(&cfg);
+        let post = |token: &str, session: Option<&str>, body: &'static str| {
+            let mut b = Request::post("/")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("host", "localhost");
+            if let Some(s) = session {
+                b = b.header("mcp-session-id", s);
+            }
+            b.body(Body::from(body)).unwrap()
+        };
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+
+        let resp = app
+            .clone()
+            .oneshot(post("engramo_owner", None, init))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sid = resp.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(post("engramo_attacker", Some(&sid), initialized))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!resp.headers().contains_key("www-authenticate"));
+        let bytes = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"Not Found: Session not found");
+
+        let resp = app
+            .oneshot(post("engramo_owner", Some(&sid), initialized))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn test_http_app_version_is_unauthenticated_but_root_requires_bearer() {
-        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
+        let app = test_app(&test_cfg());
         let v = app
             .clone()
             .oneshot(
@@ -386,6 +531,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn get_status_and_body(
+        app: axum::Router,
+        uri: &str,
+    ) -> (StatusCode, String, Option<String>) {
+        let resp = app
+            .oneshot(
+                Request::get(uri)
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string(), ct)
+    }
+
+    #[tokio::test]
+    async fn test_openai_challenge_served_when_set() {
+        let cfg = test_cfg().with_openai_apps_challenge("tok-xyz");
+        let app = test_app(&cfg);
+        let (status, body, ct) =
+            get_status_and_body(app, "/.well-known/openai-apps-challenge").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "tok-xyz");
+        assert!(ct.unwrap().starts_with("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_openai_challenge_404_when_unset() {
+        let app = test_app(&test_cfg());
+        let (status, _, _) = get_status_and_body(app, "/.well-known/openai-apps-challenge").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_root_401_advertises_metadata_url_with_single_slash() {
+        let cfg = McpConfig::new("http://localhost", None, false)
+            .unwrap()
+            .with_public_url("https://mcp.engramo.app/");
+        let app = test_app(&cfg);
+        let resp = app
+            .oneshot(
+                Request::post("/")
+                    .header("host", "localhost")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get("www-authenticate").unwrap(),
+            "Bearer resource_metadata=\"https://mcp.engramo.app/.well-known/oauth-protected-resource\""
+        );
     }
 
     fn test_server() -> EngramoMcpServer {

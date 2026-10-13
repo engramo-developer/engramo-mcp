@@ -88,6 +88,10 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   - `ENGRAMO_API_URL` — base URL, e.g. `http://localhost:8080`
   - `ENGRAMO_API_TOKEN` — user's API token (required for `stdio`; unused in `http` mode)
   - `ENGRAMO_ENABLE_PAID_AI` — `true`/`1`/`yes`/`on` to register the paid-AI tools (default off)
+  - `MCP_PUBLIC_URL` — this server's public URL; **required in `http` mode** (startup fails without it), used
+    for the OAuth metadata `resource` and the `WWW-Authenticate: Bearer resource_metadata="<url>/.well-known/oauth-protected-resource"` header on 401s. Unused by stdio.
+  - `OPENAI_APPS_CHALLENGE` — optional OpenAI domain-verification token served (text/plain) at the
+    unauthenticated `GET /.well-known/openai-apps-challenge`; unset/blank → 404. `http` only.
   - `MCP_BIND_ADDR` — bind address for `http` mode (default `0.0.0.0:8080`)
   - `ENGRAMO_TTS_GEMINI_API_KEYS` — one key or comma-separated list; **stdio only** (see `tts/mod.rs`,
     read only by `run_stdio`). Unset/blank → both local-TTS tools absent. The generic `GEMINI_API_KEY`
@@ -107,10 +111,16 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   `StreamableHttpService::new` takes a plain `Fn() -> Result<S, io::Error>` with no access to request
   headers. The factory runs synchronously inside `handle_post` while establishing a new session
   (`initialize` request), which is still within the task the middleware scoped, so `try_with` sees the
-  value. Missing/empty bearer → `401` at the middleware, before a session is ever created. One
+  value. Missing/empty bearer → `401` with `WWW-Authenticate: Bearer resource_metadata="…"` at the
+  middleware, before a session is ever created. One
   `EngramoClient` (and thus one EngrAmo account) per MCP session, for the session's lifetime.
+- **Session-open token check:** a POST without `Mcp-Session-Id` is validated before rmcp sees it: a bearer not
+  starting with `engramo_` (current) or `engram_` (legacy) → 401 `invalid_token` (no upstream call); otherwise `GET /me` via the shared
+  `HardenedClient` — upstream 401 → 401 `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"`,
+  403 counts as valid, network/timeout/5xx → 503 (no `WWW-Authenticate`). The probe has a 5 s timeout, and a token the API rejected is remembered (keyed hash) for 60 s so repeats skip the probe; valid tokens are not cached. A POST without a session id whose body is not a JSON-RPC `initialize` request → 400 (checked on the body, buffered up to 16 MiB, because rmcp decides statelessness from the body `_meta`, not the header; a stateless request would bypass session binding); requests carrying a session id
+  and GET/DELETE are never probed.
 - **Session binding (security):** rmcp authorizes every post-`initialize` request on the `Mcp-Session-Id`
-  header alone, so `SessionTokens` records which token opened each session and 401s a request that presents a
+  header alone, so `SessionTokens` records which token opened each session and 404s ("Session not found", no `WWW-Authenticate`) a request that presents a
   different one — otherwise a leaked session id would let anyone act as that session's owner. Requests are
   capped at 16 MiB (`RequestBodyLimitLayer`): rmcp buffers the whole body before parsing, and axum's
   `DefaultBodyLimit` does not reach a `fallback_service`.

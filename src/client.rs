@@ -7,7 +7,7 @@ use crate::dto::{
     AiChatRequest, AiChatResponseDto, CardAiBatchResultDto, CardAiRequest, CardDto, CatalogDto,
     CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CreateCardRequest, CreateCatalogRequest,
     CreateCatalogWithCardsApiRequest, CreateLearningPathRequest, GlobalSearchResult,
-    LearningCardDto, LearningPathDetailDto, LearningPathDto, MediaDto, PagedResponse,
+    LearningCardDto, LearningPathDetailDto, LearningPathDto, MeDto, MediaDto, PagedResponse,
     PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UpdateLearningPathRequest,
     UploadMediaResponseDto, UsageSummaryDto, UserSubscriptionDto,
 };
@@ -565,6 +565,14 @@ impl EngramoClient {
             .ok_or(ApiError::Internal)
     }
 
+    // ── Identity ──────────────────────────────────────────────────────────────
+
+    /// `GET /me` — resolves the credential to its owner. Used by `http` mode to validate a
+    /// bearer token when a session opens (401 → [`ApiError::Unauthorized`]).
+    pub async fn get_me(&self) -> Result<MeDto, ApiError> {
+        self.get("/me").await
+    }
+
     // ── Subscription ──────────────────────────────────────────────────────────
 
     pub async fn get_subscription(&self) -> Result<UserSubscriptionDto, ApiError> {
@@ -753,6 +761,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.cursor, Some("abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_me_returns_user_id() {
+        let server = MockServer::start().await;
+        let id = "11111111-2222-3333-4444-555555555555";
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .and(wiremock::matchers::header(
+                "X-Api-Key",
+                "engramo_test_token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id": id})))
+            .mount(&server)
+            .await;
+        let me = client(&server.uri()).get_me().await.unwrap();
+        assert_eq!(me.user_id.to_string(), id);
+    }
+
+    #[tokio::test]
+    async fn test_get_me_401_is_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri()).get_me().await.unwrap_err();
+        assert!(matches!(err, ApiError::Unauthorized));
     }
 
     #[tokio::test]

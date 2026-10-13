@@ -507,6 +507,14 @@ async fn process_card(
 #[tool_router(router = local_tts_tools_router, vis = "pub(crate)")]
 impl EngramoMcpServer {
     #[tool(
+        title = "List TTS voices",
+        annotations(
+            title = "List TTS voices",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "List the voices available for generate_card_audio, along with the \
         currently configured TTS engine, model, and default voice. No network call. Only \
         available when the user has configured their own TTS key (ENGRAMO_TTS_GEMINI_API_KEYS) \
@@ -536,6 +544,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Generate card audio",
+        annotations(
+            title = "Generate card audio",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
         description = "Generate spoken audio for the FACE side of up to 20 flashcards, upload \
         it to your EngrAmo media, and attach it to each card. Uses YOUR OWN locally-configured \
         TTS key (ENGRAMO_TTS_GEMINI_API_KEYS) — this spends your own Gemini quota, never \

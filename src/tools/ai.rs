@@ -71,6 +71,14 @@ fn parse_optional_uuid(s: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
 #[tool_router(router = paid_ai_tools_router, vis = "pub(crate)")]
 impl EngramoMcpServer {
     #[tool(
+        title = "Generate TTS for cards",
+        annotations(
+            title = "Generate TTS for cards",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
         description = "Generate server-side TTS audio for cards that have no face audio yet. \
         USES ENGRAMO'S PAID AI — this consumes the account's TTS quota. \
         Provide exactly one of catalog_id or card_id. Audio is generated asynchronously; \
@@ -100,6 +108,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Translate cards",
+        annotations(
+            title = "Translate cards",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
         description = "Translate cards whose back text is empty, into the given language. \
         USES ENGRAMO'S PAID AI — this consumes the account's translation quota. \
         Provide exactly one of catalog_id or card_id. \
@@ -130,6 +146,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Generate dictionary for cards",
+        annotations(
+            title = "Generate dictionary for cards",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
         description = "Fill in missing word-level dictionary entries (word -> translation) on cards. \
         USES ENGRAMO'S PAID AI — this consumes the account's translation quota. \
         Provide exactly one of catalog_id or card_id."
@@ -160,6 +184,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Chat with AI agent",
+        annotations(
+            title = "Chat with AI agent",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
         description = "Chat with EngrAmo's server-side AI agent (e.g. to draft a song- or \
         vocabulary-based deck idea). USES ENGRAMO'S PAID AI — this consumes the account's \
         AI-agent message quota."
@@ -183,6 +215,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Translate batch import",
+        annotations(
+            title = "Translate batch import",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
         description = "Create a new catalog from an uploaded ZIP/JSON content file, auto-translating \
         every card into target_lang. USES ENGRAMO'S PAID AI — this consumes the account's \
         translation quota. Intended for bulk imports of pre-recorded audio + source text; most \

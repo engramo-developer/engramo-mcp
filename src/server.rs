@@ -116,6 +116,14 @@ pub fn build_session_server(
 #[tool_router(router = server_info_tools_router)]
 impl EngramoMcpServer {
     #[tool(
+        title = "Get server version",
+        annotations(
+            title = "Get server version",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Get the version of this EngrAmo MCP server binary itself (its build/release \
         version, e.g. from Cargo.toml) — NOT a catalog's or card's `version` field (an unrelated \
         per-entity optimistic-locking counter used by update_catalog/update_card). Useful for \
@@ -131,6 +139,14 @@ impl EngramoMcpServer {
 #[tool_router(router = catalog_tools_router)]
 impl EngramoMcpServer {
     #[tool(
+        title = "List catalogs",
+        annotations(
+            title = "List catalogs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "List the user's flashcard catalogs with cursor-based pagination. Returns id, name, and card_count for each catalog. Use get_catalog to fetch full details. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     pub async fn list_catalogs(
@@ -150,6 +166,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Get catalog",
+        annotations(
+            title = "Get catalog",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Get full details of a single catalog by its UUID, including description and tags."
     )]
     pub async fn get_catalog(
@@ -166,6 +190,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Update catalog",
+        annotations(
+            title = "Update catalog",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Update an existing catalog's name, description, tags, or visibility. Requires the current version for optimistic locking — fetch the catalog first to get the version. If you get a Conflict error, re-fetch and retry."
     )]
     pub async fn update_catalog(
@@ -191,6 +223,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Delete catalog",
+        annotations(
+            title = "Delete catalog",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Delete a catalog. It is archived (not hard-deleted) if it has cards, a cover image, or is in an active learning path; otherwise it is hard-deleted. There is no restore/unarchive tool. Cards also in another live catalog are unaffected (they only lose this membership); cards only in this catalog stay reachable by id via get_card (showing `catalogs: []`) only until backend cleanup archives them; they disappear from search and list_cards immediately, and once archived get_card/update_card report them as Not found (cards with learning progress still appear in get_due_cards). To keep them, move them to another catalog with update_card (catalog_ids) BEFORE deleting. Catalog quota decrements automatically."
     )]
     pub async fn delete_catalog(
@@ -212,6 +252,14 @@ impl EngramoMcpServer {
 #[tool_router(router = card_tools_router)]
 impl EngramoMcpServer {
     #[tool(
+        title = "List cards",
+        annotations(
+            title = "List cards",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "List flashcards in a catalog with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). Each returned card includes its `catalogs` memberships (id, name), permission-filtered the same as `get_card` — omitted when the API didn't report memberships."
     )]
     pub async fn list_cards(
@@ -232,6 +280,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Get card",
+        annotations(
+            title = "Get card",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Get a single flashcard by UUID, including its face, back, and catalog memberships (`catalogs` is omitted when the API does not report memberships). A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way). A card that was archived (e.g. deleted after learning started) is reported as Not found even if it still appears in get_due_cards."
     )]
     pub async fn get_card(
@@ -248,6 +304,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Update card",
+        annotations(
+            title = "Update card",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Update an existing flashcard's face, back, or catalog memberships. \
         Requires the current version for optimistic locking — fetch the card first. \
         `catalog_ids` REPLACES the memberships you can see, so build it from the \
@@ -356,6 +420,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Delete card",
+        annotations(
+            title = "Delete card",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Delete a flashcard from a catalog. If the card has learning progress it is archived (it stays in get_due_cards/get_all_learning_cards and remains reviewable, but get_card/update_card then report it as Not found); otherwise hard-deleted. A card_id that doesn't exist, or a catalog_id the card is not in, is reported as \"Not found\" and nothing is deleted; a card that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn delete_card(
@@ -401,6 +473,14 @@ impl EngramoMcpServer {
 #[tool_router(router = learning_tools_router)]
 impl EngramoMcpServer {
     #[tool(
+        title = "Get due cards",
+        annotations(
+            title = "Get due cards",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Get flashcards due for review today, sorted by priority. Use this to start a study session. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). A returned card may be archived (deleted after learning started): it stays reviewable here, but get_card/update_card report it as Not found."
     )]
     pub async fn get_due_cards(
@@ -420,6 +500,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Get all learning cards",
+        annotations(
+            title = "Get all learning cards",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Get all cards currently in the learning queue (due and future), with pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). A returned card may be archived (deleted after learning started): it stays reviewable here, but get_card/update_card report it as Not found."
     )]
     pub async fn get_all_learning_cards(
@@ -439,6 +527,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Add card to learning",
+        annotations(
+            title = "Add card to learning",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Add a single card to the learning queue. It will appear in due reviews. A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way)."
     )]
     pub async fn add_card_to_learning(
@@ -454,7 +550,17 @@ impl EngramoMcpServer {
         })
     }
 
-    #[tool(description = "Add all cards in a catalog to the learning queue at once.")]
+    #[tool(
+        title = "Add catalog to learning",
+        annotations(
+            title = "Add catalog to learning",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Add all cards in a catalog to the learning queue at once."
+    )]
     pub async fn add_catalog_to_learning(
         &self,
         Parameters(p): Parameters<AddCatalogToLearningParams>,
@@ -474,6 +580,14 @@ impl EngramoMcpServer {
 #[tool_router(router = learning_path_tools_router)]
 impl EngramoMcpServer {
     #[tool(
+        title = "List learning paths",
+        annotations(
+            title = "List learning paths",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "List all learning paths with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     pub async fn list_learning_paths(
@@ -493,6 +607,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Get learning path",
+        annotations(
+            title = "Get learning path",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Get full details of a learning path, including its catalogs, tags, \
         visibility, and current version (needed by update_learning_path)."
     )]
@@ -510,6 +632,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Create learning path",
+        annotations(
+            title = "Create learning path",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
         description = "Create a new learning path. It starts empty — use add_catalog_to_learning_path \
         (or pass `catalog_ids` here) to populate it with catalogs. Passing `catalog_ids` adds each \
         one in its own request right after the path is created (non-atomic): the path is never \
@@ -597,7 +727,17 @@ impl EngramoMcpServer {
         }))
     }
 
-    #[tool(description = "Activate a learning path so its catalogs are included in daily reviews.")]
+    #[tool(
+        title = "Activate learning path",
+        annotations(
+            title = "Activate learning path",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Activate a learning path so its catalogs are included in daily reviews."
+    )]
     pub async fn activate_learning_path(
         &self,
         Parameters(p): Parameters<ActivateLearningPathParams>,
@@ -612,6 +752,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Deactivate learning path",
+        annotations(
+            title = "Deactivate learning path",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Deactivate a learning path so its catalogs are excluded from daily reviews."
     )]
     pub async fn deactivate_learning_path(
@@ -628,6 +776,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Add catalog to learning path",
+        annotations(
+            title = "Add catalog to learning path",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Add a catalog to a learning path so its cards become part of the path. \
         Idempotent: adding a catalog that is already in the path succeeds (no error). A missing \
         path or catalog returns Not found."
@@ -659,6 +815,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Remove catalog from learning path",
+        annotations(
+            title = "Remove catalog from learning path",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Remove a catalog from a learning path. Idempotent: removing a catalog \
         that is not in the path succeeds (with a hint) instead of erroring, so a retried remove \
         is safe. A missing path returns Not found."
@@ -708,6 +872,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Update learning path",
+        annotations(
+            title = "Update learning path",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Update a learning path's name, description, tags, or visibility. \
         Requires the current version for optimistic locking — fetch the path first \
         (get_learning_path) to get the version. If you get a Conflict error, re-fetch and retry. \
@@ -768,6 +940,14 @@ async fn disambiguate_catalog_forbidden(
 #[tool_router(router = search_tools_router)]
 impl EngramoMcpServer {
     #[tool(
+        title = "Search everything",
+        annotations(
+            title = "Search everything",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Searches cards and catalogs (newer API versions also return learning paths \
         with item_type 'learning_path'). To search learning paths specifically, use \
         search_learning_paths. Each hit has item_type ('catalog', 'card', 'learning_path', or a \
@@ -792,6 +972,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Search catalogs",
+        annotations(
+            title = "Search catalogs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Search catalogs by name, description, or short ID. If the user gives you a \
         catalog's short ID (the ~8-character code shown in the app/URL, e.g. \"A7KX9QM2\" — NOT a \
         UUID) rather than a name, search for that exact code here instead of paginating through \
@@ -808,6 +996,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Search learning paths",
+        annotations(
+            title = "Search learning paths",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Search learning paths by name or description. Returns an array of \
         {id, name, description, tags, visibility, version} (tags/visibility are omitted when the API \
         does not send them); pass `id` as path_id to get_learning_path (to see its \
@@ -832,6 +1028,14 @@ impl EngramoMcpServer {
 #[tool_router(router = media_tools_router)]
 impl EngramoMcpServer {
     #[tool(
+        title = "List media",
+        annotations(
+            title = "List media",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "List your own media library — files you uploaded with upload_media, \
         including audio produced by generate_card_audio. This does NOT include media attached \
         to cards uploaded by other accounts (e.g. in shared/subscribed catalogs); to find a \
@@ -858,6 +1062,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Upload media",
+        annotations(
+            title = "Upload media",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
         description = "Upload a media file you already have — a user's own voice recording, a \
         self-generated audio clip, or an image — and get back a media_id. Use that id as \
         `audio_id`/`visual_id` on a card's face/back, or as `image_id` for a catalog cover, via \
@@ -1289,7 +1501,16 @@ fn normalize_card_content(content: &mut crate::dto::CardContent) {
 
 #[tool_router(router = generate_tools_router)]
 impl EngramoMcpServer {
-    #[tool(description = "Create a single styled flashcard. \
+    #[tool(
+        title = "Create card",
+        annotations(
+            title = "Create card",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        description = "Create a single styled flashcard. \
             Pass catalog_id to add to an existing catalog; omit for the default catalog. \
             For language-learning cards: translate face.text yourself and set back.text before calling; \
             build a word-level dictionary (word → translation map) yourself and set face.dictionary. \
@@ -1303,7 +1524,8 @@ impl EngramoMcpServer {
             {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
             Use fontFamily='monospace' for code, bold=true for key terms, \
             fontColor='#E74C3C' for warnings, '#27AE60' for correct answers. \
-            If no styling needed, omit rich_text entirely and just set text.")]
+            If no styling needed, omit rich_text entirely and just set text."
+    )]
     pub async fn generate_card(
         &self,
         Parameters(mut p): Parameters<GenerateCardParams>,
@@ -1338,6 +1560,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Create catalog with cards",
+        annotations(
+            title = "Create catalog with cards",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
         description = "Create a new catalog together with all its flashcards in one atomic call. \
             More efficient than creating cards one by one. \
             For language-learning cards: translate each face.text yourself and set back.text; \
@@ -1408,6 +1638,14 @@ impl EngramoMcpServer {
     }
 
     #[tool(
+        title = "Create cards",
+        annotations(
+            title = "Create cards",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
         description = "Add multiple flashcards to an EXISTING catalog in one batch. \
             Use this instead of calling generate_card N times. \
             WARNING: cards are created one at a time — if one fails, previously created cards \
@@ -5114,5 +5352,84 @@ mod tests {
         assert!(!is_safe_font_family(""));
         assert!(is_safe_font_family("Arial, sans-serif"));
         assert!(!is_safe_text_align("start"));
+    }
+
+    #[test]
+    fn test_all_live_tools_have_title_and_annotations() {
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, true).with_tts(fake_tts_engine());
+        let tools = server.tool_router.list_all();
+        assert_eq!(tools.len(), 36, "29 core + 5 paid AI + 2 local TTS");
+        for t in &tools {
+            let n = &t.name;
+            assert!(t.title.is_some(), "{n}: missing title");
+            let a = t
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{n}: missing annotations"));
+            assert!(a.title.is_some(), "{n}: missing annotations.title");
+            assert_eq!(a.title, t.title, "{n}: titles differ");
+            assert!(a.read_only_hint.is_some(), "{n}: missing read_only_hint");
+            assert!(
+                a.destructive_hint.is_some(),
+                "{n}: missing destructive_hint"
+            );
+            assert!(a.idempotent_hint.is_some(), "{n}: missing idempotent_hint");
+            assert!(a.open_world_hint.is_some(), "{n}: missing open_world_hint");
+        }
+        let get = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.annotations.clone())
+                .unwrap_or_else(|| panic!("{name} not found"))
+        };
+        for name in ["delete_card", "update_card", "delete_catalog"] {
+            let a = get(name);
+            assert_eq!(a.read_only_hint, Some(false), "{name}");
+            assert_eq!(a.destructive_hint, Some(true), "{name}");
+        }
+        let a = get("list_catalogs");
+        assert_eq!(a.read_only_hint, Some(true));
+        assert_eq!(a.destructive_hint, Some(false));
+        assert_eq!(a.idempotent_hint, Some(true));
+        assert_eq!(a.open_world_hint, Some(false));
+        assert_eq!(get("generate_card").destructive_hint, Some(false));
+        assert_eq!(get("generate_card_audio").open_world_hint, Some(true));
+        assert_eq!(get("translate_cards").open_world_hint, Some(true));
+    }
+
+    #[test]
+    fn test_tool_annotation_invariants() {
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, true).with_tts(fake_tts_engine());
+        let tools = server.tool_router.list_all();
+        for t in &tools {
+            let a = t.annotations.clone().unwrap();
+            if a.read_only_hint == Some(true) {
+                assert_eq!(
+                    a.destructive_hint,
+                    Some(false),
+                    "{}: read-only but destructive",
+                    t.name
+                );
+            }
+        }
+        for name in [
+            "generate_tts_for_cards",
+            "translate_cards",
+            "generate_dictionary_for_cards",
+            "ai_agent_chat",
+            "translate_batch_import",
+            "generate_card_audio",
+        ] {
+            let a = tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.annotations.clone())
+                .unwrap_or_else(|| panic!("{name} not found"));
+            assert_eq!(a.open_world_hint, Some(true), "{name}");
+            assert_eq!(a.read_only_hint, Some(false), "{name}");
+        }
     }
 }
