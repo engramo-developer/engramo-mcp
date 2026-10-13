@@ -54,6 +54,10 @@ pub struct McpConfig {
     /// e.g. to also allow a Cloud Run service's own `*.run.app` fallback URL
     /// alongside its custom domain mapping.
     pub extra_allowed_hosts: Vec<String>,
+    /// Token served verbatim at `GET /.well-known/openai-apps-challenge` for
+    /// OpenAI domain verification. Loaded from `OPENAI_APPS_CHALLENGE` (trimmed;
+    /// empty/unset → `None`, and the route 404s). `http` mode only.
+    pub openai_apps_challenge: Option<String>,
 }
 
 impl McpConfig {
@@ -81,6 +85,7 @@ impl McpConfig {
             paid_ai_enabled,
             public_url: None,
             extra_allowed_hosts: Vec::new(),
+            openai_apps_challenge: None,
         })
     }
 
@@ -89,6 +94,13 @@ impl McpConfig {
     /// already depend on).
     pub fn with_public_url(mut self, public_url: impl Into<String>) -> Self {
         self.public_url = Some(public_url.into());
+        self
+    }
+
+    /// Sets [`Self::openai_apps_challenge`]; blank values become `None`.
+    pub fn with_openai_apps_challenge(mut self, token: impl AsRef<str>) -> Self {
+        let t = token.as_ref().trim();
+        self.openai_apps_challenge = (!t.is_empty()).then(|| t.to_string());
         self
     }
 
@@ -132,8 +144,10 @@ impl McpConfig {
     ///   ignored by `http` mode, which derives a client token per session.
     /// - `ENGRAMO_ENABLE_PAID_AI` — `true`/`1`/`yes`/`on` to enable the paid-AI
     ///   tools; defaults to `false`.
-    /// - `MCP_PUBLIC_URL` — this server's own canonical public URL; only read by
-    ///   `http` mode's OAuth protected-resource metadata route.
+    /// - `MCP_PUBLIC_URL` — this server's own canonical public URL; required by
+    ///   `http` mode (see `require_public_url`), unused by `stdio`.
+    /// - `OPENAI_APPS_CHALLENGE` — OpenAI domain-verification token served at
+    ///   `/.well-known/openai-apps-challenge` in `http` mode; unset/blank → 404.
     /// - `MCP_ALLOWED_HOSTS` — comma-separated extra hostnames/`host:port` values
     ///   for the `http` mode inbound `Host`-header allowlist (see `allowed_hosts`).
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -157,7 +171,19 @@ impl McpConfig {
                     .collect()
             })
             .unwrap_or_default();
+        let cfg = match env::var("OPENAI_APPS_CHALLENGE").ok() {
+            Some(t) => cfg.with_openai_apps_challenge(t),
+            None => cfg,
+        };
         Ok(cfg.with_extra_allowed_hosts(extra_hosts))
+    }
+
+    /// Returns the public URL, or an error if none was set. Call this in `http`
+    /// mode, which cannot advertise correct OAuth metadata without it.
+    pub fn require_public_url(&self) -> Result<&str, ConfigError> {
+        self.public_url
+            .as_deref()
+            .ok_or(ConfigError::MissingVar("MCP_PUBLIC_URL"))
     }
 
     /// Returns the configured API token, or an error if none was set.
@@ -292,6 +318,27 @@ mod tests {
         let cfg = McpConfig::new("https://api.engram.dev", None, false).unwrap();
         let err = cfg.require_token().unwrap_err();
         assert!(matches!(err, ConfigError::MissingVar("ENGRAMO_API_TOKEN")));
+    }
+
+    #[test]
+    fn test_require_public_url_present_and_missing() {
+        let cfg = McpConfig::new("https://api.engram.dev", None, false).unwrap();
+        assert!(matches!(
+            cfg.require_public_url().unwrap_err(),
+            ConfigError::MissingVar("MCP_PUBLIC_URL")
+        ));
+        let cfg = cfg.with_public_url("https://mcp.engramo.app");
+        assert_eq!(cfg.require_public_url().unwrap(), "https://mcp.engramo.app");
+    }
+
+    #[test]
+    fn test_openai_apps_challenge_trimmed_and_blank_is_none() {
+        let cfg = McpConfig::new("https://api.engram.dev", None, false).unwrap();
+        assert!(cfg.openai_apps_challenge.is_none());
+        let set = cfg.clone().with_openai_apps_challenge("  tok123\n");
+        assert_eq!(set.openai_apps_challenge.as_deref(), Some("tok123"));
+        let blank = cfg.with_openai_apps_challenge("   ");
+        assert!(blank.openai_apps_challenge.is_none());
     }
 
     #[test]
@@ -431,6 +478,24 @@ mod tests {
     fn test_debug_shows_none_token_as_none() {
         let cfg = McpConfig::new("https://api.engram.dev", None, false).unwrap();
         assert!(format!("{cfg:?}").contains("api_token: None"));
+    }
+
+    #[test]
+    fn test_from_env_reads_openai_apps_challenge() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("ENGRAMO_API_URL", "https://api.engram.dev");
+            std::env::set_var("OPENAI_APPS_CHALLENGE", "  abc-token \n");
+        }
+        let set = McpConfig::from_env().unwrap();
+        unsafe { std::env::set_var("OPENAI_APPS_CHALLENGE", "") };
+        let empty = McpConfig::from_env().unwrap();
+        unsafe {
+            std::env::remove_var("OPENAI_APPS_CHALLENGE");
+            std::env::remove_var("ENGRAMO_API_URL");
+        }
+        assert_eq!(set.openai_apps_challenge.as_deref(), Some("abc-token"));
+        assert!(empty.openai_apps_challenge.is_none());
     }
 
     #[test]

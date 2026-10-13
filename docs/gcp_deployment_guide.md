@@ -119,6 +119,7 @@ substitutions:
   _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com'
   _ENGRAMO_ENABLE_PAID_AI: 'false'
   _APP_ENV: 'dev'
+  _OPENAI_APPS_CHALLENGE: ''
 ```
 
 The defaults above are **dev** values. The prod trigger (Section 5) overrides `_ENGRAMO_API_URL`,
@@ -132,6 +133,14 @@ events. It has no effect on which backend is called; that's entirely `_ENGRAMO_A
 
 `_MCP_PUBLIC_URL` should be a bare origin, no path (the MCP endpoint is served at `/`, root — it
 becomes the `resource` value in `.well-known/oauth-protected-resource`, see `src/well_known.rs`).
+
+`_OPENAI_APPS_CHALLENGE` is the OpenAI domain-verification token. Leave it empty until OpenAI
+issues one; when set (as a substitution override on the trigger), the server answers
+`GET /.well-known/openai-apps-challenge` with exactly that token as `text/plain`, and returns 404
+when it is empty.
+
+`_MCP_PUBLIC_URL` is **required**: `engramo-mcp http` refuses to start without it, since it is
+advertised in the `WWW-Authenticate` header of every 401 and in the OAuth metadata.
 
 ## 5. Create the manual trigger
 

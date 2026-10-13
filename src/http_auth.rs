@@ -11,7 +11,9 @@
 //! `initialize`, anyone replaying a live session id with *any* bearer token
 //! would otherwise act as that session's owner, with their EngrAmo token, and
 //! would keep doing so after the owner rotated it. [`SessionTokens`] closes that
-//! by remembering which token opened each session and rejecting a mismatch.
+//! by remembering which token opened each session and rejecting a mismatch
+//! with 404 (indistinguishable from an unknown session, so a probe learns
+//! nothing about which session ids are live).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Request, State},
-    http::{Method, StatusCode, header::AUTHORIZATION},
+    http::{
+        Method, StatusCode,
+        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+    },
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -60,6 +65,31 @@ tokio::task_local! {
 /// unreachable for the MCP endpoint — it rejects tokenless requests with 401).
 pub fn current_bearer_token() -> Option<String> {
     CURRENT_BEARER_TOKEN.try_with(|t| t.clone()).ok()
+}
+
+/// State of [`bearer_auth_middleware`].
+#[derive(Clone)]
+pub struct AuthState {
+    pub sessions: SessionTokens,
+    /// Absolute URL of this server's `/.well-known/oauth-protected-resource`,
+    /// advertised in the `WWW-Authenticate` header of a 401 (RFC 9728 §5.1).
+    pub resource_metadata_url: String,
+}
+
+impl AuthState {
+    pub fn new(sessions: SessionTokens, resource_metadata_url: impl Into<String>) -> Self {
+        Self {
+            sessions,
+            resource_metadata_url: resource_metadata_url.into(),
+        }
+    }
+
+    fn www_authenticate(&self) -> String {
+        format!(
+            "Bearer resource_metadata=\"{}\"",
+            self.resource_metadata_url
+        )
+    }
 }
 
 /// Remembers which bearer token opened each MCP session, so later requests
@@ -171,23 +201,31 @@ fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
 
 /// Extracts `Authorization: Bearer <token>` and scopes it into
 /// `CURRENT_BEARER_TOKEN` for the duration of the request. Missing, empty or
-/// malformed bearer tokens are rejected with 401 at the edge — before ever
+/// malformed bearer tokens are rejected with 401 (plus a `WWW-Authenticate`
+/// pointing at the protected-resource metadata) at the edge — before ever
 /// reaching the rmcp session factory (which would 500 on a missing task-local,
 /// since it has no HTTP-status-aware rejection path of its own).
 ///
 /// A request that carries an `Mcp-Session-Id` must present the same token that
-/// opened that session; see the module docs for why rmcp cannot enforce this.
+/// opened that session, otherwise it gets 404 (no `WWW-Authenticate`: the
+/// caller's token is fine, the session just is not theirs); see the module docs
+/// for why rmcp cannot enforce this.
 pub async fn bearer_auth_middleware(
-    State(sessions): State<SessionTokens>,
+    State(auth): State<AuthState>,
     req: Request,
     next: Next,
 ) -> Response {
+    let sessions = &auth.sessions;
     let Some(token) = extract_bearer(req.headers()) else {
-        return (
+        let mut resp = (
             StatusCode::UNAUTHORIZED,
             "Missing or malformed Authorization: Bearer <token> header",
         )
             .into_response();
+        if let Ok(v) = auth.www_authenticate().parse() {
+            resp.headers_mut().insert(WWW_AUTHENTICATE, v);
+        }
+        return resp;
     };
 
     let session_id = req
@@ -204,11 +242,7 @@ pub async fn bearer_auth_middleware(
                 tracing::warn!(
                     "rejected request whose bearer token does not match its MCP session"
                 );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    "Bearer token does not match this MCP session",
-                )
-                    .into_response();
+                return (StatusCode::NOT_FOUND, "Session not found").into_response();
             }
         }
         // No session id yet — this request may open one, so make sure we can
@@ -267,7 +301,10 @@ mod tests {
     /// A stand-in for rmcp's service: echoes the token it saw via the
     /// task-local (as the real session factory does) and mints a session id on
     /// a request that has none, exactly like an `initialize` response.
+    const META_URL: &str = "https://mcp.example.com/.well-known/oauth-protected-resource";
+
     fn app(sessions: SessionTokens) -> Router {
+        let auth = AuthState::new(sessions, META_URL);
         Router::new()
             .route(
                 "/",
@@ -284,10 +321,10 @@ mod tests {
             )
             .route("/get", get(|| async { StatusCode::OK }))
             .layer(middleware::from_fn_with_state(
-                sessions.clone(),
+                auth.clone(),
                 bearer_auth_middleware,
             ))
-            .with_state(sessions)
+            .with_state(auth)
     }
 
     fn request(token: Option<&str>, session: Option<&str>) -> HttpRequest<Body> {
@@ -315,6 +352,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_missing_bearer_401_carries_www_authenticate() {
+        let resp = app(SessionTokens::new())
+            .oneshot(request(None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(WWW_AUTHENTICATE).unwrap(),
+            "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_malformed_bearer_401_carries_www_authenticate_without_error_param() {
+        let resp = app(SessionTokens::new())
+            .oneshot(request(Some("Basic dXNlcjpwYXNz"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let h = resp
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(h.starts_with("Bearer resource_metadata="), "{h}");
+        assert!(!h.contains("error="), "{h}");
     }
 
     #[tokio::test]
@@ -400,8 +467,9 @@ mod tests {
             .oneshot(request(Some(&format!("Bearer {ATTACKER}")), Some(SESSION)))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(body_string(resp).await.contains("does not match"));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().get(WWW_AUTHENTICATE).is_none());
+        assert!(!body_string(resp).await.contains(ATTACKER));
     }
 
     #[tokio::test]

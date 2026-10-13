@@ -37,7 +37,7 @@ steps:
       # URL, since only MCP_PUBLIC_URL's host is allowed automatically.
       # APP_ENV=dev/prod switches src/main.rs's init_logging() from human-readable
       # local output to GCP Cloud Logging JSON + Error Reporting (see error_reporting.rs).
-      - 'ENGRAMO_API_URL=${_ENGRAMO_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAMO_ENABLE_PAID_AI=${_ENGRAMO_ENABLE_PAID_AI},MCP_ALLOWED_HOSTS=${_SERVICE_NAME}-$PROJECT_NUMBER.europe-west1.run.app,APP_ENV=${_APP_ENV}'
+      - 'ENGRAMO_API_URL=${_ENGRAMO_API_URL},MCP_PUBLIC_URL=${_MCP_PUBLIC_URL},ENGRAMO_ENABLE_PAID_AI=${_ENGRAMO_ENABLE_PAID_AI},MCP_ALLOWED_HOSTS=${_SERVICE_NAME}-$PROJECT_NUMBER.europe-west1.run.app,APP_ENV=${_APP_ENV},OPENAI_APPS_CHALLENGE=${_OPENAI_APPS_CHALLENGE}'
 
 images:
   - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
@@ -48,6 +48,7 @@ substitutions:
   _MCP_PUBLIC_URL: 'https://mcp-engramo.volmyr.com'
   _ENGRAMO_ENABLE_PAID_AI: 'false'
   _APP_ENV: 'dev'
+  _OPENAI_APPS_CHALLENGE: ''
 
 options:
   logging: CLOUD_LOGGING_ONLY

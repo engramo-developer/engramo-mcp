@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use engramo_mcp::{
     client::{EngramoClient, HardenedClient},
     config::McpConfig,
-    http_auth::{SessionTokens, bearer_auth_middleware, current_bearer_token},
+    http_auth::{AuthState, SessionTokens, bearer_auth_middleware, current_bearer_token},
     server::{EngramoMcpServer, build_session_server},
     tts, well_known,
 };
@@ -201,6 +201,13 @@ fn attach_tts(
 async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = McpConfig::from_env()
         .map_err(|e| format!("{e}\n\nSet ENGRAMO_API_URL before running `engramo-mcp http`."))?;
+    cfg.require_public_url().map_err(|e| {
+        format!(
+            "{e}\n\nSet MCP_PUBLIC_URL to this server's public URL (e.g. https://mcp.engramo.app) \
+             before running `engramo-mcp http`: it is advertised in OAuth metadata and \
+             WWW-Authenticate challenges."
+        )
+    })?;
 
     // Local TTS is stdio-only (see `tts` module doc comment) — this reads only the env var's
     // *name*, never its value, and never builds a TtsConfig/engine. This is the only place
@@ -240,7 +247,17 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
 /// the unauthenticated `/version` and `/.well-known/oauth-protected-resource` routes. Pulled
 /// out of `run_http` (a pure move, no behavior change) so tests can drive the router directly
 /// with `tower::ServiceExt::oneshot` instead of binding a real listener.
+///
+/// `cfg.public_url` must be set (`run_http` enforces it at startup); `build_app` panics otherwise.
 fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
+    let public_url = cfg
+        .require_public_url()
+        .expect("MCP_PUBLIC_URL is required in http mode (checked at startup)")
+        .to_string();
+    let resource_metadata_url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        public_url.trim_end_matches('/')
+    );
     let api_url = cfg.api_url.clone();
     let paid_ai_enabled = cfg.paid_ai_enabled;
     let allowed_hosts = cfg.allowed_hosts();
@@ -283,28 +300,20 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
     // `.well-known/oauth-protected-resource` (RFC 9728, Track 3 Phase 3) must be
     // fetchable *without* a token, since its whole purpose is telling an
     // unauthenticated client where to go get one.
-    let sessions = SessionTokens::new();
+    let auth = AuthState::new(SessionTokens::new(), resource_metadata_url);
     let mcp_router = axum::Router::new()
         .fallback_service(service)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             MAX_BODY_BYTES,
         ))
         .layer(middleware::from_fn_with_state(
-            sessions.clone(),
+            auth.clone(),
             bearer_auth_middleware,
         ))
-        .with_state(sessions);
+        .with_state(auth);
 
     let protected_resource_state = well_known::ProtectedResourceState {
-        resource: cfg.public_url.clone().unwrap_or_else(|| {
-            tracing::warn!(
-                "MCP_PUBLIC_URL is not set — .well-known/oauth-protected-resource will \
-                 advertise a placeholder \"resource\" value. Set MCP_PUBLIC_URL to this \
-                 server's real public URL (e.g. https://mcp.engramo.app) before \
-                 deploying for OAuth."
-            );
-            "http://localhost:8080".to_string()
-        }),
+        resource: public_url,
         authorization_server: cfg.api_url.clone(),
     };
     axum::Router::new()
@@ -313,6 +322,12 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
             axum::routing::get(well_known::protected_resource_metadata),
         )
         .with_state(protected_resource_state)
+        // OpenAI domain verification — unauthenticated, outside the bearer middleware.
+        .route(
+            "/.well-known/openai-apps-challenge",
+            axum::routing::get(well_known::openai_apps_challenge)
+                .with_state(cfg.openai_apps_challenge.clone()),
+        )
         // Unauthenticated by design — it returns only this deployment's public build
         // version (name + version), nothing user- or token-scoped. Lives on the outer
         // router so it sits outside `bearer_auth_middleware`, like the `.well-known` route.
@@ -331,7 +346,9 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_cfg() -> McpConfig {
-        McpConfig::new("http://localhost", None, false).unwrap()
+        McpConfig::new("http://localhost", None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080")
     }
 
     #[tokio::test]
@@ -386,6 +403,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn get_status_and_body(
+        app: axum::Router,
+        uri: &str,
+    ) -> (StatusCode, String, Option<String>) {
+        let resp = app
+            .oneshot(
+                Request::get(uri)
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string(), ct)
+    }
+
+    #[tokio::test]
+    async fn test_openai_challenge_served_when_set() {
+        let cfg = test_cfg().with_openai_apps_challenge("tok-xyz");
+        let app = build_app(&cfg, EngramoClient::build_http_client());
+        let (status, body, ct) =
+            get_status_and_body(app, "/.well-known/openai-apps-challenge").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "tok-xyz");
+        assert!(ct.unwrap().starts_with("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_openai_challenge_404_when_unset() {
+        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
+        let (status, _, _) = get_status_and_body(app, "/.well-known/openai-apps-challenge").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_root_401_advertises_metadata_url_with_single_slash() {
+        let cfg = McpConfig::new("http://localhost", None, false)
+            .unwrap()
+            .with_public_url("https://mcp.engramo.app/");
+        let app = build_app(&cfg, EngramoClient::build_http_client());
+        let resp = app
+            .oneshot(
+                Request::post("/")
+                    .header("host", "localhost")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get("www-authenticate").unwrap(),
+            "Bearer resource_metadata=\"https://mcp.engramo.app/.well-known/oauth-protected-resource\""
+        );
     }
 
     fn test_server() -> EngramoMcpServer {

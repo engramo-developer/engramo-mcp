@@ -22,6 +22,22 @@ pub struct ProtectedResourceState {
     pub authorization_server: String,
 }
 
+/// GET /.well-known/openai-apps-challenge — OpenAI domain verification. Serves
+/// the configured token verbatim as `text/plain`; 404 when none is configured.
+pub async fn openai_apps_challenge(State(token): State<Option<String>>) -> impl IntoResponse {
+    match token {
+        Some(t) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            t,
+        )
+            .into_response(),
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 #[derive(Serialize)]
 struct ProtectedResourceMetadata {
     resource: String,

@@ -38,7 +38,7 @@ pub enum ApiError {
     Conflict(String),
 
     #[error(
-        "Quota exceeded: {resource_type} limit reached ({used}/{limit}). Upgrade your plan or delete unused resources."
+        "Quota exceeded: {resource_type} limit reached ({used}/{limit}). Delete unused resources, or manage your plan in the EngrAmo app."
     )]
     QuotaExceeded {
         resource_type: String,
@@ -49,7 +49,9 @@ pub enum ApiError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
-    #[error("Unauthorized: API token is invalid or expired. Check your ENGRAMO_API_TOKEN.")]
+    #[error(
+        "Unauthorized: EngrAmo authorization is invalid, expired, or revoked. Reconnect EngrAmo in your AI app (local installs: update ENGRAMO_API_TOKEN)."
+    )]
     Unauthorized,
 
     #[error(
@@ -768,7 +770,7 @@ mod tests {
     #[test]
     fn test_unauthorized_display() {
         let e = ApiError::Unauthorized;
-        assert!(e.to_string().contains("invalid or expired"));
+        assert!(e.to_string().contains("invalid, expired, or revoked"));
     }
 
     #[test]
