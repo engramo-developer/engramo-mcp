@@ -114,6 +114,11 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   value. Missing/empty bearer → `401` with `WWW-Authenticate: Bearer resource_metadata="…"` at the
   middleware, before a session is ever created. One
   `EngramoClient` (and thus one EngrAmo account) per MCP session, for the session's lifetime.
+- **Session-open token check:** a POST without `Mcp-Session-Id` is validated before rmcp sees it: a bearer not
+  starting with `engramo_` (current) or `engram_` (legacy) → 401 `invalid_token` (no upstream call); otherwise `GET /me` via the shared
+  `HardenedClient` — upstream 401 → 401 `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"`,
+  403 counts as valid, network/timeout/5xx → 503 (no `WWW-Authenticate`). No cache; requests carrying a session id
+  and GET/DELETE are never probed.
 - **Session binding (security):** rmcp authorizes every post-`initialize` request on the `Mcp-Session-Id`
   header alone, so `SessionTokens` records which token opened each session and 404s ("Session not found", no `WWW-Authenticate`) a request that presents a
   different one — otherwise a leaked session id would let anyone act as that session's owner. Requests are

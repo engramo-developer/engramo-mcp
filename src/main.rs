@@ -261,6 +261,8 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
     let api_url = cfg.api_url.clone();
     let paid_ai_enabled = cfg.paid_ai_enabled;
     let allowed_hosts = cfg.allowed_hosts();
+    let auth_http = http.clone();
+    let auth_api_url = api_url.clone();
     let factory = move || {
         let token = current_bearer_token().ok_or_else(|| {
             // Invariant violation: `bearer_auth_middleware` already rejects any
@@ -300,7 +302,12 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
     // `.well-known/oauth-protected-resource` (RFC 9728, Track 3 Phase 3) must be
     // fetchable *without* a token, since its whole purpose is telling an
     // unauthenticated client where to go get one.
-    let auth = AuthState::new(SessionTokens::new(), resource_metadata_url);
+    let auth = AuthState::new(
+        SessionTokens::new(),
+        resource_metadata_url,
+        auth_http,
+        auth_api_url,
+    );
     let mcp_router = axum::Router::new()
         .fallback_service(service)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -360,10 +367,22 @@ mod tests {
         // "length limit exceeded" message rather than 413. This pins that real, current
         // behavior so a regression that instead buffers/accepts the oversized body (e.g. a
         // layer reordered or dropped) still fails this test.
-        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
+        // Session open now probes `GET /me`, so the token must look valid and the API must
+        // answer; the body limit is still what rejects the request afterwards.
+        let api = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/me"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"user_id": "11111111-2222-3333-4444-555555555555"}),
+            ))
+            .mount(&api)
+            .await;
+        let cfg = McpConfig::new(api.uri(), None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080");
+        let app = build_app(&cfg, EngramoClient::build_http_client());
         let body = vec![b'a'; MAX_BODY_BYTES + 1];
         let req = Request::post("/")
-            .header("authorization", "Bearer t")
+            .header("authorization", "Bearer engramo_t")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("host", "localhost")

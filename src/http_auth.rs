@@ -30,6 +30,9 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
+use crate::client::{EngramoClient, HardenedClient};
+use crate::error::ApiError;
+
 /// Header rmcp uses to carry the MCP session id, on both requests and the
 /// `initialize` response.
 const HEADER_SESSION_ID: &str = "mcp-session-id";
@@ -49,6 +52,20 @@ const BINDING_TTL: Duration = Duration::from_secs(3600);
 /// silently dropping bindings, which would weaken the check this module exists
 /// to enforce.
 const MAX_TRACKED_SESSIONS: usize = 10_000;
+
+/// Prefix of newly minted EngrAmo API tokens (user-minted and OAuth-issued); mirrors
+/// engram-api's `CURRENT_TOKEN_PREFIX` (`db/src/repo/api_token/mod.rs`).
+const TOKEN_PREFIX_CURRENT: &str = "engramo_";
+
+/// Prefix of pre-rename tokens that still validate; mirrors engram-api's
+/// `LEGACY_TOKEN_PREFIX`.
+const TOKEN_PREFIX_LEGACY: &str = "engram_";
+
+/// A bearer with neither prefix cannot be valid, so it is rejected at session open
+/// with no upstream call.
+fn has_known_token_prefix(token: &str) -> bool {
+    token.starts_with(TOKEN_PREFIX_CURRENT) || token.starts_with(TOKEN_PREFIX_LEGACY)
+}
 
 // Carries the per-request bearer token from [`bearer_auth_middleware`] to the rmcp
 // `StreamableHttpService` session factory, which is a plain `Fn() -> Result<S, io::Error>`
@@ -74,13 +91,32 @@ pub struct AuthState {
     /// Absolute URL of this server's `/.well-known/oauth-protected-resource`,
     /// advertised in the `WWW-Authenticate` header of a 401 (RFC 9728 §5.1).
     pub resource_metadata_url: String,
+    /// Shared upstream client (same one the session factory uses), for the
+    /// session-open token probe.
+    http: HardenedClient,
+    api_url: String,
+}
+
+/// Result of probing a bearer token against `GET /me`.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenProbe {
+    Valid,
+    Invalid,
+    Unavailable,
 }
 
 impl AuthState {
-    pub fn new(sessions: SessionTokens, resource_metadata_url: impl Into<String>) -> Self {
+    pub fn new(
+        sessions: SessionTokens,
+        resource_metadata_url: impl Into<String>,
+        http: HardenedClient,
+        api_url: impl Into<String>,
+    ) -> Self {
         Self {
             sessions,
             resource_metadata_url: resource_metadata_url.into(),
+            http,
+            api_url: api_url.into(),
         }
     }
 
@@ -89,6 +125,37 @@ impl AuthState {
             "Bearer resource_metadata=\"{}\"",
             self.resource_metadata_url
         )
+    }
+
+    fn www_authenticate_invalid_token(&self) -> String {
+        format!(
+            "Bearer error=\"invalid_token\", resource_metadata=\"{}\"",
+            self.resource_metadata_url
+        )
+    }
+
+    fn invalid_token_response(&self) -> Response {
+        let mut resp = (
+            StatusCode::UNAUTHORIZED,
+            "EngrAmo authorization is invalid, expired, or revoked",
+        )
+            .into_response();
+        if let Ok(v) = self.www_authenticate_invalid_token().parse() {
+            resp.headers_mut().insert(WWW_AUTHENTICATE, v);
+        }
+        resp
+    }
+
+    /// Asks the EngrAmo API whether `token` is currently valid. A 403 is treated as
+    /// valid: the backend collapses every 403 to a bare "Forbidden", which does not
+    /// prove the credential is dead. Never logs the token or the upstream error text.
+    async fn probe(&self, token: &str) -> TokenProbe {
+        let client = EngramoClient::with_http(self.http.clone(), &self.api_url, token);
+        match client.get_me().await {
+            Ok(_) | Err(ApiError::PermissionDenied(_)) => TokenProbe::Valid,
+            Err(ApiError::Unauthorized) => TokenProbe::Invalid,
+            Err(_) => TokenProbe::Unavailable,
+        }
     }
 }
 
@@ -199,6 +266,11 @@ fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
     Some(token.to_string())
 }
 
+/// A POST without an `Mcp-Session-Id` (a session open) is additionally validated:
+/// a bearer not starting with `engram_` gets 401 `invalid_token` with no upstream
+/// call; otherwise `GET /me` decides — upstream 401 → 401 `invalid_token`, 403 →
+/// valid, anything else (network, timeout, 5xx) → 503 without `WWW-Authenticate`.
+///
 /// Extracts `Authorization: Bearer <token>` and scopes it into
 /// `CURRENT_BEARER_TOKEN` for the duration of the request. Missing, empty or
 /// malformed bearer tokens are rejected with 401 (plus a `WWW-Authenticate`
@@ -256,6 +328,26 @@ pub async fn bearer_auth_middleware(
                 )
                     .into_response();
             }
+            // Session open (POST, no session id): validate the token before rmcp
+            // allocates a session. GET/DELETE without a session id are rejected by
+            // rmcp itself, so they are not probed.
+            if req.method() == Method::POST {
+                if !has_known_token_prefix(&token) {
+                    return auth.invalid_token_response();
+                }
+                match auth.probe(&token).await {
+                    TokenProbe::Valid => {}
+                    TokenProbe::Invalid => return auth.invalid_token_response(),
+                    TokenProbe::Unavailable => {
+                        tracing::warn!("token validation failed: EngrAmo API unavailable");
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "EngrAmo API unavailable, try again",
+                        )
+                            .into_response();
+                    }
+                }
+            }
         }
     }
 
@@ -293,6 +385,8 @@ mod tests {
         Router, body::Body, http::Request as HttpRequest, middleware, routing::get, routing::post,
     };
     use tower::ServiceExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const VICTIM: &str = "engramo_victim_token";
     const ATTACKER: &str = "engramo_attacker_token";
@@ -303,8 +397,36 @@ mod tests {
     /// a request that has none, exactly like an `initialize` response.
     const META_URL: &str = "https://mcp.example.com/.well-known/oauth-protected-resource";
 
-    fn app(sessions: SessionTokens) -> Router {
-        let auth = AuthState::new(sessions, META_URL);
+    /// Router whose probe is answered by a leaked wiremock server that accepts
+    /// every token (`GET /me` → 200).
+    async fn app(sessions: SessionTokens) -> Router {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let router = app_with(sessions, &server.uri());
+        Box::leak(Box::new(server));
+        router
+    }
+
+    async fn mock_me(server: &MockServer, status: u16) {
+        let body = serde_json::json!({"user_id": "11111111-2222-3333-4444-555555555555"});
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn me_calls(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    fn app_with(sessions: SessionTokens, api_url: &str) -> Router {
+        let auth = AuthState::new(
+            sessions,
+            META_URL,
+            EngramoClient::build_http_client(),
+            api_url,
+        );
         Router::new()
             .route(
                 "/",
@@ -348,6 +470,7 @@ mod tests {
     #[tokio::test]
     async fn test_middleware_rejects_missing_authorization_header() {
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(None, None))
             .await
             .unwrap();
@@ -357,6 +480,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_bearer_401_carries_www_authenticate() {
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(None, None))
             .await
             .unwrap();
@@ -370,6 +494,7 @@ mod tests {
     #[tokio::test]
     async fn test_malformed_bearer_401_carries_www_authenticate_without_error_param() {
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(Some("Basic dXNlcjpwYXNz"), None))
             .await
             .unwrap();
@@ -387,6 +512,7 @@ mod tests {
     #[tokio::test]
     async fn test_middleware_rejects_empty_bearer_token() {
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(Some("Bearer "), None))
             .await
             .unwrap();
@@ -396,6 +522,7 @@ mod tests {
     #[tokio::test]
     async fn test_middleware_rejects_non_bearer_scheme() {
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(Some("Basic dXNlcjpwYXNz"), None))
             .await
             .unwrap();
@@ -406,6 +533,7 @@ mod tests {
     async fn test_middleware_rejects_oversized_token() {
         let huge = format!("Bearer {}", "a".repeat(MAX_TOKEN_LEN + 1));
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(Some(&huge), None))
             .await
             .unwrap();
@@ -417,6 +545,7 @@ mod tests {
         // A space inside the token would break the `X-Api-Key` header it is
         // forwarded as; anything non-graphic is refused.
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(Some("Bearer engramo tok"), None))
             .await
             .unwrap();
@@ -427,6 +556,7 @@ mod tests {
     async fn test_middleware_accepts_lowercase_bearer_scheme() {
         // RFC 7235 §2.1: the auth-scheme token is case-insensitive.
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(Some(&format!("bearer {VICTIM}")), None))
             .await
             .unwrap();
@@ -437,6 +567,7 @@ mod tests {
     #[tokio::test]
     async fn test_middleware_scopes_token_for_the_inner_service() {
         let resp = app(SessionTokens::new())
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), None))
             .await
             .unwrap();
@@ -448,6 +579,7 @@ mod tests {
     async fn test_initialize_response_binds_session_to_its_token() {
         let sessions = SessionTokens::new();
         let resp = app(sessions.clone())
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), None))
             .await
             .unwrap();
@@ -459,11 +591,13 @@ mod tests {
     async fn test_session_rejects_a_different_bearer_token() {
         let sessions = SessionTokens::new();
         app(sessions.clone())
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), None))
             .await
             .unwrap();
 
         let resp = app(sessions.clone())
+            .await
             .oneshot(request(Some(&format!("Bearer {ATTACKER}")), Some(SESSION)))
             .await
             .unwrap();
@@ -476,11 +610,13 @@ mod tests {
     async fn test_session_accepts_the_token_that_opened_it() {
         let sessions = SessionTokens::new();
         app(sessions.clone())
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), None))
             .await
             .unwrap();
 
         let resp = app(sessions.clone())
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), Some(SESSION)))
             .await
             .unwrap();
@@ -492,6 +628,7 @@ mod tests {
     async fn test_unknown_session_is_passed_through_for_rmcp_to_404() {
         let sessions = SessionTokens::new();
         let resp = app(sessions)
+            .await
             .oneshot(request(
                 Some(&format!("Bearer {ATTACKER}")),
                 Some("11111111-1111-1111-1111-111111111111"),
@@ -505,6 +642,7 @@ mod tests {
     async fn test_delete_releases_the_binding() {
         let sessions = SessionTokens::new();
         app(sessions.clone())
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), None))
             .await
             .unwrap();
@@ -517,7 +655,7 @@ mod tests {
             .header(HEADER_SESSION_ID, SESSION)
             .body(Body::empty())
             .unwrap();
-        let resp = app(sessions.clone()).oneshot(req).await.unwrap();
+        let resp = app(sessions.clone()).await.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(sessions.len().await, 0);
     }
@@ -538,6 +676,7 @@ mod tests {
             }
         }
         let resp = app(sessions)
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), None))
             .await
             .unwrap();
@@ -561,6 +700,7 @@ mod tests {
             }
         }
         let resp = app(sessions.clone())
+            .await
             .oneshot(request(Some(&format!("Bearer {VICTIM}")), None))
             .await
             .unwrap();
@@ -580,5 +720,184 @@ mod tests {
         assert!(!constant_time_eq("engramo_abc", "engramo_abcd"));
         assert!(!constant_time_eq("", "x"));
         assert!(constant_time_eq("", ""));
+    }
+
+    fn open_req(method_: &str, token: &str, session: Option<&str>) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder()
+            .method(method_)
+            .uri("/")
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(s) = session {
+            b = b.header(HEADER_SESSION_ID, s);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_session_open_with_valid_token_passes_and_probes_once() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(me_calls(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_non_engram_prefix_is_401_invalid_token_without_upstream_call() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(open_req("POST", "junk_token", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(WWW_AUTHENTICATE).unwrap(),
+            "Bearer error=\"invalid_token\", resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource\""
+        );
+        assert!(!body_string(resp).await.contains("junk_token"));
+        assert_eq!(me_calls(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_engram_prefix_is_probed_and_accepted() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(open_req("POST", "engram_legacy_token", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(me_calls(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_near_miss_prefixes_are_rejected_without_upstream_call() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        for t in [
+            "foo_token",
+            "engramX_token",
+            "engramox_token",
+            "engra_token",
+        ] {
+            let resp = app_with(SessionTokens::new(), &server.uri())
+                .oneshot(open_req("POST", t, None))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{t}");
+        }
+        assert_eq!(me_calls(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_401_is_401_invalid_token() {
+        let server = MockServer::start().await;
+        mock_me(&server, 401).await;
+        let sessions = SessionTokens::new();
+        let resp = app_with(sessions.clone(), &server.uri())
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(WWW_AUTHENTICATE).unwrap(),
+            "Bearer error=\"invalid_token\", resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource\""
+        );
+        assert_eq!(sessions.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_403_counts_as_valid() {
+        let server = MockServer::start().await;
+        mock_me(&server, 403).await;
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_500_is_503_without_www_authenticate() {
+        let server = MockServer::start().await;
+        mock_me(&server, 500).await;
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(WWW_AUTHENTICATE).is_none());
+        assert_eq!(
+            body_string(resp).await,
+            "EngrAmo API unavailable, try again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_upstream_is_503() {
+        let resp = app_with(SessionTokens::new(), "http://127.0.0.1:1")
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_request_with_session_id_is_not_probed() {
+        let server = MockServer::start().await;
+        mock_me(&server, 500).await;
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(open_req("POST", VICTIM, Some(SESSION)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(me_calls(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_without_session_id_is_not_probed() {
+        let server = MockServer::start().await;
+        mock_me(&server, 500).await;
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/get")
+            .header(AUTHORIZATION, format!("Bearer {VICTIM}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(me_calls(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_full_table_is_checked_before_probe() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let sessions = SessionTokens::new();
+        {
+            let mut guard = sessions.inner.write().await;
+            for i in 0..MAX_TRACKED_SESSIONS {
+                guard.insert(
+                    format!("session-{i}"),
+                    Binding {
+                        token: VICTIM.to_string(),
+                        last_seen: Instant::now(),
+                    },
+                );
+            }
+        }
+        let resp = app_with(sessions, &server.uri())
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(me_calls(&server).await, 0);
     }
 }
