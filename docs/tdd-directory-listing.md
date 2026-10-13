@@ -1,6 +1,6 @@
 # TDD: List engramo-mcp in public MCP directories (Claude, ChatGPT, MCP Registry, Antigravity)
 
-> **Status:** REVIEWED, 2026-10-13. Open questions resolved (section 1). Nothing in it has been implemented yet.
+> **Status:** IN PROGRESS, 2026-10-13. Open questions resolved (section 1). Implementation progress is tracked in section 10.
 > **Goal:** EngrAmo installs in one click with OAuth from Claude (web, desktop, mobile, Code), ChatGPT, and
 > MCP-aware dev tools (VS Code/Copilot, Cursor, Antigravity), and shows up in their official directories.
 > **Origin:** a first-pass plan drafted outside this repo ("Let's prepare comprehensive plan to do this step b….md").
@@ -17,7 +17,7 @@
 | Scope of the first execution wave | **All platforms, in order:** code gaps → MCP Registry → Claude directory → ChatGPT directory → Antigravity. |
 | ChatGPT integration style | **Native MCP app** (Apps SDK / app directory). We are **not** building an OpenAPI gateway or a Custom GPT. |
 | Branching | engramo-mcp: feature branches and PRs only, never `main`. engram-api: changes go **uncommitted on the branch the user names**; no branches, commits, or PRs unless asked. Releases stay user-driven (`/release` runs separately). |
-| 4.3: cache token validation? | **No cache.** Every session open costs one engram-api call, behind a free `engram_` prefix pre-filter. |
+| 4.3: cache token validation? | **No cache.** Every session open costs one engram-api call, behind a free token-prefix pre-filter (`engramo_` current, `engram_` legacy). |
 | 4.3: which endpoint validates a token? | **A new `GET /me` in engram-api** (Phase A), built before 4.3. 4.3 waits for it; there is no interim probe. |
 | Terms of Service / privacy policy | ToS exists (`engramo-landing/src/pages/policy/terms.astro`). The privacy policy needs fixes before submitting; see 6.1. |
 | Paid AI on the public prod endpoint | **Stays off** while listed. The quota error's "Upgrade your plan" wording is reworded anyway (4.5). |
@@ -66,7 +66,7 @@ Note: `resource` is advertised **without** a trailing slash, while connectors ar
 - **Redirect URIs:** `engram-api/service/src/oauth_service.rs::validate_redirect_uri_format` accepts any
   `https://` URI and loopback `http://` URIs at DCR time. Claude's callback (`https://claude.ai/api/mcp/auth_callback`) and
   ChatGPT's (a `chatgpt.com` https URL) therefore both register without an allowlist change.
-- **Token model:** each OAuth access token is a minted 90-day `engram_` PAT, stored with `source = 'oauth'`
+- **Token model:** each OAuth access token is a minted 90-day PAT (prefix `engramo_`; pre-rename tokens use the legacy `engram_`, which still validates), stored with `source = 'oauth'`
   (`api_token_service.rs`, `TokenSource::Oauth`), and there is **no refresh token**. When it expires the user must redo
   OAuth. Clients only do that when the server answers with HTTP 401. See 4.3.
 - **Token revocation gap:** `GET`/`DELETE /auth/api-tokens` (used by engram_app's API-token page) are hard-scoped to
@@ -146,10 +146,7 @@ Sources: Antigravity custom MCP guides (Google Developer Experts on Medium, Goog
 its own small PR (`feat/session-open-token-check`). The `/review` loop runs before each PR is opened.
 
 ### 4.0 Prerequisite: the leftover `feat/mcpb-bundle` commit
-The bundle itself landed in #88 (release hardening, `.sha256`, `mcpb-attest`, `mcpb_manifest_matches_env_contract`). One commit
-is still only on the branch: `73a59d5 fix(ci): unblock mcpb tools npm audit` (`tmp` override plus `mcpb/tools/audit.mjs` with a
-reviewed allowlist). Cherry-pick it onto a fresh branch from `main`, run the gate, and open the PR. Nothing else depends on it, except
-that the next release's `mcpb` job needs it to pass `npm audit`.
+**Done (no-op).** The bundle landed in #88, and the squash merge already included `73a59d5 fix(ci): unblock mcpb tools npm audit`. A cherry-pick onto `main` came up empty, and `mcpb/tools/audit.mjs` passes on `main`.
 
 ### 4.1 Tool annotations (hard requirement for both directories)
 - Scope: the **36 live tools**, meaning the `#[tool(...)]`s in `src/server.rs`, `src/tools/ai.rs`, and `src/tools/tts.rs`. Leave the
@@ -204,7 +201,7 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
   re-run OAuth on an HTTP 401.
 - **Design:** for a **POST without an `Mcp-Session-Id`** (a session open), validate the bearer before passing the request to rmcp.
   GET or DELETE without a session id is rejected by rmcp anyway, so it isn't checked.
-  1. **Pre-filter, at no cost:** if the bearer doesn't start with `engram_`, return 401 with `error="invalid_token"` and make no
+  1. **Pre-filter, at no cost:** if the bearer starts with neither `engramo_` (engram-api `CURRENT_TOKEN_PREFIX`) nor `engram_` (`LEGACY_TOKEN_PREFIX`), return 401 with `error="invalid_token"` and make no
      upstream call. This takes the cost out of junk-bearer floods (otherwise each unauthenticated request causes one engram-api call).
   2. **Probe:** `EngramoClient::get_me()` → `GET /me` through the shared `HardenedClient`.
      - `ApiError::Unauthorized` (upstream 401) → **401** + `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"`.
@@ -219,7 +216,7 @@ Some clients fall back to probing `.well-known` themselves, but relying on that 
   Make it work for both modes: "EngrAmo authorization is invalid, expired, or revoked. Reconnect EngrAmo in your AI app (local
   installs: update ENGRAMO_API_TOKEN)." This change goes in with 4.1/4.2.
 - Security: the token is never logged. The rule against logging the session id is unchanged.
-- Tests: wiremock covering valid → session opens; non-`engram_` bearer → 401 with no upstream call; upstream 401 → 401 with the header;
+- Tests: wiremock covering valid → session opens; unknown-prefix bearer → 401 with no upstream call; legacy `engram_` bearer → probed; upstream 401 → 401 with the header;
   upstream 403 → session opens; upstream 500 → 503; a request with a session id → no `/me` call; GET without a session id → no `/me` call.
 
 ### 4.4 ChatGPT domain verification route
@@ -271,6 +268,12 @@ Unblocks 4.3 and the revocation story.
 - The existing `/auth/api-tokens` routes stay as they are (personal token only).
 - Effect on MCP: a revoked token gets 401 on the next API call, so the next session open gets 401 (4.3) and the client re-runs OAuth.
 - Repo, service, and route tests, including "can't delete another user's row" and "can't delete a `source = 'user'` row through this route".
+
+### 4A.3 OAuth token naming (found during implementation)
+- `OauthServiceImpl::exchange_code` stored every OAuth token as `"ChatGPT ({client_name})"`, a leftover from when ChatGPT was the only
+  client. A Claude connection would have shown as "ChatGPT (Claude)" in Connected apps.
+- Fix: store the DCR `client_name` as-is (blank → "AI app"). The connected-apps list strips the exact legacy `"ChatGPT (X)"` form to `X`
+  for rows already in the database.
 
 ## 4B. Design: engram_app (Phase B)
 
@@ -333,7 +336,7 @@ Unblocks 4.3 and the revocation story.
     - **Google (Gemini)** added. engram-api's prod config sends content to `generativelanguage.googleapis.com` and to the
       Gemini-based premium-TTS service. The lines saying "No other third-party services receive your personal data" (81) and
       "only… our own servers and Supabase" (67) are currently inaccurate.
-    - Line 92 updated: access also works with API tokens and OAuth access tokens (`engram_` PATs), not only Supabase sessions.
+    - Line 92 updated: access also works with API tokens and OAuth access tokens (`engramo_` PATs), not only Supabase sessions.
     - A sentence on revoking connected apps (4B), and a new "Last updated" date.
   - Support contact, using the GitHub issues URL or an email.
 - **Brand assets:** a square icon (reuse `mcpb/icon.png`), a dark variant, and brand hex colors.
@@ -404,8 +407,8 @@ Unblocks 4.3 and the revocation story.
     `WWW-Authenticate: Bearer resource_metadata="http://localhost:8080/.well-known/oauth-protected-resource"`.
   - Unset `MCP_PUBLIC_URL` → http mode refuses to start.
   - `initialize` with a bearer like `foo` → `401` with `error="invalid_token"`, and no `/me` call in the logs.
-  - `initialize` with a revoked `engram_` token → `401` with `error="invalid_token"`.
-  - `initialize` with a valid dev `engram_` token, then `tools/list` → 36 tools minus paid AI and TTS (29), each with `title`,
+  - `initialize` with a revoked `engramo_` token → `401` with `error="invalid_token"`.
+  - `initialize` with a valid dev `engramo_` token, then `tools/list` → 36 tools minus paid AI and TTS (29), each with `title`,
     `annotations.title`, and all three hints.
   - Reuse that session id with a different valid token → `404`.
   - `curl localhost:8080/.well-known/openai-apps-challenge` → 404 when unset, and the token when `OPENAI_APPS_CHALLENGE` is set.
@@ -422,7 +425,7 @@ Unblocks 4.3 and the revocation story.
 
 ## 9. Resolved questions (2026-10-13)
 
-1. **4.3 cache:** none. An `engram_` prefix pre-filter handles junk tokens (4.3).
+1. **4.3 cache:** none. A token-prefix pre-filter (`engramo_`/`engram_`) handles junk tokens (4.3).
 2. **4.3 probe:** a new `GET /me` in engram-api (4A.1). 4.3 waits for it.
 3. **Legal pages:** ToS exists. The privacy policy needs Anthropic, Google/Gemini, and token-wording fixes (6.1).
 4. **Paid AI in prod:** stays off. The quota wording is neutralized regardless (4.5).
@@ -443,3 +446,35 @@ Unblocks 4.3 and the revocation story.
   `engram-api/app/src/routes/oauth.rs`, `engram-api/service/src/oauth_service.rs`,
   `engram-api/db/src/repo/api_token/api_token_repo_pg.rs`, `engram_app/lib/presentation/screens/settings/api_token_page.dart`,
   `engramo-landing/src/pages/policy/privacy.astro`
+
+---
+
+## 10. Implementation progress (2026-10-13)
+
+Nothing is pushed. engramo-mcp branches carry local commits; the other repos' changes are uncommitted on new branches made from `main`.
+
+| Phase | Repo / branch | State | Verification |
+|---|---|---|---|
+| 0 OAuth spike | — | **Not started** (needs the user's browser logins) | — |
+| 0b leftover mcpb commit | — | Done: no-op (already in #88) | `audit.mjs` passes on `main` |
+| 1 (4.1, 4.2, 4.4, 4.5, error text) | engramo-mcp `feat/directory-readiness` | Committed locally (`ac6fa6f`, `7b10e89`) | gate green, 706 tests |
+| 1b (4.3) + `/review` fixes | engramo-mcp `feat/session-open-token-check` (on top of 1) | 4.3 committed locally (`9514001`); two review passes' fixes uncommitted | gate green |
+| 2 MCP Registry | engramo-mcp `feat/mcp-registry` (worktree `../engram-mcp-registry`) | Committed locally (`a56827d`) | gate green, 698 tests; `mcp-publisher validate` passed |
+| A `/me` + connected apps + 4A.3 | engram-api `feat/me-and-connected-apps` | Uncommitted (includes 2 new `.sqlx` files) | 1863 passed, incl. DB integration tests |
+| B Connected apps UI | engram_app `feat/connected-apps` | Uncommitted (7 goldens regenerated, unreviewed) | analyze clean, 1691 tests |
+| 3 Privacy policy | engramo-landing `docs/privacy-ai-processors` | Uncommitted | `npm run build` passes |
+| 6 Antigravity README | — | Already on `main` | — |
+
+**Review-loop changes to 4.2/4.3 beyond the original design** (`.claude/.review-cache/`):
+- **Unknown sessions:** an unknown or unbound session id now fails closed, with a 404 that matches rmcp's byte for byte.
+- **Session limits:** at most 32 sessions per token, evicting that token's own stale bindings first, otherwise 429 + `Retry-After`.
+- **Binding lifetime:** bindings last at least twice rmcp's keep-alive, which is now set explicitly.
+- **Token check:** at most 32 `/me` probes run at once, with a 2 s wait for a slot. Still no cache.
+- **Startup:** `MCP_PUBLIC_URL` is validated (https unless loopback, no userinfo).
+
+**Open items for the user:**
+- Phase 0 spike.
+- DNS TXT record on `engramo.app` and the `mcp-registry` GitHub environment and secret (`docs/mcp-registry.md` on `feat/mcp-registry`).
+- Confirm DPAs with Anthropic and Google before publishing the privacy policy. Identify the provider behind the standard TTS service (`engram-agent-tts`).
+- Publish the privacy policy only after Phase B ships, since it refers to Settings → Connected apps.
+- Annotation judgment calls: `deactivate_learning_path` is destructive, and the paid-AI tools are additive.
