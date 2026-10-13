@@ -16,7 +16,8 @@
 //! unknown-session 404, so a probe learns nothing about which session ids are live.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -27,6 +28,9 @@ use axum::{
     },
     middleware::Next,
     response::{IntoResponse, Response},
+};
+use rmcp::transport::streamable_http_server::session::{
+    SessionManager, local::LocalSessionManager,
 };
 use tokio::sync::{RwLock, Semaphore};
 
@@ -80,6 +84,34 @@ const MAX_SESSIONS_PER_TOKEN: usize = 32;
 /// Cap on concurrent session-open probes (`GET /me`) against the EngrAmo API, so
 /// unauthenticated traffic cannot become an unbounded flood upstream.
 const MAX_CONCURRENT_PROBES: usize = 32;
+
+/// Upper bound on one session-open probe, so a slow upstream cannot hold a probe
+/// permit for the client's full request timeout.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a token the upstream rejected is remembered, so repeats skip the probe.
+const NEGATIVE_TTL: Duration = Duration::from_secs(60);
+
+/// Cap on remembered rejected tokens (8 bytes + an `Instant` each).
+const MAX_NEGATIVE_ENTRIES: usize = 4096;
+
+/// Largest request body accepted in `http` mode. rmcp buffers the whole body in memory
+/// before parsing it (`expect_json`) and axum's `DefaultBodyLimit` does not apply to a
+/// `fallback_service`, so without this an unauthenticated caller can drive the process
+/// out of memory with one POST. 16 MiB leaves room for the ~13.4 MiB of base64 a maximum
+/// 10 MB `upload_media` produces, plus JSON-RPC framing.
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// An `initialize` request is a few KB; nothing larger is a legitimate session open.
+const MAX_INITIALIZE_BYTES: usize = 64 * 1024;
+
+/// Upper bound on reading a session-less POST body, so a slow-drip upload cannot pin memory.
+const INITIALIZE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// True when `to_bytes` failed because the body exceeded the limit (vs. a transport error).
+fn is_length_limit_error(e: &axum::Error) -> bool {
+    std::error::Error::source(e).is_some_and(|s| s.to_string().contains("length limit exceeded"))
+}
 
 /// How long a session open waits for a free probe slot before answering 503.
 #[cfg(not(test))]
@@ -139,6 +171,44 @@ pub struct AuthState {
     /// session-open token probe.
     http: HardenedClient,
     api_url: String,
+    /// Tokens the upstream recently rejected (keyed hashes, never the raw token).
+    recently_invalid: Arc<NegativeCache>,
+    /// rmcp's session manager, so a session whose binding was refused can be closed
+    /// instead of lingering unusable until its keep-alive expires.
+    session_manager: Option<Arc<LocalSessionManager>>,
+}
+
+/// Short-lived memory of rejected tokens. Keys are randomly keyed SipHash digests, so
+/// the raw token is never retained.
+struct NegativeCache {
+    hasher: RandomState,
+    seen: Mutex<HashMap<u64, Instant>>,
+}
+
+impl NegativeCache {
+    fn new() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn contains(&self, token: &str) -> bool {
+        let key = self.hasher.hash_one(token);
+        let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.get(&key).is_some_and(|t| t.elapsed() < NEGATIVE_TTL)
+    }
+
+    fn insert(&self, token: &str) {
+        let key = self.hasher.hash_one(token);
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() >= MAX_NEGATIVE_ENTRIES {
+            seen.retain(|_, t| t.elapsed() < NEGATIVE_TTL);
+        }
+        if seen.len() < MAX_NEGATIVE_ENTRIES {
+            seen.insert(key, Instant::now());
+        }
+    }
 }
 
 /// Result of probing a bearer token against `GET /me`.
@@ -177,7 +247,23 @@ impl AuthState {
             probe_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES)),
             http,
             api_url: api_url.into(),
+            recently_invalid: Arc::new(NegativeCache::new()),
+            session_manager: None,
         })
+    }
+
+    /// Registers the rmcp session manager so refused session opens can be closed.
+    #[must_use]
+    pub fn with_session_manager(mut self, manager: Arc<LocalSessionManager>) -> Self {
+        self.session_manager = Some(manager);
+        self
+    }
+
+    /// Closes the rmcp session that was just created for a refused open.
+    async fn discard_session(&self, session_id: &str) {
+        if let Some(manager) = &self.session_manager {
+            let _ = manager.close_session(&Arc::<str>::from(session_id)).await;
+        }
     }
 
     fn invalid_token_response(&self) -> Response {
@@ -198,10 +284,12 @@ impl AuthState {
     /// session open. Never logs the token or the upstream error text.
     async fn probe(&self, token: &str) -> TokenProbe {
         let client = EngramoClient::with_http(self.http.clone(), &self.api_url, token);
-        match client.get_me().await {
-            Ok(_) | Err(ApiError::PermissionDenied(_) | ApiError::Decode(_)) => TokenProbe::Valid,
-            Err(ApiError::Unauthorized) => TokenProbe::Invalid,
-            Err(_) => TokenProbe::Unavailable,
+        match tokio::time::timeout(PROBE_TIMEOUT, client.get_me()).await {
+            Ok(Ok(_) | Err(ApiError::PermissionDenied(_) | ApiError::Decode(_))) => {
+                TokenProbe::Valid
+            }
+            Ok(Err(ApiError::Unauthorized)) => TokenProbe::Invalid,
+            Ok(Err(_)) | Err(_) => TokenProbe::Unavailable,
         }
     }
 }
@@ -500,7 +588,7 @@ fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
 /// not theirs); see the module docs for why rmcp cannot enforce this.
 pub async fn bearer_auth_middleware(
     State(auth): State<AuthState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let sessions = &auth.sessions;
@@ -533,13 +621,55 @@ pub async fn bearer_auth_middleware(
             }
         }
         // No session id yet. Only a POST can open a session (GET/DELETE without one are
-        // rejected by rmcp itself), so only a POST is vetted: cheap prefix check first,
+        // rejected by rmcp itself), so only a POST is vetted, cheapest check first:
+        // prefix / recently-rejected cache, then the (small, time-bounded) body shape,
         // then the read-only capacity check, then the bounded upstream probe.
         None => {
             if req.method() == Method::POST {
-                if !has_known_token_prefix(&token) {
+                if !has_known_token_prefix(&token) || auth.recently_invalid.contains(&token) {
                     return auth.invalid_token_response();
                 }
+                // Every session opens with `initialize`, and rmcp decides from the
+                // *body* (not the `MCP-Protocol-Version` header) whether a POST is
+                // stateless (per-request metadata, no session id). A stateless POST
+                // would bypass session binding and turn the probe pool into a
+                // throughput cap, so a session-less POST must be an `initialize`;
+                // rmcp always routes `initialize` down its session path. The body is
+                // classified with rmcp's own message type so gate and transport agree.
+                let (parts, body) = req.into_parts();
+                let read = tokio::time::timeout(
+                    INITIALIZE_READ_TIMEOUT,
+                    axum::body::to_bytes(body, MAX_INITIALIZE_BYTES),
+                )
+                .await;
+                let bytes = match read {
+                    Err(_) => {
+                        return (StatusCode::REQUEST_TIMEOUT, "Request body read timed out")
+                            .into_response();
+                    }
+                    Ok(Ok(b)) => b,
+                    Ok(Err(e)) if is_length_limit_error(&e) => {
+                        return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large")
+                            .into_response();
+                    }
+                    Ok(Err(_)) => {
+                        return (StatusCode::BAD_REQUEST, "Failed to read request body")
+                            .into_response();
+                    }
+                };
+                let is_initialize = matches!(
+                    serde_json::from_slice::<rmcp::model::ClientJsonRpcMessage>(&bytes),
+                    Ok(rmcp::model::JsonRpcMessage::Request(r))
+                        if matches!(r.request, rmcp::model::ClientRequest::InitializeRequest(_))
+                );
+                if !is_initialize {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "A request without Mcp-Session-Id must be an initialize request",
+                    )
+                        .into_response();
+                }
+                req = Request::from_parts(parts, axum::body::Body::from(bytes));
                 // A token at its cap is refused only after the probe, so a revoked
                 // token still gets 401 rather than a misleading 429.
                 let mut token_full = None;
@@ -563,7 +693,10 @@ pub async fn bearer_auth_middleware(
                 };
                 match auth.probe(&token).await {
                     TokenProbe::Valid => {}
-                    TokenProbe::Invalid => return auth.invalid_token_response(),
+                    TokenProbe::Invalid => {
+                        auth.recently_invalid.insert(&token);
+                        return auth.invalid_token_response();
+                    }
                     TokenProbe::Unavailable => {
                         tracing::warn!("token validation failed: EngrAmo API unavailable");
                         return api_unavailable();
@@ -593,9 +726,13 @@ pub async fn bearer_auth_middleware(
             BindOutcome::Bound => {}
             BindOutcome::TableFull => {
                 tracing::error!("session binding table is full — dropping new MCP session");
+                auth.discard_session(new_id).await;
                 return table_full();
             }
-            BindOutcome::TokenFull(retry) => return too_many_sessions(retry),
+            BindOutcome::TokenFull(retry) => {
+                auth.discard_session(new_id).await;
+                return too_many_sessions(retry);
+            }
         }
     }
 
@@ -696,7 +833,14 @@ mod tests {
         if let Some(s) = session {
             b = b.header(HEADER_SESSION_ID, s);
         }
-        b.body(Body::empty()).unwrap()
+        let body = if session.is_none() {
+            Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+            )
+        } else {
+            Body::empty()
+        };
+        b.body(body).unwrap()
     }
 
     async fn body_string(resp: Response) -> String {
@@ -986,7 +1130,14 @@ mod tests {
         if let Some(s) = session {
             b = b.header(HEADER_SESSION_ID, s);
         }
-        b.body(Body::empty()).unwrap()
+        let body = if method_ == "POST" {
+            Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+            )
+        } else {
+            Body::empty()
+        };
+        b.body(body).unwrap()
     }
 
     #[tokio::test]
@@ -1438,5 +1589,230 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_bind_refusal_when_table_fills_during_open_answers_503() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let sessions = SessionTokens::new();
+        let auth = test_auth(sessions.clone(), &server.uri());
+        {
+            let mut guard = sessions.inner.write().await;
+            for i in 0..MAX_TRACKED_SESSIONS - 1 {
+                guard.insert(
+                    format!("pre-{i}"),
+                    Binding {
+                        token: format!("engramo_o{i}"),
+                        last_seen: Instant::now(),
+                    },
+                );
+            }
+        }
+        let racing = sessions.clone();
+        let router = Router::new()
+            .route(
+                "/",
+                post(move || {
+                    let racing = racing.clone();
+                    async move {
+                        racing.bind("racer", "engramo_other".to_string()).await;
+                        let mut resp = Response::new(Body::empty());
+                        resp.headers_mut()
+                            .insert(HEADER_SESSION_ID, SESSION.parse().unwrap());
+                        resp
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth.clone(),
+                bearer_auth_middleware,
+            ))
+            .with_state(auth);
+        let resp = router
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_string(resp).await,
+            "Too many active sessions, try again later"
+        );
+        assert!(!sessions.inner.read().await.by_session.contains_key(SESSION));
+    }
+
+    #[tokio::test]
+    async fn test_rebinding_a_session_to_another_token_moves_its_per_token_entry() {
+        let sessions = SessionTokens::new();
+        assert_eq!(
+            sessions.bind("s", VICTIM.to_string()).await,
+            BindOutcome::Bound
+        );
+        assert_eq!(
+            sessions.bind("s", ATTACKER.to_string()).await,
+            BindOutcome::Bound
+        );
+        {
+            let g = sessions.inner.read().await;
+            assert!(!g.per_token.contains_key(VICTIM));
+            assert!(g.per_token[ATTACKER].contains("s"));
+            assert!(constant_time_eq(&g.by_session["s"].token, ATTACKER));
+            assert_eq!(g.by_session.len(), 1);
+        }
+        assert_eq!(
+            sessions.bind("s", ATTACKER.to_string()).await,
+            BindOutcome::Bound
+        );
+        let g = sessions.inner.read().await;
+        assert_eq!(g.per_token[ATTACKER].len(), 1);
+        assert!(g.per_token[ATTACKER].contains("s"));
+    }
+
+    #[tokio::test]
+    async fn test_capacity_precheck_prune_is_rate_limited() {
+        let sessions = SessionTokens::new();
+        {
+            let mut guard = sessions.inner.write().await;
+            let stale = Instant::now() - BINDING_TTL - Duration::from_secs(1);
+            for i in 0..MAX_TRACKED_SESSIONS {
+                guard.insert(
+                    format!("s-{i}"),
+                    Binding {
+                        token: format!("engramo_o{i}"),
+                        last_seen: stale,
+                    },
+                );
+            }
+            guard.last_prune = Some(Instant::now());
+        }
+        assert_eq!(sessions.has_capacity(VICTIM).await, Capacity::TableFull);
+        assert_eq!(sessions.len().await, MAX_TRACKED_SESSIONS);
+        sessions.inner.write().await.last_prune =
+            Some(Instant::now() - PRUNE_INTERVAL - Duration::from_secs(1));
+        assert_eq!(sessions.has_capacity(VICTIM).await, Capacity::Available);
+        assert_eq!(sessions.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_failed_or_foreign_delete_keeps_the_binding() {
+        // (a) a DELETE the inner service answers with 500 keeps the binding.
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let sessions = SessionTokens::new();
+        sessions.bind(SESSION, VICTIM.to_string()).await;
+        let auth = test_auth(sessions.clone(), &server.uri());
+        let failing = Router::new()
+            .route(
+                "/",
+                axum::routing::delete(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth.clone(),
+                bearer_auth_middleware,
+            ))
+            .with_state(auth);
+        let resp = failing
+            .oneshot(open_req("DELETE", VICTIM, Some(SESSION)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(sessions.len().await, 1);
+
+        // (b) a DELETE with a different bearer is 404'd and the owner keeps the session.
+        let router = app(sessions.clone()).await;
+        let resp = router
+            .clone()
+            .oneshot(open_req("DELETE", ATTACKER, Some(SESSION)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = router
+            .oneshot(open_req("POST", VICTIM, Some(SESSION)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(sessions.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rejected_token_is_not_probed_again_within_ttl() {
+        let server = MockServer::start().await;
+        mock_me(&server, 401).await;
+        let router = app_with(SessionTokens::new(), &server.uri());
+        for _ in 0..2 {
+            let resp = router
+                .clone()
+                .oneshot(open_req("POST", VICTIM, None))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert!(resp.headers().contains_key(WWW_AUTHENTICATE));
+        }
+        assert_eq!(me_calls(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sessionless_non_initialize_post_is_rejected_without_probe() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let router = app_with(SessionTokens::new(), &server.uri());
+        let build = |version: &str, body: &'static str| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/")
+                .header(AUTHORIZATION, format!("Bearer {VICTIM}"))
+                .header("mcp-protocol-version", version)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        // Header claims an old revision but the body carries stateless `_meta`.
+        let meta_call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_catalogs","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+        for (version, body) in [
+            ("2025-06-18", meta_call),
+            ("2026-07-28", meta_call),
+            ("2025-06-18", ""),
+            ("2025-06-18", "not json"),
+        ] {
+            let resp = router.clone().oneshot(build(version, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{version} {body}");
+        }
+        assert_eq!(me_calls(&server).await, 0);
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let resp = router.oneshot(build("2025-06-18", init)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(me_calls(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sessionless_bad_prefix_with_non_initialize_body_is_401_not_400() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let router = app_with(SessionTokens::new(), &server.uri());
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/")
+            .header(AUTHORIZATION, "Bearer x")
+            .body(Body::from(vec![b'a'; MAX_INITIALIZE_BYTES + 1]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key(WWW_AUTHENTICATE));
+        assert_eq!(me_calls(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sessionless_post_over_initialize_cap_is_413_without_probe() {
+        let server = MockServer::start().await;
+        mock_me(&server, 200).await;
+        let router = app_with(SessionTokens::new(), &server.uri());
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/")
+            .header(AUTHORIZATION, format!("Bearer {VICTIM}"))
+            .body(Body::from(vec![b'a'; MAX_INITIALIZE_BYTES + 1]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(me_calls(&server).await, 0);
     }
 }

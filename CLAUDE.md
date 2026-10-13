@@ -117,7 +117,7 @@ Spans must satisfy all five rules or `rich_text` is discarded:
 - **Session-open token check:** a POST without `Mcp-Session-Id` is validated before rmcp sees it: a bearer not
   starting with `engramo_` (current) or `engram_` (legacy) → 401 `invalid_token` (no upstream call); otherwise `GET /me` via the shared
   `HardenedClient` — upstream 401 → 401 `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"`,
-  403 counts as valid, network/timeout/5xx → 503 (no `WWW-Authenticate`). No cache; requests carrying a session id
+  403 counts as valid, network/timeout/5xx → 503 (no `WWW-Authenticate`). The probe has a 5 s timeout, and a token the API rejected is remembered (keyed hash) for 60 s so repeats skip the probe; valid tokens are not cached. A POST without a session id whose body is not a JSON-RPC `initialize` request → 400 (checked on the body, buffered up to 16 MiB, because rmcp decides statelessness from the body `_meta`, not the header; a stateless request would bypass session binding); requests carrying a session id
   and GET/DELETE are never probed.
 - **Session binding (security):** rmcp authorizes every post-`initialize` request on the `Mcp-Session-Id`
   header alone, so `SessionTokens` records which token opened each session and 404s ("Session not found", no `WWW-Authenticate`) a request that presents a

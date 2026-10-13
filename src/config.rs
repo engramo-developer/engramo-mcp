@@ -222,11 +222,19 @@ fn validate_public_url(url: &str) -> Result<(), ConfigError> {
         if authority.contains('@') {
             return Err(invalid("must have a plain host[:port] authority"));
         }
-        let host = match authority.strip_prefix('[') {
-            Some(v6) => v6.split(']').next().unwrap_or_default(),
-            None => authority.split(':').next().unwrap_or_default(),
+        let (host, port) = match authority.strip_prefix('[') {
+            Some(v6) => {
+                let (h, rest) = v6
+                    .split_once(']')
+                    .ok_or_else(|| invalid("must have a plain host[:port] authority"))?;
+                (h, rest.strip_prefix(':'))
+            }
+            None => match authority.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (authority, None),
+            },
         };
-        if host.is_empty() {
+        if host.is_empty() || port.is_some_and(|p| p.parse::<u16>().is_err()) {
             return Err(invalid("must have a plain host[:port] authority"));
         }
         Ok(host.to_string())
@@ -388,6 +396,18 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_var_display_names_var_and_reason() {
+        let err = McpConfig::new("https://api.engram.dev", None, false)
+            .unwrap()
+            .with_public_url("http://mcp.engramo.app")
+            .require_public_url()
+            .unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("MCP_PUBLIC_URL"), "{s}");
+        assert!(s.contains("must use https://"), "{s}");
+    }
+
+    #[test]
     fn test_require_public_url_validation() {
         let base = McpConfig::new("https://api.engram.dev", None, false).unwrap();
         for ok in [
@@ -407,6 +427,8 @@ mod tests {
             "https://",
             "https://@",
             "https://:443",
+            "https://mcp.engramo.app:abc",
+            "https://[::1",
             "http://:8080",
             "http://127.0.0.1:x@evil.example",
             "http://localhost:1@evil.example",

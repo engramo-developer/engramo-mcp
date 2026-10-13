@@ -756,6 +756,21 @@ mod tests {
     }
 
     #[test]
+    fn test_error_texts_are_neutral() {
+        let q = ApiError::QuotaExceeded {
+            resource_type: "cards_total".into(),
+            used: 1,
+            limit: 1,
+        }
+        .to_string();
+        assert!(q.contains("manage your plan in the EngrAmo app"), "{q}");
+        assert!(!q.to_lowercase().contains("upgrade"), "{q}");
+        let u = ApiError::Unauthorized.to_string();
+        assert!(u.contains("Reconnect EngrAmo"), "{u}");
+        assert!(!u.contains("Check your ENGRAMO_API_TOKEN"), "{u}");
+    }
+
+    #[test]
     fn test_quota_exceeded_display() {
         let e = ApiError::QuotaExceeded {
             resource_type: "cards_total".to_string(),
