@@ -35,6 +35,14 @@ pub struct PagedResponseWithCount<T> {
     pub total_count: i64,
 }
 
+// ── Identity ──────────────────────────────────────────────────────────────────
+
+/// Response of `GET /me`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MeDto {
+    pub user_id: Uuid,
+}
+
 // ── Catalog ───────────────────────────────────────────────────────────────────
 
 /// Full catalog returned by GET /catalogs/{id} or POST /catalogs.

@@ -5398,4 +5398,38 @@ mod tests {
         assert_eq!(get("generate_card_audio").open_world_hint, Some(true));
         assert_eq!(get("translate_cards").open_world_hint, Some(true));
     }
+
+    #[test]
+    fn test_tool_annotation_invariants() {
+        let client = EngramoClient::new("http://localhost", "engramo_test");
+        let server = EngramoMcpServer::new(client, true).with_tts(fake_tts_engine());
+        let tools = server.tool_router.list_all();
+        for t in &tools {
+            let a = t.annotations.clone().unwrap();
+            if a.read_only_hint == Some(true) {
+                assert_eq!(
+                    a.destructive_hint,
+                    Some(false),
+                    "{}: read-only but destructive",
+                    t.name
+                );
+            }
+        }
+        for name in [
+            "generate_tts_for_cards",
+            "translate_cards",
+            "generate_dictionary_for_cards",
+            "ai_agent_chat",
+            "translate_batch_import",
+            "generate_card_audio",
+        ] {
+            let a = tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.annotations.clone())
+                .unwrap_or_else(|| panic!("{name} not found"));
+            assert_eq!(a.open_world_hint, Some(true), "{name}");
+            assert_eq!(a.read_only_hint, Some(false), "{name}");
+        }
+    }
 }

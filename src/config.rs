@@ -180,10 +180,17 @@ impl McpConfig {
 
     /// Returns the public URL, or an error if none was set. Call this in `http`
     /// mode, which cannot advertise correct OAuth metadata without it.
+    ///
+    /// The value is advertised in the `WWW-Authenticate` challenge and the RFC 9728
+    /// `resource` field, so it must be an absolute `https://` URL (`http://` only for a
+    /// loopback host) free of whitespace, control characters, `"` and `\`.
     pub fn require_public_url(&self) -> Result<&str, ConfigError> {
-        self.public_url
+        let url = self
+            .public_url
             .as_deref()
-            .ok_or(ConfigError::MissingVar("MCP_PUBLIC_URL"))
+            .ok_or(ConfigError::MissingVar("MCP_PUBLIC_URL"))?;
+        validate_public_url(url)?;
+        Ok(url)
     }
 
     /// Returns the configured API token, or an error if none was set.
@@ -193,6 +200,57 @@ impl McpConfig {
             .as_deref()
             .ok_or(ConfigError::MissingVar("ENGRAMO_API_TOKEN"))
     }
+}
+
+/// Checks `MCP_PUBLIC_URL` is safe to embed in a quoted `WWW-Authenticate` parameter and
+/// is an absolute URL clients can trust as a resource identifier.
+fn validate_public_url(url: &str) -> Result<(), ConfigError> {
+    let invalid = |reason| ConfigError::InvalidVar {
+        var: "MCP_PUBLIC_URL",
+        reason,
+    };
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\\')
+    {
+        return Err(invalid(
+            "must not contain whitespace, control characters, '\"' or '\\'",
+        ));
+    }
+    let host_of = |rest: &str| -> Result<String, ConfigError> {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err(invalid("must have a plain host[:port] authority"));
+        }
+        let (host, port) = match authority.strip_prefix('[') {
+            Some(v6) => {
+                let (h, rest) = v6
+                    .split_once(']')
+                    .ok_or_else(|| invalid("must have a plain host[:port] authority"))?;
+                (h, rest.strip_prefix(':'))
+            }
+            None => match authority.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (authority, None),
+            },
+        };
+        if host.is_empty() || port.is_some_and(|p| p.parse::<u16>().is_err()) {
+            return Err(invalid("must have a plain host[:port] authority"));
+        }
+        Ok(host.to_string())
+    };
+    if let Some(rest) = url.strip_prefix("https://") {
+        host_of(rest)?;
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let host = host_of(rest)?;
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+            return Ok(());
+        }
+        return Err(invalid("must use https:// unless the host is loopback"));
+    }
+    Err(invalid("must be an absolute http(s):// URL"))
 }
 
 /// Extracts the `host[:port]` authority out of a URL, e.g.
@@ -241,6 +299,12 @@ pub enum ConfigError {
 
     #[error("Environment variable {0} is empty")]
     EmptyVar(&'static str),
+
+    #[error("Environment variable {var} is invalid: {reason}")]
+    InvalidVar {
+        var: &'static str,
+        reason: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -329,6 +393,63 @@ mod tests {
         ));
         let cfg = cfg.with_public_url("https://mcp.engramo.app");
         assert_eq!(cfg.require_public_url().unwrap(), "https://mcp.engramo.app");
+    }
+
+    #[test]
+    fn test_invalid_var_display_names_var_and_reason() {
+        let err = McpConfig::new("https://api.engram.dev", None, false)
+            .unwrap()
+            .with_public_url("http://mcp.engramo.app")
+            .require_public_url()
+            .unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("MCP_PUBLIC_URL"), "{s}");
+        assert!(s.contains("must use https://"), "{s}");
+    }
+
+    #[test]
+    fn test_require_public_url_validation() {
+        let base = McpConfig::new("https://api.engram.dev", None, false).unwrap();
+        for ok in [
+            "https://mcp.engramo.app",
+            "https://mcp.engramo.app/",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            let cfg = base.clone().with_public_url(ok);
+            assert_eq!(cfg.require_public_url().unwrap(), ok, "{ok}");
+        }
+        for bad in [
+            "mcp.engramo.app",
+            "ftp://mcp.engramo.app",
+            "http://mcp.engramo.app",
+            "https://",
+            "https://@",
+            "https://:443",
+            "https://mcp.engramo.app:abc",
+            "https://[::1",
+            "http://:8080",
+            "http://127.0.0.1:x@evil.example",
+            "http://localhost:1@evil.example",
+            "https://u@mcp.engramo.app",
+            "https://mcp.engramo.app/\"x",
+            "https://mcp.engramo.app/a\\b",
+            "https://mcp.engramo.app/ x",
+            "https://mcp.engramo.app/\nx",
+        ] {
+            let cfg = base.clone().with_public_url(bad);
+            assert!(
+                matches!(
+                    cfg.require_public_url().unwrap_err(),
+                    ConfigError::InvalidVar {
+                        var: "MCP_PUBLIC_URL",
+                        ..
+                    }
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
