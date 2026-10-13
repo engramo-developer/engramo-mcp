@@ -5,7 +5,9 @@ use clap::{Parser, Subcommand};
 use engramo_mcp::{
     client::{EngramoClient, HardenedClient},
     config::McpConfig,
-    http_auth::{AuthState, SessionTokens, bearer_auth_middleware, current_bearer_token},
+    http_auth::{
+        AuthState, SESSION_KEEP_ALIVE, SessionTokens, bearer_auth_middleware, current_bearer_token,
+    },
     server::{EngramoMcpServer, build_session_server},
     tts, well_known,
 };
@@ -201,13 +203,14 @@ fn attach_tts(
 async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = McpConfig::from_env()
         .map_err(|e| format!("{e}\n\nSet ENGRAMO_API_URL before running `engramo-mcp http`."))?;
-    cfg.require_public_url().map_err(|e| {
+    let public_url = cfg.require_public_url().map_err(|e| {
         format!(
             "{e}\n\nSet MCP_PUBLIC_URL to this server's public URL (e.g. https://mcp.engramo.app) \
              before running `engramo-mcp http`: it is advertised in OAuth metadata and \
              WWW-Authenticate challenges."
         )
     })?;
+    let public_url = public_url.to_string();
 
     // Local TTS is stdio-only (see `tts` module doc comment) — this reads only the env var's
     // *name*, never its value, and never builds a TtsConfig/engine. This is the only place
@@ -227,7 +230,7 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     // no-redirect policy that keeps a session's bearer token from following a 3xx to
     // another host can't be dropped by a future edit to this function.
     let http = EngramoClient::build_http_client();
-    let app = build_app(&cfg, http);
+    let app = build_app(&cfg, &public_url, http)?;
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -248,12 +251,22 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
 /// out of `run_http` (a pure move, no behavior change) so tests can drive the router directly
 /// with `tower::ServiceExt::oneshot` instead of binding a real listener.
 ///
-/// `cfg.public_url` must be set (`run_http` enforces it at startup); `build_app` panics otherwise.
-fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
-    let public_url = cfg
-        .require_public_url()
-        .expect("MCP_PUBLIC_URL is required in http mode (checked at startup)")
-        .to_string();
+/// `public_url` is the validated `MCP_PUBLIC_URL` (`McpConfig::require_public_url`). Fails
+/// when it cannot be embedded in a `WWW-Authenticate` challenge.
+/// rmcp's session manager with its idle timeout pinned to [`SESSION_KEEP_ALIVE`], the
+/// constant the session-binding table is derived from.
+fn session_manager() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
+    manager
+}
+
+fn build_app(
+    cfg: &McpConfig,
+    public_url: &str,
+    http: HardenedClient,
+) -> Result<axum::Router, String> {
+    let public_url = public_url.to_string();
     let resource_metadata_url = format!(
         "{}/.well-known/oauth-protected-resource",
         public_url.trim_end_matches('/')
@@ -291,7 +304,8 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
         ?allowed_hosts,
         "Configured Host-header allowlist for http mode"
     );
-    let session_manager = Arc::new(LocalSessionManager::default());
+    // Pin rmcp's idle timeout to the constant the session-binding table is derived from.
+    let session_manager = Arc::new(session_manager());
     let service = StreamableHttpService::new(
         factory,
         session_manager,
@@ -307,7 +321,7 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
         resource_metadata_url,
         auth_http,
         auth_api_url,
-    );
+    )?;
     let mcp_router = axum::Router::new()
         .fallback_service(service)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -323,7 +337,7 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
         resource: public_url,
         authorization_server: cfg.api_url.clone(),
     };
-    axum::Router::new()
+    Ok(axum::Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             axum::routing::get(well_known::protected_resource_metadata),
@@ -342,15 +356,43 @@ fn build_app(cfg: &McpConfig, http: HardenedClient) -> axum::Router {
             "/version",
             axum::routing::get(engramo_mcp::version::version_endpoint),
         )
-        .merge(mcp_router)
+        .merge(mcp_router))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_session_manager_pins_keep_alive() {
+        assert_eq!(
+            session_manager().session_config.keep_alive,
+            Some(SESSION_KEEP_ALIVE)
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    fn test_app(cfg: &McpConfig) -> axum::Router {
+        let url = cfg.require_public_url().unwrap().to_string();
+        build_app(cfg, &url, EngramoClient::build_http_client()).unwrap()
+    }
+
+    #[test]
+    fn test_build_app_rejects_unusable_public_url_instead_of_falling_back() {
+        // `require_public_url` (what `run_http` calls) errors on an unset or unusable
+        // value, and `build_app` itself refuses a URL that cannot be a header parameter.
+        let unset = McpConfig::new("http://localhost", None, false).unwrap();
+        assert!(unset.require_public_url().is_err());
+        let err = build_app(
+            &unset,
+            "https://x.example/\"bad",
+            EngramoClient::build_http_client(),
+        )
+        .unwrap_err();
+        assert!(err.contains("quote"), "{err}");
+    }
 
     fn test_cfg() -> McpConfig {
         McpConfig::new("http://localhost", None, false)
@@ -379,7 +421,7 @@ mod tests {
         let cfg = McpConfig::new(api.uri(), None, false)
             .unwrap()
             .with_public_url("http://localhost:8080");
-        let app = build_app(&cfg, EngramoClient::build_http_client());
+        let app = test_app(&cfg);
         let body = vec![b'a'; MAX_BODY_BYTES + 1];
         let req = Request::post("/")
             .header("authorization", "Bearer engramo_t")
@@ -399,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_app_version_is_unauthenticated_but_root_requires_bearer() {
-        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
+        let app = test_app(&test_cfg());
         let v = app
             .clone()
             .oneshot(
@@ -451,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn test_openai_challenge_served_when_set() {
         let cfg = test_cfg().with_openai_apps_challenge("tok-xyz");
-        let app = build_app(&cfg, EngramoClient::build_http_client());
+        let app = test_app(&cfg);
         let (status, body, ct) =
             get_status_and_body(app, "/.well-known/openai-apps-challenge").await;
         assert_eq!(status, StatusCode::OK);
@@ -461,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_openai_challenge_404_when_unset() {
-        let app = build_app(&test_cfg(), EngramoClient::build_http_client());
+        let app = test_app(&test_cfg());
         let (status, _, _) = get_status_and_body(app, "/.well-known/openai-apps-challenge").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
@@ -471,7 +513,7 @@ mod tests {
         let cfg = McpConfig::new("http://localhost", None, false)
             .unwrap()
             .with_public_url("https://mcp.engramo.app/");
-        let app = build_app(&cfg, EngramoClient::build_http_client());
+        let app = test_app(&cfg);
         let resp = app
             .oneshot(
                 Request::post("/")
