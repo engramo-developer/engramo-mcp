@@ -465,3 +465,95 @@ jobs:
           "
 
           .github/scripts/npm-publish.sh "$pkg_dir" $NPM_PUBLISH_FLAGS
+
+  # Publishes server.json to the official MCP Registry (registry.modelcontextprotocol.io)
+  # under the domain-verified name app.engramo/mcp. Runs only after the GitHub
+  # release (needs the real .mcpb asset + its checksum) and the npm packages
+  # (the registry checks package.json's mcpName against the just-published
+  # version) exist. Skipped on dry runs. Its only secret is the DNS-auth
+  # private key in the protected `mcp-registry` environment; NPM_TOKEN is never
+  # exposed here.
+  mcp-registry:
+    name: Publish to MCP Registry
+    needs: [resolve, github-release, npm-publish]
+    if: needs.resolve.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    environment: mcp-registry
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Stage server.json
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The sha256 file is `shasum` output: "<hex>  engramo.mcpb".
+          curl -fsSL --retry 5 --retry-delay 5 \
+            -o engramo.mcpb.sha256 \
+            "https://github.com/engramo-developer/engramo-mcp/releases/download/v${VERSION}/engramo.mcpb.sha256"
+          MCPB_SHA256="$(awk '{print $1; exit}' engramo.mcpb.sha256)"
+          if ! [[ "$MCPB_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::invalid .mcpb checksum: $MCPB_SHA256"
+            exit 1
+          fi
+          export MCPB_SHA256
+          # The server.json version fields are 0.0.0 placeholders, like the npm packages.
+          node -e '
+            const fs = require("fs");
+            const s = JSON.parse(fs.readFileSync("server.json", "utf8"));
+            const v = process.env.VERSION;
+            s.version = v;
+            for (const p of s.packages) {
+              if (p.registryType === "npm") {
+                p.version = v;
+              } else if (p.registryType === "mcpb") {
+                p.identifier = p.identifier.replace("/download/v0.0.0/", "/download/v" + v + "/");
+                if (!p.identifier.includes("/download/v" + v + "/")) throw new Error("mcpb URL tag not rewritten");
+                p.fileSha256 = process.env.MCPB_SHA256;
+              }
+            }
+            fs.writeFileSync("server.staged.json", JSON.stringify(s, null, 2) + "\n");
+          '
+          cat server.staged.json
+
+      # Pinned release AND verified by checksum. To bump: pick a release at
+      # https://github.com/modelcontextprotocol/registry/releases, set
+      # MCP_PUBLISHER_VERSION, and copy the mcp-publisher_linux_amd64.tar.gz
+      # line from that release's registry_<version>_checksums.txt into
+      # MCP_PUBLISHER_SHA256.
+      - name: Install mcp-publisher (pinned, checksum-verified)
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 5 -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate server.staged.json
+
+      - name: Log in (DNS) and publish
+        env:
+          MCP_REGISTRY_PRIVATE_KEY: ${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          ./mcp-publisher login dns --domain engramo.app --private-key "$MCP_REGISTRY_PRIVATE_KEY"
+          # The registry verifies mcpName against the npm version published
+          # moments ago, which can lag behind the registry's own view.
+          for attempt in 1 2 3 4 5; do
+            if ./mcp-publisher publish server.staged.json; then
+              exit 0
+            fi
+            echo "publish attempt $attempt failed; retrying in $((attempt * 30))s"
+            sleep $((attempt * 30))
+          done
+          echo "::error::mcp-publisher publish failed after 5 attempts"
+          exit 1

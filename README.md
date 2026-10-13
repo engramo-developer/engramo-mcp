@@ -656,6 +656,11 @@ git tag vx.y.z
 git push origin vx.y.z
 ```
 
+The release workflow also publishes `server.json` to the official
+[MCP Registry](https://registry.modelcontextprotocol.io) as `app.engramo/mcp`, after the GitHub release and npm
+packages exist. One-time setup, key rotation and bumping the pinned `mcp-publisher` are in
+[`docs/mcp-registry.md`](docs/mcp-registry.md).
+
 ## Contributing
 
 Bug reports and pull requests are welcome at

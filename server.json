@@ -1,0 +1,79 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "app.engramo/mcp",
+  "title": "EngrAmo",
+  "description": "Create and study EngrAmo spaced-repetition flashcards from your AI client.",
+  "repository": {
+    "url": "https://github.com/engramo-developer/engramo-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://engramo.app",
+  "version": "0.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.engramo.app/"
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@engramo/mcp",
+      "version": "0.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ENGRAMO_API_TOKEN",
+          "description": "Your EngrAmo API token. From study.engramo.app: person icon (top right) → API token → Generate.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "ENGRAMO_API_URL",
+          "description": "Base URL of the EngrAmo API.",
+          "isRequired": false,
+          "isSecret": false,
+          "default": "https://api.engramo.app"
+        },
+        {
+          "name": "ENGRAMO_TTS_GEMINI_API_KEYS",
+          "description": "Optional. Your own free Gemini API key(s) from aistudio.google.com, comma-separated, to enable card audio generation. Leave unset to turn audio off.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/engramo-developer/engramo-mcp/releases/download/v0.0.0/engramo.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ENGRAMO_API_TOKEN",
+          "description": "Your EngrAmo API token. From study.engramo.app: person icon (top right) → API token → Generate.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "ENGRAMO_API_URL",
+          "description": "Base URL of the EngrAmo API.",
+          "isRequired": false,
+          "isSecret": false,
+          "default": "https://api.engramo.app"
+        },
+        {
+          "name": "ENGRAMO_TTS_GEMINI_API_KEYS",
+          "description": "Optional. Your own free Gemini API key(s) from aistudio.google.com, comma-separated, to enable card audio generation. Leave unset to turn audio off.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
