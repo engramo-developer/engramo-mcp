@@ -455,15 +455,28 @@ Nothing is pushed. engramo-mcp branches carry local commits; the other repos' ch
 
 | Phase | Repo / branch | State | Verification |
 |---|---|---|---|
-| 0 OAuth spike | — | **Not started** (needs the user's browser logins) | — |
+| 0 OAuth spike | dev (`mcp-engramo.volmyr.com`, pre-4.2 build) | **Passed** 2026-10-13: claude.ai, ChatGPT developer mode, MCP Inspector (see 10.1) | dev Cloud Run request logs |
 | 0b leftover mcpb commit | — | Done: no-op (already in #88) | `audit.mjs` passes on `main` |
 | 1 (4.1, 4.2, 4.4, 4.5, error text) | engramo-mcp `feat/directory-readiness` | Committed locally (`ac6fa6f`, `7b10e89`) | gate green, 706 tests |
-| 1b (4.3) + `/review` fixes | engramo-mcp `feat/session-open-token-check` (on top of 1) | 4.3 committed locally (`9514001`); two review passes' fixes uncommitted | gate green |
+| 1b (4.3) + `/review` fixes | engramo-mcp `feat/session-open-token-check` (on top of 1) | Committed locally (`9514001`, `e3ab235`) | gate green, 735 tests |
 | 2 MCP Registry | engramo-mcp `feat/mcp-registry` (worktree `../engram-mcp-registry`) | Committed locally (`a56827d`) | gate green, 698 tests; `mcp-publisher validate` passed |
 | A `/me` + connected apps + 4A.3 | engram-api `feat/me-and-connected-apps` | Uncommitted (includes 2 new `.sqlx` files) | 1863 passed, incl. DB integration tests |
 | B Connected apps UI | engram_app `feat/connected-apps` | Uncommitted (7 goldens regenerated, unreviewed) | analyze clean, 1691 tests |
 | 3 Privacy policy | engramo-landing `docs/privacy-ai-processors` | Uncommitted | `npm run build` passes |
 | 6 Antigravity README | — | Already on `main` | — |
+
+### 10.1 Phase 0 results (2026-10-13)
+
+All three clients completed OAuth against dev, which still runs the build **without** the 4.2 `WWW-Authenticate` header. Sequence in the logs: `POST /` → 401 → `GET /.well-known/oauth-protected-resource` → AS metadata → `POST /oauth/register` (201) → `/oauth/authorize` → consent → `POST /oauth/token` (200) → MCP session.
+
+- **claude.ai** (`Claude-User`): connected, 29 tools listed (36 minus 5 paid-AI and 2 stdio-only TTS), tool calls work.
+- **ChatGPT developer mode** (`openai-mcp/1.0.0`): connected, tool calls work. Redirect URI `https://chatgpt.com/connector/oauth/<id>`. ChatGPT also probes `/.well-known/openid-configuration` (404, harmless).
+- **MCP Inspector** (`node`): connected with an empty client ID (auto DCR, loopback redirect `http://127.0.0.1:6274/oauth/callback` accepted). The browser already held a Supabase session, so the bridge page went straight to consent.
+- **`resource` parameter:** all clients send the slash-less `https://mcp-engramo.volmyr.com`; `/oauth/authorize` and `/oauth/token` accept it. Manual probes also showed `/oauth/authorize` accepting the trailing-slash form and no `resource` at all.
+- **Missing `WWW-Authenticate`:** no client needed it. 4.2 stays as spec compliance and for stricter clients, not as a blocker.
+- **Idle sessions:** sessions expire after about 5 minutes idle (keep-alive 300 s; Cloud Run also cuts the GET SSE stream at 300 s). Inspector does not re-initialize after the 404 and hangs on the next call. claude.ai and ChatGPT both kept working after more than 6 minutes idle, so this is not a review risk.
+- **Login page:** email + password (Supabase), no sign-up link. Reviewer demo accounts must be created in advance.
+- Probe clients `Phase0 spike probe*` were registered on dev by DCR. They have no user or tokens and can be deleted.
 
 **Review-loop changes to 4.2/4.3 beyond the original design** (`.claude/.review-cache/`):
 - **Unknown sessions:** an unknown or unbound session id now fails closed, with a 404 that matches rmcp's byte for byte.
@@ -473,7 +486,6 @@ Nothing is pushed. engramo-mcp branches carry local commits; the other repos' ch
 - **Startup:** `MCP_PUBLIC_URL` is validated (https unless loopback, no userinfo).
 
 **Open items for the user:**
-- Phase 0 spike.
 - DNS TXT record on `engramo.app` and the `mcp-registry` GitHub environment and secret (`docs/mcp-registry.md` on `feat/mcp-registry`).
 - Confirm DPAs with Anthropic and Google before publishing the privacy policy. Identify the provider behind the standard TTS service (`engram-agent-tts`).
 - Publish the privacy policy only after Phase B ships, since it refers to Settings → Connected apps.
