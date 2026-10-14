@@ -588,7 +588,7 @@ impl EngramoMcpServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "List all learning paths with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). Each path includes `isActive` and `isDefault` (the auto-created default path)."
+        description = "List all learning paths with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). Each path may include `isActive`, `isDefault` (the auto-created default path), and `catalogCount`; a missing field means unknown, not false."
     )]
     pub async fn list_learning_paths(
         &self,
@@ -616,7 +616,7 @@ impl EngramoMcpServer {
             open_world_hint = false
         ),
         description = "Get full details of a learning path, including its catalogs, tags, \
-        visibility, `isActive`/`isDefault` flags, and current version (needed by update_learning_path)."
+        visibility, `isActive`/`isDefault`/`catalogCount` (when provided), and current version (needed by update_learning_path)."
     )]
     pub async fn get_learning_path(
         &self,
@@ -679,7 +679,7 @@ impl EngramoMcpServer {
             name: p.name,
             description: p.description,
         };
-        let path = match self.client.create_learning_path(&req).await {
+        let mut path = match self.client.create_learning_path(&req).await {
             Ok(path) => path,
             Err(e) => return Ok(err_result(e)),
         };
@@ -719,6 +719,11 @@ impl EngramoMcpServer {
                 }
             }
         }
+
+        // The create response predates the catalog adds, so bring its count up to date.
+        path.catalog_count = path
+            .catalog_count
+            .map(|c| c.saturating_add(i64::try_from(added.len()).unwrap_or(i64::MAX)));
 
         Ok(ok_json(&CreatedLearningPathWithCatalogs {
             path: &path,
@@ -4347,6 +4352,144 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(text).unwrap();
         assert!(v.get("tags").is_none(), "{text}");
         assert!(v.get("visibility").is_none(), "{text}");
+        assert!(v.get("isActive").is_none(), "{text}");
+        assert!(v.get("catalogCount").is_none(), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_list_learning_paths_real_server_includes_active_default_and_count() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": TEST_ID, "name": "Default", "version": 1,
+                     "isActive": true, "isDefault": true, "catalogCount": 2},
+                    {"id": "00000000-0000-0000-0000-000000000002", "name": "Legacy", "version": 1}
+                ],
+                "nextCursor": null
+            })))
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .list_learning_paths(Parameters(ListLearningPathsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert_ne!(r.is_error, Some(true), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&r)).unwrap();
+        assert_eq!(v["data"][0]["isActive"], true);
+        assert_eq!(v["data"][0]["isDefault"], true);
+        assert_eq!(v["data"][0]["catalogCount"], 2);
+        assert!(v["data"][1].get("isActive").is_none());
+        assert!(v["data"][1].get("isDefault").is_none());
+        assert!(v["data"][1].get("catalogCount").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_learning_path_real_server_includes_active_default_and_count() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "Spanish A1", "description": null, "version": 1,
+                "isActive": true, "isDefault": false, "catalogCount": 3, "catalogs": []
+            })))
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .get_learning_path(Parameters(GetLearningPathParams {
+                path_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(r.is_error, Some(true), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&r)).unwrap();
+        assert_eq!(v["isActive"], true);
+        assert_eq!(v["isDefault"], false);
+        assert_eq!(v["catalogCount"], 3);
+    }
+
+    /// The create response predates the catalog adds, so `catalogCount` must be updated to
+    /// agree with `catalogs_added`, and the flags must be flattened to the top level.
+    #[tokio::test]
+    async fn test_create_learning_path_with_catalog_ids_flattens_flags_and_updates_count() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let cid = "00000000-0000-0000-0000-000000000002";
+        let ms = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "P", "version": 1,
+                "isActive": false, "isDefault": false, "catalogCount": 0
+            })))
+            .mount(&ms)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{TEST_ID}/catalogs/{cid}")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"status": "catalog added"})),
+            )
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .create_learning_path(Parameters(CreateLearningPathParams {
+                name: "P".to_string(),
+                description: None,
+                catalog_ids: Some(vec![cid.to_string()]),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(r.is_error, Some(true), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&r)).unwrap();
+        assert_eq!(v["isActive"], false);
+        assert_eq!(v["isDefault"], false);
+        assert_eq!(v["catalogCount"], 1);
+        assert_eq!(v["catalogs_added"], serde_json::json!([cid]));
+    }
+
+    /// A hostile upstream `catalogCount` near `i64::MAX` must saturate, not overflow.
+    #[tokio::test]
+    async fn test_create_learning_path_with_catalog_ids_saturates_huge_count() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let cid = "00000000-0000-0000-0000-000000000002";
+        let ms = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "P", "version": 1,
+                "catalogCount": i64::MAX
+            })))
+            .mount(&ms)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{TEST_ID}/catalogs/{cid}")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"status": "catalog added"})),
+            )
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .create_learning_path(Parameters(CreateLearningPathParams {
+                name: "P".to_string(),
+                description: None,
+                catalog_ids: Some(vec![cid.to_string()]),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(r.is_error, Some(true), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&r)).unwrap();
+        assert_eq!(v["catalogCount"], i64::MAX);
     }
 
     #[tokio::test]
