@@ -588,7 +588,7 @@ impl EngramoMcpServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "List all learning paths with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "List all learning paths with cursor-based pagination. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page). Each path includes `isActive` and `isDefault` (the auto-created default path)."
     )]
     pub async fn list_learning_paths(
         &self,
@@ -616,7 +616,7 @@ impl EngramoMcpServer {
             open_world_hint = false
         ),
         description = "Get full details of a learning path, including its catalogs, tags, \
-        visibility, and current version (needed by update_learning_path)."
+        visibility, `isActive`/`isDefault` flags, and current version (needed by update_learning_path)."
     )]
     pub async fn get_learning_path(
         &self,

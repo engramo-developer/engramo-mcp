@@ -222,6 +222,110 @@ mod tests {
         LearningPathTools::new(EngramoClient::new(base_url, "engramo_test"))
     }
 
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_list_learning_paths_output_includes_active_default_and_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": mock_id(), "name": "P", "version": 1, "isDefault": true,
+                           "isActive": true, "catalogCount": 2, "cardCount": 0}],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+        let result = make_tools(&server.uri())
+            .list_learning_paths(Parameters(ListLearningPathsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        let item = &v["data"][0];
+        assert_eq!(item["isActive"], true);
+        assert_eq!(item["isDefault"], true);
+        assert_eq!(item["catalogCount"], 2);
+        assert!(item.get("cardCount").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_learning_paths_without_flags_still_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/learning-paths"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": mock_id(), "name": "P", "version": 1}],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+        let result = make_tools(&server.uri())
+            .list_learning_paths(Parameters(ListLearningPathsParams {
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let v: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert!(v["data"][0].get("isActive").is_none());
+        assert!(v["data"][0].get("catalogCount").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_learning_path_output_includes_active_default_and_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "name": "P", "version": 1, "isDefault": false,
+                "isActive": true, "catalogCount": 3
+            })))
+            .mount(&server)
+            .await;
+        let result = make_tools(&server.uri())
+            .get_learning_path(Parameters(GetLearningPathParams {
+                path_id: mock_id().to_string(),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(v["isActive"], true);
+        assert_eq!(v["isDefault"], false);
+        assert_eq!(v["catalogCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_learning_path_without_flags_still_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/learning-paths/{}", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "name": "P", "version": 1
+            })))
+            .mount(&server)
+            .await;
+        let result = make_tools(&server.uri())
+            .get_learning_path(Parameters(GetLearningPathParams {
+                path_id: mock_id().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let v: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert!(v.get("isActive").is_none());
+    }
+
     #[tokio::test]
     async fn test_list_learning_paths_ok() {
         let server = MockServer::start().await;

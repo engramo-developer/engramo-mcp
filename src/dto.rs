@@ -474,6 +474,16 @@ pub struct LearningPathDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
     pub version: i32,
+    #[serde(rename = "isActive", default, skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
+    #[serde(rename = "isDefault", default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    #[serde(
+        rename = "catalogCount",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catalog_count: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -486,6 +496,16 @@ pub struct LearningPathDetailDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
     pub version: i32,
+    #[serde(rename = "isActive", default, skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
+    #[serde(rename = "isDefault", default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    #[serde(
+        rename = "catalogCount",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catalog_count: Option<i64>,
     pub catalogs: Option<Vec<CatalogDto>>,
 }
 
