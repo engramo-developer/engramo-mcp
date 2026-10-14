@@ -6,10 +6,20 @@
 
 MCP server for [EngrAmo](https://engramo.app), the spaced-repetition flashcard platform.
 
+## Hosted server
+
+The hosted server at `https://mcp.engramo.app/` needs no installation. It supports OAuth 2.0 with Dynamic Client
+Registration: your client sends you to the EngrAmo sign-in page, you sign in with your EngrAmo email and password
+and approve — no API token to paste. There is no sign-up on that page, so create your account in the EngrAmo app
+first. Setup guides: [Claude](#claude-hosted-connector) and [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http);
+the public docs are at <https://engramo.app/connect/>. You can revoke access any time in the EngrAmo app under
+Settings → Connected apps.
+
 ## Prerequisites
 
 - An EngrAmo account
-- An EngrAmo API token — generate one from your account's Settings → API Tokens page
+- An EngrAmo API token — generate one from your account's Settings → API Tokens page. Only needed for the local
+  (`stdio`) setups below and for remote clients without OAuth; the hosted connectors use OAuth instead.
 
 ## Environments
 
@@ -70,7 +80,8 @@ Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key)
 | Windsurf | GPT / Claude / Gemini | ✅ | [Windsurf](#windsurf) |
 | Gemini CLI | Gemini | ✅ | [Gemini CLI](#gemini-cli) |
 | Antigravity | Gemini / Claude / GPT | ✅ stdio / ❌ remote | [Antigravity](#antigravity) |
-| ChatGPT | OpenAI models | ❌ — remote connector only; local TTS intentionally unavailable | [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http) |
+| Claude (claude.ai, Desktop, mobile) | Claude | ❌ — hosted connector only; local TTS intentionally unavailable | [Claude (hosted connector)](#claude-hosted-connector) |
+| ChatGPT | OpenAI models | ❌ — remote connector only (OAuth); local TTS intentionally unavailable | [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http) |
 
 ## Claude Desktop
 
@@ -135,6 +146,17 @@ Gemini quota; omit the line to disable. See [Text-to-speech](#text-to-speech-bri
 After editing, fully quit Claude Desktop (⌘Q on macOS — closing the window isn't enough) and reopen it.
 If the server doesn't show up, check the logs at `~/Library/Logs/Claude/mcp-server-engramo.log` (macOS) or
 `%APPDATA%\Claude\logs\` (Windows). The Gemini key is never logged.
+
+## Claude (hosted connector)
+
+Use the hosted server from claude.ai, Claude Desktop, or Claude mobile — no install, no token:
+
+1. **Settings → Connectors → Add custom connector**
+2. Paste `https://mcp.engramo.app/`
+3. **Connect**, sign in with your EngrAmo account, and approve.
+
+All hosted tools are then available. Like every remote connection, it has no local
+[text-to-speech](#text-to-speech-bring-your-own-key); use the [Claude Desktop](#claude-desktop) extension for that.
 
 ## Claude Code
 
@@ -384,7 +406,7 @@ Text-to-speech is unavailable over the remote transport — use the stdio config
 ## Use in ChatGPT (remote MCP over Streamable HTTP)
 
 `engramo-mcp` also runs as a **remote** server, so it can be added to ChatGPT as a custom connector (developer
-mode) without installing anything locally. This is the same binary — the `http` subcommand instead of the
+mode) without installing anything locally. The hosted server at `https://mcp.engramo.app/` already works this way. This is the same binary — the `http` subcommand instead of the
 default `stdio` — so a self-hosted deployment serves both Claude Desktop users (stdio) and ChatGPT users
 (HTTP) from one codebase.
 
@@ -402,9 +424,11 @@ created, and once a session exists every later request on it must carry the same
 binary's build version, read from `Cargo.toml` at compile time) — handy for deployment health and
 version probes without an MCP handshake.
 
-In ChatGPT: **Settings → Connectors → Advanced → Developer mode**, then add a custom connector pointing at
-your deployment's `https://<host>/`, pasting an EngrAmo API token (from Settings → API Tokens) as the
-bearer token. Once connected, prompts like *"Make me a 10-card Spanish restaurant deck"* or *"Turn this
+In ChatGPT, enable developer mode (**Settings → Connectors → Advanced → Developer mode**), then add an app
+pointing at `https://mcp.engramo.app/` (or your own deployment's `https://<host>/`). ChatGPT signs you in
+through OAuth: sign in with your EngrAmo account and approve — no API token needs to be pasted. (Clients
+without OAuth can instead send an EngrAmo API token from Settings → API Tokens as a static
+`Authorization: Bearer` header.) Once connected, prompts like *"Make me a 10-card Spanish restaurant deck"* or *"Turn this
 conversation into flashcards"* call `generate_catalog_with_cards` directly; open the result at
 `https://study.engramo.app/catalog/<shortId>` to study it.
 
@@ -412,8 +436,7 @@ conversation into flashcards"* call `generate_catalog_with_cards` directly; open
 > [text-to-speech](#text-to-speech-bring-your-own-key) is `stdio`-only by design. To use your ChatGPT
 > account's models with local TTS, use [Codex](#codex) instead.
 
-> A published, one-click ChatGPT App (OAuth login instead of a pasted token) is planned but not yet available
-> — see the project tracker for status.
+> A listing in the public ChatGPT app directory is coming; until then, add the app in developer mode as above.
 
 ## Bring-your-own-AI
 
