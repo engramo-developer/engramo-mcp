@@ -435,7 +435,7 @@ jobs:
             # (see THIRD_PARTY_LICENSES at the repo root).
             cp THIRD_PARTY_LICENSES "$pkg_dir/THIRD_PARTY_LICENSES"
 
-            npm publish "$pkg_dir" $NPM_PUBLISH_FLAGS
+            .github/scripts/npm-publish.sh "$pkg_dir" $NPM_PUBLISH_FLAGS
           done
 
       - name: Publish main package
@@ -464,4 +464,4 @@ jobs:
             fs.writeFileSync('$pkg_dir/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
-          npm publish "$pkg_dir" $NPM_PUBLISH_FLAGS
+          .github/scripts/npm-publish.sh "$pkg_dir" $NPM_PUBLISH_FLAGS
