@@ -171,9 +171,15 @@ jobs:
   # Claude Desktop extension (.mcpb): a zip of mcpb/manifest.json plus the
   # binaries, installed by double-click with the API token and Gemini keys
   # entered in Claude Desktop's own form (stored in the OS keychain), so users
-  # need neither Node.js nor a hand-edited config. macOS gets one universal
-  # binary because the manifest's command path can't vary by CPU arch, only by
-  # OS. Runs on macOS for `lipo`, and holds no secrets or write permissions
+  # need neither Node.js nor a hand-edited config. The manifest's command can
+  # vary by OS (platform_overrides) but not by CPU arch, so:
+  #   server/engramo-mcp            macOS: one universal (lipo) binary
+  #   server/engramo-mcp.exe        Windows x64
+  #   server/linux/engramo-mcp      Linux: POSIX sh launcher (mcpb/linux-launcher.sh),
+  #                                 run as `/bin/sh <path>`, which execs the static
+  #                                 musl binary for `uname -m` from:
+  #   server/linux/engramo-mcp-x64, server/linux/engramo-mcp-arm64
+  # Runs on macOS for `lipo`, and holds no secrets or write permissions
   # (attestation is a separate job): the packer comes from npm (installed from a committed
   # lockfile), so it never shares a job with NPM_TOKEN.
   mcpb:
@@ -205,7 +211,13 @@ jobs:
           lipo -create engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 -output stage/server/engramo-mcp
           lipo stage/server/engramo-mcp -verify_arch arm64 x86_64
           cp engramo-mcp-win32-x64.exe stage/server/engramo-mcp.exe
-          chmod 755 stage/server/engramo-mcp stage/server/engramo-mcp.exe
+          mkdir -p stage/server/linux
+          cp mcpb/linux-launcher.sh stage/server/linux/engramo-mcp
+          cp engramo-mcp-linux-x64 stage/server/linux/engramo-mcp-x64
+          cp engramo-mcp-linux-arm64 stage/server/linux/engramo-mcp-arm64
+          file stage/server/linux/engramo-mcp-x64   | grep -q 'ELF 64-bit.*x86-64' || { echo "::error::linux x64 binary is not an x86-64 ELF"; exit 1; }
+          file stage/server/linux/engramo-mcp-arm64 | grep -q 'ELF 64-bit.*aarch64' || { echo "::error::linux arm64 binary is not an aarch64 ELF"; exit 1; }
+          chmod 755 stage/server/engramo-mcp stage/server/engramo-mcp.exe stage/server/linux/*
           cp mcpb/icon.png LICENSE THIRD_PARTY_LICENSES stage/
           # The manifest's version is a 0.0.0 placeholder, like the npm packages.
           node -e '
@@ -225,6 +237,21 @@ jobs:
         run: |
           set -euo pipefail
           MCPB=mcpb/tools/node_modules/.bin/mcpb
+          # Every path the manifest references must exist in the staged bundle.
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("stage/manifest.json", "utf8"));
+            const cfg = m.server.mcp_config;
+            const refs = [cfg.command, ...(cfg.args || [])];
+            for (const o of Object.values(cfg.platform_overrides || {})) refs.push(o.command, ...(o.args || []));
+            for (const r of refs.filter(r => typeof r === "string" && r.startsWith("${__dirname}/"))) {
+              const p = "stage/" + r.slice("${__dirname}/".length);
+              if (!fs.existsSync(p)) { console.error("manifest references missing file: " + p); process.exit(1); }
+            }
+            for (const a of ["x64", "arm64"]) {
+              if (!fs.existsSync("stage/server/linux/engramo-mcp-" + a)) { console.error("missing linux " + a); process.exit(1); }
+            }
+          '
           "$MCPB" validate stage/manifest.json
           "$MCPB" pack stage engramo.mcpb
           "$MCPB" info engramo.mcpb

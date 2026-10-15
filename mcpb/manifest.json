@@ -23,7 +23,11 @@
         "ENGRAMO_TTS_GEMINI_API_KEYS": "${user_config.gemini_keys}"
       },
       "platform_overrides": {
-        "win32": { "command": "${__dirname}/server/engramo-mcp.exe" }
+        "win32": { "command": "${__dirname}/server/engramo-mcp.exe" },
+        "linux": {
+          "command": "/bin/sh",
+          "args": ["${__dirname}/server/linux/engramo-mcp"]
+        }
       }
     }
   },
@@ -31,7 +35,7 @@
   "keywords": ["flashcards", "spaced-repetition", "language-learning", "engramo"],
   "license": "MIT",
   "compatibility": {
-    "platforms": ["darwin", "win32"]
+    "platforms": ["darwin", "win32", "linux"]
   },
   "user_config": {
     "api_token": {

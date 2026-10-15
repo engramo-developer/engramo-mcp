@@ -88,7 +88,7 @@ Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key)
 ### One-click extension (recommended)
 
 1. Download [`engramo.mcpb`](https://github.com/engramo-developer/engramo-mcp/releases/latest/download/engramo.mcpb)
-   from the latest release (macOS — Intel and Apple Silicon — and Windows).
+   from the latest release (macOS on Intel and Apple Silicon, Windows x64, Linux x64 and arm64).
 2. Double-click it (or drag it onto Claude Desktop) and click **Install**. Claude Desktop warns that the
    developer isn't verified by Anthropic; it shows this for every extension installed from a file.
 3. Paste your **EngrAmo API token**, and optionally your Gemini API keys (comma-separated) to enable
