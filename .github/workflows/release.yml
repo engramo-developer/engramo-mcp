@@ -171,9 +171,15 @@ jobs:
   # Claude Desktop extension (.mcpb): a zip of mcpb/manifest.json plus the
   # binaries, installed by double-click with the API token and Gemini keys
   # entered in Claude Desktop's own form (stored in the OS keychain), so users
-  # need neither Node.js nor a hand-edited config. macOS gets one universal
-  # binary because the manifest's command path can't vary by CPU arch, only by
-  # OS. Runs on macOS for `lipo`, and holds no secrets or write permissions
+  # need neither Node.js nor a hand-edited config. The manifest's command can
+  # vary by OS (platform_overrides) but not by CPU arch, so:
+  #   server/engramo-mcp            macOS: one universal (lipo) binary
+  #   server/engramo-mcp.exe        Windows x64
+  #   server/linux/engramo-mcp      Linux: POSIX sh launcher (mcpb/linux-launcher.sh),
+  #                                 run as `/bin/sh <path>`, which execs the static
+  #                                 musl binary for `uname -m` from:
+  #   server/linux/engramo-mcp-x64, server/linux/engramo-mcp-arm64
+  # Runs on macOS for `lipo`, and holds no secrets or write permissions
   # (attestation is a separate job): the packer comes from npm (installed from a committed
   # lockfile), so it never shares a job with NPM_TOKEN.
   mcpb:
@@ -205,7 +211,11 @@ jobs:
           lipo -create engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 -output stage/server/engramo-mcp
           lipo stage/server/engramo-mcp -verify_arch arm64 x86_64
           cp engramo-mcp-win32-x64.exe stage/server/engramo-mcp.exe
-          chmod 755 stage/server/engramo-mcp stage/server/engramo-mcp.exe
+          mkdir -p stage/server/linux
+          cp mcpb/linux-launcher.sh stage/server/linux/engramo-mcp
+          cp engramo-mcp-linux-x64 stage/server/linux/engramo-mcp-x64
+          cp engramo-mcp-linux-arm64 stage/server/linux/engramo-mcp-arm64
+          chmod 755 stage/server/engramo-mcp stage/server/engramo-mcp.exe stage/server/linux/*
           cp mcpb/icon.png LICENSE THIRD_PARTY_LICENSES stage/
           # The manifest's version is a 0.0.0 placeholder, like the npm packages.
           node -e '
