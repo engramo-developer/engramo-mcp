@@ -64,6 +64,28 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Lint mcpb Linux launcher
+        run: shellcheck -s sh mcpb/linux-launcher.sh
+
+      - name: Smoke-test mcpb Linux launcher
+        run: |
+          set -eu
+          stage=$(mktemp -d)
+          cp mcpb/linux-launcher.sh "$stage/engramo-mcp"
+          cp target/debug/engramo-mcp "$stage/engramo-mcp-x64"
+          chmod 644 "$stage/engramo-mcp-x64"            # exercise the exec-bit restore branch
+          # happy path: invoked as the manifest does (/bin/sh <abs path>) from an unrelated cwd
+          out=$(cd / && /bin/sh "$stage/engramo-mcp" --version)
+          case $out in "engramo-mcp "*) ;; *) echo "unexpected: $out"; exit 1 ;; esac
+          test -x "$stage/engramo-mcp-x64"
+          # unsupported-arch branch: shadow uname
+          mkdir "$stage/fakebin"
+          printf '#!/bin/sh\necho riscv64\n' > "$stage/fakebin/uname"; chmod +x "$stage/fakebin/uname"
+          if PATH="$stage/fakebin:$PATH" /bin/sh "$stage/engramo-mcp" --version 2>"$stage/err.txt"; then
+            echo "expected failure on unsupported arch"; exit 1
+          fi
+          grep -q "unsupported CPU architecture 'riscv64'" "$stage/err.txt"
+
       - name: Test
         run: cargo test --workspace
 
@@ -111,6 +133,8 @@ jobs:
   # Deliberately NOT a required check: the packer only runs at release time on
   # staged artifacts, so an npm advisory must not block unrelated Rust PRs.
   # release.yml's mcpb job re-runs this audit so a vulnerable packer can't ship.
+  # The job also validates mcpb/manifest.json against the schema; validation runs
+  # even when the audit step fails so an advisory can't hide a manifest break.
   audit-mcpb-tools:
     name: Audit mcpb tools (npm)
     runs-on: ubuntu-latest
@@ -121,3 +145,11 @@ jobs:
 
       - name: Audit
         run: node mcpb/tools/audit.mjs
+
+      - name: Install mcpb CLI (locked)
+        if: ${{ !cancelled() }}
+        run: npm ci --ignore-scripts --prefix mcpb/tools
+
+      - name: Validate manifest
+        if: ${{ !cancelled() }}
+        run: mcpb/tools/node_modules/.bin/mcpb validate mcpb/manifest.json
