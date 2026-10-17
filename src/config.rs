@@ -720,4 +720,75 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn server_json_matches_env_contract() {
+        let sj: serde_json::Value = serde_json::from_str(include_str!("../server.json"))
+            .expect("server.json is valid JSON");
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(include_str!("../npm/engramo-mcp/package.json"))
+                .expect("package.json is valid JSON");
+
+        // Placeholders that release.yml rewrites.
+        assert_eq!(sj["version"], "0.0.0");
+        // The registry verifies this name against the npm package's mcpName.
+        assert_eq!(sj["name"], pkg_json["mcpName"]);
+        assert_eq!(sj["name"], "app.engramo/mcp");
+
+        let packages = sj["packages"].as_array().expect("packages array");
+        assert!(
+            packages.iter().any(|p| p["registryType"] == "npm"),
+            "npm package present"
+        );
+        let mut expected = vec!["ENGRAMO_API_URL", "ENGRAMO_API_TOKEN", crate::tts::ENV_KEYS];
+        expected.sort();
+
+        for pkg in packages {
+            assert_eq!(pkg["transport"]["type"], "stdio");
+            assert_eq!(pkg["version"].as_str().unwrap_or("0.0.0"), "0.0.0");
+            let vars = pkg["environmentVariables"].as_array().expect("env vars");
+            let mut names: Vec<&str> = vars.iter().map(|v| v["name"].as_str().unwrap()).collect();
+            names.sort();
+            assert_eq!(names, expected);
+
+            let var = |n: &str| vars.iter().find(|v| v["name"] == n).unwrap();
+            // stdio requires the token, and the token / TTS keys are secrets.
+            assert_eq!(var("ENGRAMO_API_TOKEN")["isRequired"], true);
+            assert_eq!(var("ENGRAMO_API_TOKEN")["isSecret"], true);
+            assert_eq!(var(crate::tts::ENV_KEYS)["isSecret"], true);
+            assert_ne!(var(crate::tts::ENV_KEYS)["isRequired"], true);
+            assert_eq!(var("ENGRAMO_API_URL")["default"], "https://api.engramo.app");
+
+            // http-only / paid-AI vars must never be advertised for stdio.
+            for forbidden in [
+                "MCP_PUBLIC_URL",
+                "MCP_BIND_ADDR",
+                "OPENAI_APPS_CHALLENGE",
+                "ENGRAMO_ENABLE_PAID_AI",
+                "MCP_ALLOWED_HOSTS",
+                "GEMINI_API_KEY",
+            ] {
+                assert!(
+                    !names.contains(&forbidden),
+                    "{forbidden} must not be in server.json env"
+                );
+            }
+        }
+
+        let mcpb = packages
+            .iter()
+            .find(|p| p["registryType"] == "mcpb")
+            .expect("mcpb package");
+        assert!(
+            mcpb["identifier"]
+                .as_str()
+                .unwrap()
+                .ends_with("/download/v0.0.0/engramo.mcpb")
+        );
+        assert!(mcpb["fileSha256"].is_string());
+
+        let remote = &sj["remotes"][0];
+        assert_eq!(remote["type"], "streamable-http");
+        assert_eq!(remote["url"], "https://mcp.engramo.app/");
+    }
 }
