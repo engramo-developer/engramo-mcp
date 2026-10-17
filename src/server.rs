@@ -196,7 +196,7 @@ impl EngramoMcpServer {
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = true,
-            open_world_hint = false
+            open_world_hint = true
         ),
         description = "Update an existing catalog's name, description, tags, or visibility. Requires the current version for optimistic locking — fetch the catalog first to get the version. If you get a Conflict error, re-fetch and retry."
     )]
@@ -883,7 +883,7 @@ impl EngramoMcpServer {
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = true,
-            open_world_hint = false
+            open_world_hint = true
         ),
         description = "Update a learning path's name, description, tags, or visibility. \
         Requires the current version for optimistic locking — fetch the path first \
@@ -1574,7 +1574,7 @@ impl EngramoMcpServer {
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         ),
         description = "Create a new catalog together with all its flashcards in one atomic call. \
             More efficient than creating cards one by one. \
@@ -5560,6 +5560,14 @@ mod tests {
         assert_eq!(get("generate_card").destructive_hint, Some(false));
         assert_eq!(get("generate_card_audio").open_world_hint, Some(true));
         assert_eq!(get("translate_cards").open_world_hint, Some(true));
+        // Tools that can set `visibility` to public/unlisted expose content to other users.
+        for name in [
+            "generate_catalog_with_cards",
+            "update_catalog",
+            "update_learning_path",
+        ] {
+            assert_eq!(get(name).open_world_hint, Some(true), "{name}");
+        }
     }
 
     #[test]
