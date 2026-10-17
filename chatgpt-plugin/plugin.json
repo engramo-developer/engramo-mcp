@@ -1,0 +1,58 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "engramo",
+  "version": "1.2.11",
+  "description": "Turn any conversation into spaced-repetition flashcards in your EngrAmo account.",
+  "author": {
+    "name": "EngrAmo",
+    "url": "https://engramo.app"
+  },
+  "homepage": "https://engramo.app",
+  "repository": "https://github.com/engramo-developer/engramo-mcp",
+  "license": "MIT",
+  "keywords": [
+    "flashcards",
+    "spaced repetition",
+    "language learning",
+    "study"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "EngrAmo",
+        "shortDescription": "Flashcards you actually review",
+        "longDescription": "EngrAmo is a spaced-repetition flashcard app. This plugin lets ChatGPT work directly with your EngrAmo account, so whatever you are learning in a conversation can become a deck you review on your phone.\n\nWhat you can do:\n- Create flashcards from anything. Ask ChatGPT to build a deck from a topic, an article, or your notes. ChatGPT writes the cards itself, including bold or highlighted key phrases and word-by-word dictionaries for language cards.\n- See what's due. Ask which cards are due today, or quiz yourself on them in the chat.\n- Organise your learning. Search catalogs and cards, add catalogs to learning, and group them into learning paths you can activate or pause.\n- Edit and clean up. Fix a card's wording, move cards between catalogs, or delete what you no longer need. Destructive actions are marked so ChatGPT asks before running them.\n\nThe plugin talks only to EngrAmo's own API. You sign in with your EngrAmo account through OAuth, and you can disconnect at any time from Settings → Connected apps in the EngrAmo app. ChatGPT writes the cards itself; the plugin makes no AI calls of its own.",
+        "developerName": "EngrAmo",
+        "category": "Productivity",
+        "capabilities": [
+          "Create a flashcard deck from a topic or text",
+          "Add cards to an existing deck",
+          "Format key phrases with bold or highlights",
+          "Add word dictionaries to language cards",
+          "List your decks",
+          "Show cards due for review",
+          "Quiz you on due cards",
+          "Search your decks and public decks",
+          "Edit a card",
+          "Move cards between decks",
+          "Delete a card or deck",
+          "Add a deck to your learning queue",
+          "Create learning paths",
+          "Activate or pause a learning path",
+          "Add or remove decks in a learning path"
+        ],
+        "websiteURL": "https://engramo.app",
+        "supportURL": "https://github.com/engramo-developer/engramo-mcp/issues",
+        "privacyPolicyURL": "https://engramo.app/policy/privacy",
+        "termsOfServiceURL": "https://engramo.app/policy/terms",
+        "defaultPrompt": [
+          "Create a flashcard deck with 10 Spanish phrases for ordering food in a restaurant, and add it to my learning.",
+          "Which of my flashcards are due for review today? Quiz me on three of them.",
+          "What learning paths do I have, and what's in the active one?"
+        ],
+        "logo": "./assets/icon.png",
+        "composerIcon": "./assets/icon.png"
+      }
+    }
+  }
+}
