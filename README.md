@@ -438,6 +438,22 @@ conversation into flashcards"* call `generate_catalog_with_cards` directly; open
 
 > A listing in the public ChatGPT app directory is coming; until then, add the app in developer mode as above.
 
+### ChatGPT plugin package (maintainers)
+
+The directory listing is submitted on [platform.openai.com/plugins](https://platform.openai.com/plugins) as a
+plugin ZIP built from [`chatgpt-plugin/`](chatgpt-plugin/): `plugin.json` holds the listing metadata and
+`mcp.json` points at `https://mcp.engramo.app/` with OAuth via dynamic client registration (no client ID or
+secret). Build it with:
+
+```bash
+./chatgpt-plugin/build.sh   # → target/engramo-chatgpt-plugin.zip
+```
+
+The script copies the icon from `mcpb/` and sets `version` from `Cargo.toml`. Upload a new ZIP (**Plugins →
+EngrAmo → Upload new version**) only when the listing metadata changes; tool and server changes are picked up
+by **Rescan**. The domain-verification token served at `/.well-known/openai-apps-challenge` comes from the
+portal and is set as the `_OPENAI_APPS_CHALLENGE` substitution on the prod Cloud Build trigger, not in this repo.
+
 ## Bring-your-own-AI
 
 Every deployment is **bring-your-own-AI**: the calling model (Claude, ChatGPT, …) does all generation —
