@@ -11,7 +11,8 @@ MCP server for [EngrAmo](https://engramo.app), the spaced-repetition flashcard p
 The hosted server at `https://mcp.engramo.app/` needs no installation. It supports OAuth 2.0 with Dynamic Client
 Registration: your client sends you to the EngrAmo sign-in page, you sign in with your EngrAmo email and password
 and approve — no API token to paste. There is no sign-up on that page, so create your account in the EngrAmo app
-first. Setup guides: [Claude](#claude-hosted-connector) and [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http);
+first. EngrAmo is listed in the [Claude Connectors Directory](https://claude.ai/directory/engramo). Setup guides:
+[Claude](#claude-hosted-connector) and [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http);
 the public docs are at <https://engramo.app/connect/>. You can revoke access any time in the EngrAmo app under
 Settings → Connected apps.
 
@@ -72,7 +73,8 @@ Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key)
 
 | Client | Models | Local TTS | Setup |
 |---|---|---|---|
-| Claude Desktop | Claude | ✅ | [Claude Desktop](#claude-desktop) — recommended for non-technical users: one-click extension, no Node.js or config editing; the free plan supports local extensions |
+| Claude (claude.ai, Desktop, mobile) | Claude | ❌ — hosted connector only; local TTS intentionally unavailable | [Claude (hosted connector)](#claude-hosted-connector) — recommended: install from the Connectors Directory, nothing to download |
+| Claude Desktop extension | Claude | ✅ | [Claude Desktop](#claude-desktop) — use it for card audio: one-click extension, no Node.js or config editing; the free plan supports local extensions |
 | Claude Code | Claude | ✅ | [Claude Code](#claude-code) |
 | Codex (CLI / IDE extension) | OpenAI models — sign in with your ChatGPT account | ✅ | [Codex](#codex) |
 | VS Code (GitHub Copilot) | GPT / Claude / Gemini | ✅ | [VS Code](#vs-code-github-copilot-agent-mode) |
@@ -80,17 +82,22 @@ Any MCP client works. Local [text-to-speech](#text-to-speech-bring-your-own-key)
 | Windsurf | GPT / Claude / Gemini | ✅ | [Windsurf](#windsurf) |
 | Gemini CLI | Gemini | ✅ | [Gemini CLI](#gemini-cli) |
 | Antigravity | Gemini / Claude / GPT | ✅ stdio / ❌ remote | [Antigravity](#antigravity) |
-| Claude (claude.ai, Desktop, mobile) | Claude | ❌ — hosted connector only; local TTS intentionally unavailable | [Claude (hosted connector)](#claude-hosted-connector) |
 | ChatGPT | OpenAI models | ❌ — remote connector only (OAuth); local TTS intentionally unavailable | [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http) |
 
 ## Claude Desktop
 
-### One-click extension (recommended)
+Most Claude Desktop users should add the [hosted connector](#claude-hosted-connector) from the Connectors Directory
+instead: nothing to download, no token to paste, and it also works on claude.ai and mobile. Use the extension
+below when you want local [card audio](#text-to-speech-bring-your-own-key), which only a local server can provide.
+
+### One-click extension (for card audio)
 
 1. Download [`engramo.mcpb`](https://github.com/engramo-developer/engramo-mcp/releases/latest/download/engramo.mcpb)
    from the latest release (macOS on Intel and Apple Silicon, Windows x64, Linux x64 and arm64).
-2. Double-click it (or drag it onto Claude Desktop) and click **Install**. Claude Desktop warns that the
-   developer isn't verified by Anthropic; it shows this for every extension installed from a file.
+2. Double-click it (or drag it onto Claude Desktop) and click **Install**. Claude Desktop shows a red warning
+   that the extension gets access to everything on your computer and that the developer isn't verified by
+   Anthropic. It shows this for every extension installed from a file — the Connectors Directory no longer lists
+   desktop extensions — and it's accurate: the extension runs the `engramo-mcp` binary with your user permissions.
 3. Paste your **EngrAmo API token**, and optionally your Gemini API keys (comma-separated) to enable
    [card audio](#text-to-speech-bring-your-own-key). Claude Desktop stores both in the OS keychain.
 
@@ -151,9 +158,13 @@ If the server doesn't show up, check the logs at `~/Library/Logs/Claude/mcp-serv
 
 Use the hosted server from claude.ai, Claude Desktop, or Claude mobile — no install, no token:
 
-1. **Settings → Connectors → Add custom connector**
-2. Paste `https://mcp.engramo.app/`
-3. **Connect**, sign in with your EngrAmo account, and approve.
+1. Open [EngrAmo in the Connectors Directory](https://claude.ai/directory/engramo) (or **Settings → Connectors →
+   Browse** and search for EngrAmo).
+2. **Connect**, sign in with your EngrAmo account, and approve.
+
+It's a community connector: Anthropic ran automated reviews but hasn't verified it, so Claude shows a short notice
+before you connect. Without the directory — for example, if your organization restricts it — add it by URL
+instead: **Settings → Connectors → Add custom connector**, paste `https://mcp.engramo.app/`, then **Connect**.
 
 All hosted tools are then available. Like every remote connection, it has no local
 [text-to-speech](#text-to-speech-bring-your-own-key); use the [Claude Desktop](#claude-desktop) extension for that.
