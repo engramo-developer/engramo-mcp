@@ -303,7 +303,13 @@ fn build_app(
     let service = StreamableHttpService::new(
         factory,
         session_manager.clone(),
-        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+        StreamableHttpServerConfig::default()
+            .with_allowed_hosts(allowed_hosts)
+            // rmcp's default prepends an SSE priming event (`id: 0`, `retry: 3000`,
+            // empty `data:`) to every stream. Strict SSE parsers (Gemini) reject the
+            // `retry:` line and drop the connection, and without an event store the
+            // event enables no resumption anyway.
+            .with_sse_retry(None),
     );
 
     // Bearer auth applies only to the MCP endpoint itself (served at root, `/`) —
@@ -446,6 +452,51 @@ mod tests {
                 || (status == StatusCode::INTERNAL_SERVER_ERROR
                     && text.contains("length limit exceeded")),
             "{status} {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_app_sse_stream_has_no_priming_event() {
+        // Gemini's MCP client fails with "Invalid SSE response ... Line: retry: 3000"
+        // on rmcp's default priming event; the first SSE event must be the JSON-RPC result.
+        let api = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/me"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"user_id": "11111111-2222-3333-4444-555555555555"}),
+            ))
+            .mount(&api)
+            .await;
+        let cfg = McpConfig::new(api.uri(), None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080");
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let req = Request::post("/")
+            .header("authorization", "Bearer engramo_t")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "localhost")
+            .body(Body::from(init))
+            .unwrap();
+        let resp = test_app(&cfg).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(resp.into_body(), 1_000_000),
+        )
+        .await
+        .expect("SSE response body did not end")
+        .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.starts_with(r#"data: {"jsonrpc":"2.0","id":1,"result":"#),
+            "{text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with("retry:") || l.starts_with("id:")),
+            "{text}"
         );
     }
 
