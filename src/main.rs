@@ -244,6 +244,9 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
 fn session_manager() -> LocalSessionManager {
     let mut manager = LocalSessionManager::default();
     manager.session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
+    // Must match `StreamableHttpServerConfig::with_sse_retry(None)` in `build_app`:
+    // the session layer primes every post-initialize request-wise SSE stream on its own.
+    manager.session_config.sse_retry = None;
     manager
 }
 
@@ -308,7 +311,9 @@ fn build_app(
             // rmcp's default prepends an SSE priming event (`id: 0`, `retry: 3000`,
             // empty `data:`) to every stream. Strict SSE parsers (Gemini) reject the
             // `retry:` line and drop the connection, and without an event store the
-            // event enables no resumption anyway.
+            // event enables no resumption anyway. This covers the `initialize` response
+            // and the standalone GET stream; post-initialize request streams are primed
+            // by the session layer, disabled in `session_manager()`.
             .with_sse_retry(None),
     );
 
@@ -373,6 +378,7 @@ mod tests {
             session_manager().session_config.keep_alive,
             Some(SESSION_KEEP_ALIVE)
         );
+        assert!(session_manager().session_config.sse_retry.is_none());
     }
 
     fn test_app(cfg: &McpConfig) -> axum::Router {
@@ -498,6 +504,120 @@ mod tests {
                 .any(|l| l.starts_with("retry:") || l.starts_with("id:")),
             "{text}"
         );
+    }
+
+    /// Opens a session on `app` (initialize + notifications/initialized) and returns its id.
+    async fn open_session(app: &axum::Router) -> String {
+        let post = |session: Option<&str>, body: &'static str| {
+            let mut b = Request::post("/")
+                .header("authorization", "Bearer engramo_t")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("host", "localhost");
+            if let Some(s) = session {
+                b = b.header("mcp-session-id", s);
+            }
+            b.body(Body::from(body)).unwrap()
+        };
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let resp = app.clone().oneshot(post(None, init)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sid = resp.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let resp = app
+            .clone()
+            .oneshot(post(Some(&sid), initialized))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        sid
+    }
+
+    async fn mock_me() -> wiremock::MockServer {
+        let api = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/me"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"user_id": "11111111-2222-3333-4444-555555555555"}),
+            ))
+            .mount(&api)
+            .await;
+        api
+    }
+
+    #[tokio::test]
+    async fn test_http_app_post_initialize_sse_stream_has_no_retry_line() {
+        // Follow-up requests are primed by the session layer, not the tower layer.
+        let api = mock_me().await;
+        let cfg = McpConfig::new(api.uri(), None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080");
+        let app = test_app(&cfg);
+        let sid = open_session(&app).await;
+        let req = Request::post("/")
+            .header("authorization", "Bearer engramo_t")
+            .header("mcp-session-id", sid)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "localhost")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(resp.into_body(), 1_000_000),
+        )
+        .await
+        .expect("SSE response body did not end")
+        .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.starts_with(r#"data: {"jsonrpc":"2.0","id":2,"result":"#),
+            "{text}"
+        );
+        assert!(!text.lines().any(|l| l.starts_with("retry:")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_http_app_standalone_get_stream_has_no_priming_event() {
+        use http_body_util::BodyExt;
+        let api = mock_me().await;
+        let cfg = McpConfig::new(api.uri(), None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080");
+        let app = test_app(&cfg);
+        let sid = open_session(&app).await;
+        let req = Request::get("/")
+            .header("authorization", "Bearer engramo_t")
+            .header("mcp-session-id", sid)
+            .header("accept", "text/event-stream")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        let mut body = resp.into_body();
+        // The stream stays open: read only the first frame, if any.
+        match tokio::time::timeout(std::time::Duration::from_millis(500), body.frame()).await {
+            Err(_) => {} // no frame emitted, so no priming event
+            Ok(Some(Ok(f))) => {
+                if let Ok(d) = f.into_data() {
+                    let t = String::from_utf8_lossy(&d);
+                    assert!(
+                        !t.lines()
+                            .any(|l| l.starts_with("retry:") || l.starts_with("id:")),
+                        "{t}"
+                    );
+                }
+            }
+            Ok(other) => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]
