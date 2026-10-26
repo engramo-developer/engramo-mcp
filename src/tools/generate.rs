@@ -2178,6 +2178,11 @@ mod tests {
                 402,
                 json!({"error":"quota_exceeded","resource_type":"cards_total","used":100,"limit":100}),
             ),
+            (
+                403,
+                json!({"error": "Forbidden", "code": "FEATURE_NOT_ENTITLED",
+                       "feature": "tts_generate", "plan_id": "free"}),
+            ),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -2220,6 +2225,9 @@ mod tests {
                 "{status}: {text}"
             );
             assert!(!text.contains(".."), "{status}: {text}");
+            if status == 403 {
+                assert!(text.contains("Not included in your plan"), "{text}");
+            }
         }
     }
 

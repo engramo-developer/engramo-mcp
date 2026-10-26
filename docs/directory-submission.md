@@ -116,13 +116,14 @@ account also has an empty **My Catalog** (Default) that the app creates on first
 
 ## 3. Tool annotations and justifications
 
-The 30 tools on prod. They touch only the signed-in user's EngrAmo account, never the wider internet. 27 have `openWorldHint: false`. Three have `openWorldHint: true`: `generate_catalog_with_cards`, `update_catalog` and `update_learning_path`. They accept `visibility: public` (or `unlisted` for catalogs), which makes the content visible to other EngrAmo users. *(Flagged by the ChatGPT scan on 2026-10-17; fixed in v1.2.12 (engramo-mcp #106).)*
+The 31 tools on prod. They touch only the signed-in user's EngrAmo account, never the wider internet. 28 have `openWorldHint: false`. Three have `openWorldHint: true`: `generate_catalog_with_cards`, `update_catalog` and `update_learning_path`. They accept `visibility: public` (or `unlisted` for catalogs), which makes the content visible to other EngrAmo users. *(Flagged by the ChatGPT scan on 2026-10-17; fixed in v1.2.12 (engramo-mcp #106).)*
 
 ### 3.1 Read-only (`readOnlyHint: true`, `destructiveHint: false`)
 
 | Tool | Justification |
 |---|---|
 | `get_server_version` | Returns the server's name and version. |
+| `get_subscription_usage` | Reads the user's own plan, limits and usage. |
 | `list_catalogs`, `get_catalog` | Read the user's catalogs. |
 | `list_cards`, `get_card` | Read cards. |
 | `get_due_cards`, `get_all_learning_cards` | Read the review schedule; grading happens in the app, not here. |
