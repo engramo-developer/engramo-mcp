@@ -16,7 +16,7 @@ Each directory gets its own account, so one review's test runs can't change the 
 | Claude login | `mcp-review-claude@engramo.app` + password (same rule) |
 | Login method | Email + password on the EngrAmo OAuth page. No MFA, no email codes, no sign-up step |
 | Plan | Basic, plus a `cards_per_catalog: -1` override (see "Known limitations") |
-| Paid AI tools | Off on prod. Reviewers see **29 tools** |
+| Paid AI tools | Off on prod. Reviewers see **30 tools** |
 
 **Seeded data** (identical on both accounts; ChatGPT account 2026-10-14, Claude account 2026-10-18). The Claude
 account also has an empty **My Catalog** (Default) that the app creates on first sign-in.
@@ -116,7 +116,7 @@ account also has an empty **My Catalog** (Default) that the app creates on first
 
 ## 3. Tool annotations and justifications
 
-The 29 tools on prod. They touch only the signed-in user's EngrAmo account, never the wider internet. 26 have `openWorldHint: false`. Three have `openWorldHint: true`: `generate_catalog_with_cards`, `update_catalog` and `update_learning_path`. They accept `visibility: public` (or `unlisted` for catalogs), which makes the content visible to other EngrAmo users. *(Flagged by the ChatGPT scan on 2026-10-17; fixed in v1.2.12 (engramo-mcp #106).)*
+The 30 tools on prod. They touch only the signed-in user's EngrAmo account, never the wider internet. 27 have `openWorldHint: false`. Three have `openWorldHint: true`: `generate_catalog_with_cards`, `update_catalog` and `update_learning_path`. They accept `visibility: public` (or `unlisted` for catalogs), which makes the content visible to other EngrAmo users. *(Flagged by the ChatGPT scan on 2026-10-17; fixed in v1.2.12 (engramo-mcp #106).)*
 
 ### 3.1 Read-only (`readOnlyHint: true`, `destructiveHint: false`)
 
@@ -147,6 +147,7 @@ The 29 tools on prod. They touch only the signed-in user's EngrAmo account, neve
 |---|---|
 | `update_card`, `update_catalog`, `update_learning_path` | Overwrite existing content; the previous values are not kept. |
 | `delete_card`, `delete_catalog` | Remove content (archived when it has learning history, otherwise hard-deleted). No restore tool. |
+| `set_catalog_shadowing` | Turns shadowing on or off for a catalog, or changes its language; overwrites the previous setting, and repeating the same call changes nothing. |
 | `remove_catalog_from_learning_path` | Removes a membership. |
 | `deactivate_learning_path` | Stops the path's catalogs from being scheduled. Marked destructive on purpose because it changes what the user reviews. |
 

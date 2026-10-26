@@ -12,6 +12,10 @@ pub struct ListCatalogsParams {
     pub limit: Option<i64>,
     #[schemars(description = "Pagination cursor from a previous response")]
     pub cursor: Option<String>,
+    #[schemars(
+        description = "If true, return only catalogs with shadowing turned on. Keep the same value for every page: a cursor from one value is rejected with the other."
+    )]
+    pub speaking_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -42,6 +46,20 @@ pub struct UpdateCatalogParams {
 pub struct DeleteCatalogParams {
     #[schemars(description = "UUID of the catalog to delete")]
     pub catalog_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetCatalogShadowingParams {
+    #[schemars(description = "UUID of the catalog (must be one you own)")]
+    pub catalog_id: String,
+    #[schemars(
+        description = "true turns shadowing on (or changes its language); false turns it off"
+    )]
+    pub enabled: bool,
+    #[schemars(
+        description = "Language of the card FRONTS (faces) as a BCP-47 tag, e.g. 'es', 'es-ES', 'pt-BR', 'sr-Latn'. Required when enabled is true; ignored when enabled is false."
+    )]
+    pub language: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -75,12 +93,67 @@ pub(crate) fn parse_uuid(s: &str) -> Result<Uuid, String> {
     Uuid::parse_str(s).map_err(|_| format!("Invalid UUID: '{}'", preview(s)))
 }
 
+/// Fixes the case and separator of a BCP-47-like tag (`es_es` -> `es-ES`, `sr-latn` ->
+/// `sr-Latn`) and nothing else: validation stays on the backend so the rule can't drift. The
+/// region/script part is only re-cased when it is exactly 2 (region) or 4 (script) ASCII
+/// characters; anything else, and anything non-ASCII, passes through for the backend to reject.
+pub(crate) fn normalize_language_tag(raw: &str) -> String {
+    let raw = raw.trim();
+    let (lang, rest) = match raw.split_once(['-', '_']) {
+        Some((lang, rest)) => (lang, Some(rest)),
+        None => (raw, None),
+    };
+    let lang = lang.to_ascii_lowercase();
+    match rest {
+        None => lang,
+        Some(rest) if rest.is_ascii() && rest.len() == 2 => {
+            format!("{lang}-{}", rest.to_ascii_uppercase())
+        }
+        Some(rest) if rest.is_ascii() && rest.len() == 4 => {
+            let (head, tail) = rest.split_at(1);
+            format!(
+                "{lang}-{}{}",
+                head.to_ascii_uppercase(),
+                tail.to_ascii_lowercase()
+            )
+        }
+        Some(rest) => format!("{lang}-{rest}"),
+    }
+}
+
+/// Generous upper bound for a BCP-47 tag (RFC 5646 recommends supporting at least 35 chars).
+const MAX_LANGUAGE_TAG_LEN: usize = 64;
+
+/// The language to store for `set_catalog_shadowing`: `None` (turn off) when `enabled` is false,
+/// otherwise the normalized tag. `enabled: true` without a usable language is a local error, so
+/// a model that forgets `language` can never silently turn shadowing off.
+pub(crate) fn shadowing_target(
+    enabled: bool,
+    language: Option<&str>,
+) -> Result<Option<String>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    match language.map(str::trim) {
+        Some(l) if l.len() > MAX_LANGUAGE_TAG_LEN => Err(format!(
+            "`language` is too long (max {MAX_LANGUAGE_TAG_LEN} bytes): '{}'",
+            preview(l)
+        )),
+        Some(l) if !l.is_empty() => Ok(Some(normalize_language_tag(l))),
+        _ => Err(
+            "`language` is required when `enabled` is true (e.g. 'es', 'es-ES', 'pt-BR', \
+                  'sr-Latn')"
+                .to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::EngramoClient;
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_id() -> Uuid {
@@ -108,10 +181,116 @@ mod tests {
             .list_catalogs(Parameters(ListCatalogsParams {
                 limit: None,
                 cursor: None,
+                speaking_only: None,
             }))
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    fn tool_text(result: &rmcp::model::CallToolResult) -> &str {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_speaking_only_param_reaches_api() {
+        use rmcp::handler::server::wrapper::Parameters;
+        for (flag, expect_param) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let server = MockServer::start().await;
+            let mock = Mock::given(method("GET")).and(path("/catalogs"));
+            let mock = if expect_param {
+                mock.and(query_param("speakingOnly", "true"))
+            } else {
+                mock.and(query_param_is_missing("speakingOnly"))
+            };
+            mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [], "nextCursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+            let result = make_server(&server.uri())
+                .list_catalogs(Parameters(ListCatalogsParams {
+                    limit: None,
+                    cursor: None,
+                    speaking_only: flag,
+                }))
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false), "{flag:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_output_includes_speaking_settings_only_when_set() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": mock_id(), "name": "Shadow", "version": 1,
+                     "speakingSettings": {"language": "es-ES"}},
+                    {"id": mock_id(), "name": "Plain", "version": 1, "speakingSettings": {}}
+                ],
+                "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                limit: None,
+                cursor: None,
+                speaking_only: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert_eq!(v["data"][0]["speakingSettings"]["language"], "es-ES");
+        assert!(v["data"][1].get("speakingSettings").is_none(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_output_includes_speaking_settings_only_when_set() {
+        use rmcp::handler::server::wrapper::Parameters;
+        for (body, expected) in [
+            (
+                json!({"speakingSettings": {"language": "es-ES"}}),
+                Some("es-ES"),
+            ),
+            (json!({}), None),
+        ] {
+            let server = MockServer::start().await;
+            let mut catalog = json!({"id": mock_id(), "name": "Rust", "version": 1});
+            catalog
+                .as_object_mut()
+                .unwrap()
+                .extend(body.as_object().unwrap().clone());
+            Mock::given(method("GET"))
+                .and(path(format!("/catalogs/{}", mock_id())))
+                .respond_with(ResponseTemplate::new(200).set_body_json(catalog))
+                .mount(&server)
+                .await;
+
+            let result = make_server(&server.uri())
+                .get_catalog(Parameters(GetCatalogParams {
+                    catalog_id: mock_id().to_string(),
+                }))
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+            match expected {
+                Some(lang) => assert_eq!(v["speakingSettings"]["language"], lang),
+                None => assert!(v.get("speakingSettings").is_none(), "{v}"),
+            }
+        }
     }
 
     /// Regression test for issue #34: the tool output's `cursor` field must reflect the
@@ -133,6 +312,7 @@ mod tests {
             .list_catalogs(Parameters(ListCatalogsParams {
                 limit: None,
                 cursor: None,
+                speaking_only: None,
             }))
             .await
             .unwrap();
@@ -162,6 +342,7 @@ mod tests {
             .list_catalogs(Parameters(ListCatalogsParams {
                 limit: None,
                 cursor: None,
+                speaking_only: None,
             }))
             .await
             .unwrap();
@@ -312,6 +493,7 @@ mod tests {
             .list_catalogs(Parameters(ListCatalogsParams {
                 limit: None,
                 cursor: None,
+                speaking_only: None,
             }))
             .await
             .unwrap();
@@ -344,6 +526,7 @@ mod tests {
             .list_catalogs(Parameters(ListCatalogsParams {
                 limit: None,
                 cursor: Some("SECRET_CURSOR".to_string()),
+                speaking_only: None,
             }))
             .await
             .unwrap(); // must NOT be Err — MCP contract
@@ -357,5 +540,36 @@ mod tests {
         assert!(text.contains("Network error"), "{text}");
         assert!(!text.contains("SECRET_CURSOR"), "{text}");
         assert!(!text.contains(&uri), "{text}");
+    }
+
+    #[test]
+    fn test_normalize_language_tag() {
+        for (input, expected) in [
+            ("es_es", "es-ES"),
+            (" PT-br ", "pt-BR"),
+            ("sr-latn", "sr-Latn"),
+            ("SR_LATN", "sr-Latn"),
+            ("es", "es"),
+            ("ES", "es"),
+            ("spanish", "spanish"),
+            ("zh-hans-cn", "zh-hans-cn"),
+            ("es-é", "es-é"),
+            ("ésp-es", "ésp-ES"),
+        ] {
+            assert_eq!(normalize_language_tag(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_shadowing_target() {
+        assert_eq!(shadowing_target(false, None), Ok(None));
+        assert_eq!(shadowing_target(false, Some("es_es")), Ok(None));
+        assert_eq!(
+            shadowing_target(true, Some("es_es")),
+            Ok(Some("es-ES".to_string()))
+        );
+        for bad in [None, Some(""), Some("   ")] {
+            assert!(shadowing_target(true, bad).is_err(), "{bad:?}");
+        }
     }
 }

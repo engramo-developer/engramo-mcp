@@ -79,3 +79,14 @@ catalog, and I'll record myself saying each one after — just do the text and t
 
 The model follows the same recipe as `create_language_deck` from the tool descriptions alone, notes
 no image was attached yet, creates the deck, and is ready for audio via recipe #4/#5 afterward.
+
+## 7. Turn on shadowing (speaking practice) for a catalog
+
+```
+Turn on shadowing for my Spanish travel catalog.
+```
+
+The model finds the catalog with `list_catalogs` or `search_catalogs`, then calls `set_catalog_shadowing`
+with `enabled: true` and `language: "es-ES"` (the language of the card fronts). The catalog then shows up
+in the app's Shadowing tab. To see only those catalogs later, ask for "my shadowing catalogs"
+(`list_catalogs` with `speaking_only`).

@@ -50,6 +50,7 @@ pub struct GenerateCardParams {
     /// audio recording or image (their own voice, a self-generated file, a picture they gave
     /// you), call `upload_media` first and set `audioId`/`visualId` (+ `visualType`) to the
     /// returned `media_id`. Never fabricate a UUID for either field.
+    #[schemars(extend("type" = "object"))]
     pub face: CardContent,
 
     /// Back of the card (answer / explanation).
@@ -59,6 +60,7 @@ pub struct GenerateCardParams {
     /// Same rich-text rules as `face`: always set `text`; spans must match it exactly.
     /// For language-learning cards, translate `face.text` yourself and set `back.text` —
     /// do not leave it empty. Same `upload_media` rule as `face` for `audioId`/`visualId`.
+    #[schemars(extend("type" = "object"))]
     pub back: CardContent,
 }
 
