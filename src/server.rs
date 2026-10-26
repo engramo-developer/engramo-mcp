@@ -138,6 +138,7 @@ async fn apply_shadowing(
             description: None,
             tags: None,
             visibility: None,
+            image_id: None,
             version: current.version,
             speaking_settings: Some(SpeakingSettingsUpdate {
                 language: target.clone(),
@@ -282,12 +283,16 @@ impl EngramoMcpServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        description = "Update an existing catalog's name, description, tags, or visibility. Requires the current version for optimistic locking — fetch the catalog first to get the version. If you get a Conflict error, re-fetch and retry."
+        description = "Update an existing catalog in place: name, description, tags, visibility, or cover image (image_id, from upload_media). Requires the current version for optimistic locking — fetch the catalog first to get the version. If you get a Conflict error, re-fetch and retry. Change an existing catalog with this tool; never recreate it with generate_catalog_with_cards and delete the original, which loses learning progress, shares, and the catalog's id."
     )]
     pub async fn update_catalog(
         &self,
         Parameters(p): Parameters<UpdateCatalogParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let image_id = match p.image_id.as_deref().map(parse_uuid).transpose() {
+            Ok(image_id) => image_id,
+            Err(e) => return Ok(err_result(format!("Invalid image_id: {e}"))),
+        };
         Ok(match parse_uuid(&p.catalog_id) {
             Ok(id) => {
                 let req = UpdateCatalogRequest {
@@ -295,6 +300,7 @@ impl EngramoMcpServer {
                     description: p.description,
                     tags: p.tags,
                     visibility: p.visibility,
+                    image_id,
                     version: p.version,
                     speaking_settings: None,
                 };
@@ -1324,8 +1330,9 @@ impl EngramoMcpServer {
         ),
         description = "Upload a media file you already have — a user's own voice recording, a \
         self-generated audio clip, or an image — and get back a media_id. Use that id as \
-        `audio_id`/`visual_id` on a card's face/back, or as `image_id` for a catalog cover, via \
-        generate_card/generate_catalog_with_cards/generate_cards/update_card. This does NOT \
+        `audio_id`/`visual_id` on a card's face/back (generate_card/generate_cards/update_card), \
+        or as `image_id` for a catalog cover — update_catalog for an existing catalog, \
+        generate_catalog_with_cards for a new one. This does NOT \
         generate audio or images itself — EngrAmo has no server-side TTS/image generation in this \
         flow; the caller must already have the file. \
         Max ~10MB after decoding. \
@@ -1830,6 +1837,8 @@ impl EngramoMcpServer {
         ),
         description = "Create a new catalog together with all its flashcards in one atomic call. \
             More efficient than creating cards one by one. \
+            Only for NEW catalogs: to change an existing one (including its cover image_id) use \
+            update_catalog, and to add cards to it use generate_cards. \
             For language-learning cards: translate each face.text yourself and set back.text; \
             build a word-level dictionary (word → translation map) yourself and set face.dictionary on each card. \
             rich_text spans (IMPORTANT rules): \
@@ -4102,11 +4111,70 @@ mod tests {
                 description: None,
                 tags: None,
                 visibility: Some("unlisted".to_string()),
+                image_id: None,
                 version: 1,
             }))
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_update_catalog_sets_cover_image_on_wire_and_returns_it() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const IMAGE_ID: &str = "00000000-0000-0000-0000-0000000000aa";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .and(body_partial_json(
+                serde_json::json!({"imageId": IMAGE_ID, "version": 1}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "X", "version": 2, "imageId": IMAGE_ID
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .update_catalog(Parameters(UpdateCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+                name: None,
+                description: None,
+                tags: None,
+                visibility: None,
+                image_id: Some(IMAGE_ID.to_string()),
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.contains(IMAGE_ID), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_update_catalog_invalid_image_id_makes_no_request() {
+        let mock_server = wiremock::MockServer::start().await;
+        let server = mock_server_for(&mock_server.uri());
+        let result = server
+            .update_catalog(Parameters(UpdateCatalogParams {
+                catalog_id: TEST_ID.to_string(),
+                name: None,
+                description: None,
+                tags: None,
+                visibility: None,
+                image_id: Some("not-a-uuid".to_string()),
+                version: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.starts_with("Invalid image_id:"), "{text}");
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4167,6 +4235,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            image_id: None,
             version: 1,
         };
         let result = server
@@ -4207,6 +4276,7 @@ mod tests {
                 description: None,
                 tags: None,
                 visibility: Some("public".to_string()),
+                image_id: None,
                 version: 1,
             }))
             .await
@@ -4699,6 +4769,7 @@ mod tests {
                 description: None,
                 tags: None,
                 visibility: None,
+                image_id: None,
                 version: 1,
             }))
             .await
@@ -5206,6 +5277,7 @@ mod tests {
                             description: None,
                             tags: None,
                             visibility: None,
+                            image_id: None,
                             version: 1,
                         }))
                         .await

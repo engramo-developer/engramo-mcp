@@ -109,7 +109,7 @@ pub enum ApiError {
     )]
     Internal,
 
-    #[error("Network error: {0}")]
+    #[error("{}", network_message(.0))]
     Network(reqwest::Error),
 
     /// A 2xx response body that doesn't match the DTO we expect (e.g. a missing/renamed
@@ -136,6 +136,21 @@ pub enum ApiError {
     /// blame; the upstream was slow.
     #[error("The Engramo API did not finish responding in time ({0}). Please try again later.")]
     Timeout(&'static str),
+}
+
+/// `ApiError::Network`'s message. Spells out the next step: a bare "error sending request"
+/// leaves the calling LLM guessing whether to retry or work around the call.
+fn network_message(e: &reqwest::Error) -> String {
+    const VERIFY: &str = " If this call creates or changes data, first check (list/get) whether it \
+        already took effect, so a retry doesn't create a duplicate.";
+    if e.is_timeout() {
+        format!(
+            "Network error: the Engramo API did not respond in time. Retry this call once; if it \
+            times out again, continue with other tools and come back to it later.{VERIFY}"
+        )
+    } else {
+        format!("Network error: {e}. This is usually transient — retry this call once.{VERIFY}")
+    }
 }
 
 /// Upper bound on a non-2xx response body read into memory; only a short message is ever
@@ -643,6 +658,44 @@ mod tests {
             e.to_string(),
             "Unexpected response from the Engramo API (missing field `total`)."
         );
+    }
+
+    #[tokio::test]
+    async fn test_network_timeout_display_tells_caller_what_to_do() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let reqwest_err = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap_err();
+        let msg = ApiError::Network(reqwest_err).to_string();
+        assert!(msg.contains("did not respond in time"), "{msg}");
+        assert!(msg.contains("Retry this call once"), "{msg}");
+        assert!(msg.contains("first check (list/get)"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_network_connect_error_display_suggests_single_retry() {
+        let reqwest_err = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!reqwest_err.is_timeout());
+        let msg = ApiError::Network(reqwest_err).to_string();
+        assert!(msg.starts_with("Network error: "), "{msg}");
+        assert!(msg.contains("retry this call once"), "{msg}");
+        assert!(msg.contains("first check (list/get)"), "{msg}");
+        assert!(!msg.contains("did not respond in time"), "{msg}");
     }
 
     #[test]

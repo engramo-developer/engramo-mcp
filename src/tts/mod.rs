@@ -314,10 +314,43 @@ pub enum TtsError {
     #[error("{summary}")]
     AllKeysExhausted { summary: String, all_rejected: bool },
 
+    /// Every configured key answered 429. Split out of [`Self::AllKeysExhausted`] because the
+    /// caller's next step differs: wait `retry_after` (per-minute limit) or stop for the day
+    /// (`daily`: every key's per-day quota is used up). `retry_after` is the shortest delay any
+    /// per-minute-limited key reported, when Gemini sent one.
+    #[error("{}", rate_limited_message(*retry_after, *daily))]
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+        daily: bool,
+    },
+
     /// The request itself is invalid before any network call was made (unknown voice, bad
     /// language code, empty text, ...).
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+}
+
+/// Wait suggested after a per-minute 429 when Gemini didn't say how long to wait.
+pub const DEFAULT_RATE_LIMIT_WAIT_SECS: u64 = 60;
+
+/// Whole seconds to tell the caller to wait: Gemini's hint (at least 1s), else the default.
+pub fn suggested_wait_secs(retry_after: Option<std::time::Duration>) -> u64 {
+    retry_after.map_or(DEFAULT_RATE_LIMIT_WAIT_SECS, |d| d.as_secs().max(1))
+}
+
+fn rate_limited_message(retry_after: Option<std::time::Duration>, daily: bool) -> String {
+    if daily {
+        "Gemini TTS daily quota is used up on every configured key \
+        (ENGRAMO_TTS_GEMINI_API_KEYS). Don't retry today: the quota resets at midnight Pacific \
+        time, or add another key."
+            .to_string()
+    } else {
+        let secs = suggested_wait_secs(retry_after);
+        format!(
+            "Gemini TTS per-minute rate limit hit on every configured key. Wait about {secs}s \
+            before retrying."
+        )
+    }
 }
 
 /// A local text-to-speech engine. Implementations own their own key rotation, request
@@ -349,6 +382,15 @@ pub trait TtsEngine: Send + Sync {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_rate_limited_message_clamps_subsecond_wait_to_one_second() {
+        let e = TtsError::RateLimited {
+            retry_after: Some(std::time::Duration::from_millis(300)),
+            daily: false,
+        };
+        assert!(e.to_string().contains("about 1s"), "{e}");
+    }
 
     /// Builds a `from_lookup`-compatible closure over a fixed map — no process env
     /// mutation anywhere in this module's tests (rollout plan R8).

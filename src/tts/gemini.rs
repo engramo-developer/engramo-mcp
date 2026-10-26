@@ -107,6 +107,8 @@ pub const VOICES: &[Voice] = &[
 enum CallError {
     RateLimited {
         retry_after: Option<Duration>,
+        /// The 429 named a per-day quota, so waiting a minute won't help.
+        daily: bool,
     },
     Transient(String),
     KeyRejected(String),
@@ -122,7 +124,7 @@ enum CallError {
 impl CallError {
     /// Short, key-value-free label used to build the per-position summary in
     /// [`TtsError::AllKeysExhausted`] (e.g. "key #1: rate limited; key #2: rejected"). Never
-    /// includes `detail`/`retry_after` — those are for tracing only, so a future refactor of
+    /// includes `detail`/`retry_after` — those stay out of the key summary, so a future refactor of
     /// the public summary text can't accidentally widen it with upstream detail.
     fn label(&self) -> &'static str {
         match self {
@@ -142,10 +144,11 @@ impl CallError {
         }
     }
 
-    /// Parsed `Retry-After`/`retryDelay`, for tracing only — rotation never sleeps on it.
+    /// Parsed `Retry-After`/`retryDelay`. Rotation never sleeps on it; it feeds
+    /// `TtsError::RateLimited` (the shortest per-minute wait across keys).
     fn retry_after(&self) -> Option<Duration> {
         match self {
-            CallError::RateLimited { retry_after } => *retry_after,
+            CallError::RateLimited { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -378,7 +381,8 @@ impl GeminiTts {
                 .unwrap_or_default();
             let body_text = String::from_utf8_lossy(&body_bytes);
             let retry_after = retry_after.or_else(|| parse_retry_delay(&body_text));
-            return Err(CallError::RateLimited { retry_after });
+            let daily = is_daily_quota(&body_text);
+            return Err(CallError::RateLimited { retry_after, daily });
         }
         if matches!(status.as_u16(), 500 | 502 | 503 | 504) {
             return Err(CallError::Transient(format!("HTTP {status}")));
@@ -537,6 +541,14 @@ impl GeminiTts {
         }
 
         outcomes.sort_by_key(|(idx, _)| *idx);
+
+        if let Some(err) = all_rate_limited(&outcomes) {
+            info!(
+                keys_tried = outcomes.len(),
+                "every Gemini key is rate limited"
+            );
+            return Err(err);
+        }
 
         let all_rejected = outcomes
             .iter()
@@ -799,6 +811,53 @@ fn is_model_generated_text(body: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// [`TtsError::RateLimited`] when every key's outcome was a 429, else `None`. `daily` only when
+/// every key hit a per-day quota; `retry_after` is the shortest wait among the per-minute ones.
+fn all_rate_limited(outcomes: &[(usize, CallError)]) -> Option<TtsError> {
+    if outcomes.is_empty() {
+        return None;
+    }
+    let mut daily = true;
+    let mut retry_after: Option<Duration> = None;
+    for (_, outcome) in outcomes {
+        let CallError::RateLimited {
+            retry_after: key_wait,
+            daily: key_daily,
+        } = outcome
+        else {
+            return None;
+        };
+        if !key_daily {
+            daily = false;
+            if let Some(wait) = key_wait {
+                retry_after = Some(retry_after.map_or(*wait, |cur| cur.min(*wait)));
+            }
+        }
+    }
+    Some(TtsError::RateLimited { retry_after, daily })
+}
+
+/// Whether a Gemini 429 body names a per-day quota (a `QuotaFailure` violation whose
+/// `quotaId` is e.g. `GenerateRequestsPerDayPerProjectPerModel-FreeTier`).
+fn is_daily_quota(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(details) = value
+        .get("error")
+        .and_then(|e| e.get("details"))
+        .and_then(|d| d.as_array())
+    else {
+        return false;
+    };
+    details
+        .iter()
+        .filter_map(|d| d.get("violations").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|v| v.get("quotaId").and_then(|q| q.as_str()))
+        .any(|id| id.contains("PerDay"))
+}
+
 /// Parses the server `retryDelay` field out of a Gemini 429 error body. Expects a Google API
 /// `RetryInfo` detail with a duration string like `"12s"`.
 fn parse_retry_delay(body: &str) -> Option<Duration> {
@@ -806,9 +865,16 @@ fn parse_retry_delay(body: &str) -> Option<Duration> {
     let details = value.get("error")?.get("details")?.as_array()?;
     for detail in details {
         if let Some(delay) = detail.get("retryDelay").and_then(|v| v.as_str()) {
-            let digits: String = delay.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(secs) = digits.parse::<u64>() {
-                return Some(Duration::from_secs(secs));
+            let num: String = delay
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(secs) = num.parse::<f64>()
+                && secs.is_finite()
+                && secs >= 0.0
+            {
+                // Round up: the value is shown to the model as a wait, so never undershoot.
+                return Some(Duration::from_secs(secs.ceil() as u64));
             }
         }
     }
@@ -832,6 +898,56 @@ mod tests {
                 .collect(),
         )
         .with_api_base_for_tests(server.uri())
+    }
+
+    #[tokio::test]
+    async fn test_every_key_rate_limited_uses_retry_after_header_over_body_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_json(rate_limit_body(
+                        "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                        "41s",
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let client = make_client(&server, vec!["keyA"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TtsError::RateLimited { retry_after: Some(d), daily: false } if d == Duration::from_secs(7)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("about 7s"), "{err}");
+    }
+
+    #[test]
+    fn test_is_daily_quota_false_for_non_json_and_violation_free_bodies() {
+        assert!(!is_daily_quota("Too Many Requests"));
+        assert!(!is_daily_quota(
+            r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"5s"}]}}"#
+        ));
+        assert!(is_daily_quota(
+            &rate_limit_body("GenerateRequestsPerDayPerProjectPerModel-FreeTier", "1s").to_string()
+        ));
+    }
+
+    #[test]
+    fn test_parse_retry_delay_rounds_fractional_seconds_up() {
+        let body = |d: &str| rate_limit_body("x", d).to_string();
+        assert_eq!(
+            parse_retry_delay(&body("12.5s")),
+            Some(Duration::from_secs(13))
+        );
+        assert_eq!(
+            parse_retry_delay(&body("12s")),
+            Some(Duration::from_secs(12))
+        );
     }
 
     fn req<'a>(text: &'a str, voice: &'a str, lang: Option<&'a str>) -> TtsRequest<'a> {
@@ -1908,6 +2024,115 @@ mod tests {
         assert!(msg.contains("[REDACTED]"), "{msg}");
     }
 
+    fn rate_limit_body(quota_id: &str, retry_delay: &str) -> serde_json::Value {
+        json!({"error": {"code": 429, "details": [
+            {"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+             "violations": [{"quotaId": quota_id}]},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay}
+        ]}})
+    }
+
+    #[tokio::test]
+    async fn test_every_key_per_minute_limited_returns_rate_limited_with_shortest_wait() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-goog-api-key", "keyA"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(rate_limit_body(
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "41s",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("x-goog-api-key", "keyB"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(rate_limit_body(
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "12s",
+            )))
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["keyA", "keyB"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        match &err {
+            TtsError::RateLimited { retry_after, daily } => {
+                assert_eq!(*retry_after, Some(Duration::from_secs(12)));
+                assert!(!daily);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("about 12s"), "{msg}");
+        assert!(!msg.contains("keyA") && !msg.contains("keyB"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_every_key_daily_quota_returns_daily_rate_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(rate_limit_body(
+                "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "3600s",
+            )))
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["keyA"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TtsError::RateLimited {
+                    daily: true,
+                    retry_after: None
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("daily quota"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_one_daily_and_one_per_minute_key_is_not_daily() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-goog-api-key", "keyA"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(rate_limit_body(
+                "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "3600s",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("x-goog-api-key", "keyB"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": {}})))
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server, vec!["keyA", "keyB"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TtsError::RateLimited {
+                    daily: false,
+                    retry_after: None
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("about 60s"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_no_keys_configured_returns_all_keys_exhausted() {
         let server = MockServer::start().await;
@@ -2175,7 +2400,8 @@ mod tests {
             "error": {"details": [{"retryDelay": "1.5s"}]}
         })
         .to_string();
-        assert_eq!(parse_retry_delay(&body), Some(Duration::from_secs(1)));
+        // Fractions round up so the caller is never told to wait too little.
+        assert_eq!(parse_retry_delay(&body), Some(Duration::from_secs(2)));
     }
 
     // --- voice catalog ---
