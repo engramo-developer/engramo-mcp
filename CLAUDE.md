@@ -34,7 +34,7 @@ src/
 │                       `with_tts()` separately sums in the local-TTS router (see `tts/` below)
 ├── tools/
 │   ├── mod.rs
-│   ├── catalogs.rs  — ListCatalogsParams, GetCatalogParams, … + ok_json/err_result helpers
+│   ├── catalogs.rs  — ListCatalogsParams, GetCatalogParams, SetCatalogShadowingParams, … + ok_json/err_result helpers
 │   ├── cards.rs     — ListCardsParams, GetCardParams, UpdateCardParams, DeleteCardParams
 │   ├── learning.rs  — DueCardsParams, AddCardToLearningParams, AddCatalogToLearningParams
 │   ├── learning_paths.rs — ListLearningPathsParams, GetLearningPathParams, …

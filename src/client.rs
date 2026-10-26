@@ -304,8 +304,12 @@ impl EngramoClient {
         &self,
         limit: Option<i64>,
         cursor: Option<&str>,
+        speaking_only: bool,
     ) -> Result<PagedResponse<CatalogDto>, ApiError> {
-        let params = page_params(limit, cursor)?;
+        let mut params = page_params(limit, cursor)?;
+        if speaking_only {
+            params.push(("speakingOnly", "true".to_string()));
+        }
         self.get_with_query("/catalogs", &params).await
     }
 
@@ -666,7 +670,7 @@ mod tests {
     use super::*;
     use crate::dto::SearchItemType;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_id() -> Uuid {
@@ -711,12 +715,50 @@ mod tests {
             .await;
 
         let result = client(&server.uri())
-            .list_catalogs(None, None)
+            .list_catalogs(None, None, false)
             .await
             .unwrap();
         assert_eq!(result.data.len(), 1);
         assert_eq!(result.data[0].name, "Rust");
         assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_speaking_only_sends_query_param() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param("speakingOnly", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [], "nextCursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server.uri())
+            .list_catalogs(None, None, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_without_speaking_only_omits_query_param() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param_is_missing("speakingOnly"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [], "nextCursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server.uri())
+            .list_catalogs(None, None, false)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -734,7 +776,7 @@ mod tests {
             .await;
 
         let result = client(&server.uri())
-            .list_catalogs(Some(10), Some("abc"))
+            .list_catalogs(Some(10), Some("abc"), false)
             .await
             .unwrap();
         assert!(result.data.is_empty());
@@ -757,7 +799,7 @@ mod tests {
             .await;
 
         let result = client(&server.uri())
-            .list_catalogs(None, None)
+            .list_catalogs(None, None, false)
             .await
             .unwrap();
         assert_eq!(result.cursor, Some("abc".to_string()));
@@ -802,7 +844,7 @@ mod tests {
             .await;
 
         let err = client(&server.uri())
-            .list_catalogs(None, None)
+            .list_catalogs(None, None, false)
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::Unauthorized));
@@ -895,6 +937,7 @@ mod tests {
             tags: None,
             visibility: None,
             version: 1,
+            speaking_settings: None,
         };
         let err = client(&server.uri())
             .update_catalog(mock_id(), &req)
@@ -2367,7 +2410,7 @@ mod tests {
             .await;
 
         let err = client(&primary.uri())
-            .list_catalogs(None, None)
+            .list_catalogs(None, None, false)
             .await
             .unwrap_err();
         match err {
@@ -2430,7 +2473,7 @@ mod tests {
 
         let long = "a".repeat(MAX_QUERY_PARAM_LEN + 1);
         let err = client(&server.uri())
-            .list_catalogs(None, Some(&long))
+            .list_catalogs(None, Some(&long), false)
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
@@ -2448,7 +2491,7 @@ mod tests {
             .await;
 
         let err = client(&server.uri())
-            .list_catalogs(None, None)
+            .list_catalogs(None, None, false)
             .await
             .unwrap_err();
         assert!(
@@ -2490,7 +2533,10 @@ mod tests {
         resp.extend_from_slice(b"0\r\n\r\n");
         let uri = spawn_raw(resp).await;
 
-        let err = client(&uri).list_catalogs(None, None).await.unwrap_err();
+        let err = client(&uri)
+            .list_catalogs(None, None, false)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ApiError::ResponseTooLarge(MAX_RESPONSE_BYTES)),
             "{err:?}"
@@ -2504,7 +2550,10 @@ mod tests {
         resp.extend_from_slice(b"5\r\n{\"dat");
         let uri = spawn_raw(resp).await;
 
-        let err = client(&uri).list_catalogs(None, None).await.unwrap_err();
+        let err = client(&uri)
+            .list_catalogs(None, None, false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApiError::Network(_)), "{err:?}");
     }
 
@@ -2535,7 +2584,7 @@ mod tests {
             .await;
 
         let err = client(&server.uri())
-            .list_catalogs(None, None)
+            .list_catalogs(None, None, false)
             .await
             .unwrap_err();
         match err {

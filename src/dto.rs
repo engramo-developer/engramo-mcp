@@ -56,6 +56,40 @@ pub struct CatalogDto {
     pub card_count: Option<i64>,
     pub visibility: Option<String>,
     pub version: i32,
+    /// Shadowing settings. Absent on the wire (and `None` here) for older payloads; omitted from
+    /// the tool output unless a language is set, so non-shadowing catalogs don't grow.
+    #[serde(
+        rename = "speakingSettings",
+        default,
+        skip_serializing_if = "speaking_settings_is_empty"
+    )]
+    pub speaking_settings: Option<SpeakingSettings>,
+}
+
+/// Shadowing settings of a catalog as returned by the API. `{}` and a missing key both mean
+/// shadowing is off.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct SpeakingSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+impl SpeakingSettings {
+    pub fn is_empty(&self) -> bool {
+        self.language.is_none()
+    }
+}
+
+fn speaking_settings_is_empty(s: &Option<SpeakingSettings>) -> bool {
+    s.as_ref().is_none_or(SpeakingSettings::is_empty)
+}
+
+/// Request-side shadowing settings. `language: None` serializes as `null`, which turns
+/// shadowing off, so the field is deliberately not skipped.
+#[derive(Debug, Serialize)]
+pub struct SpeakingSettingsUpdate {
+    pub language: Option<String>,
 }
 
 /// Minimal catalog for MCP resources (context injection).
@@ -99,6 +133,8 @@ pub struct UpdateCatalogRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
     pub version: i32,
+    #[serde(rename = "speakingSettings", skip_serializing_if = "Option::is_none")]
+    pub speaking_settings: Option<SpeakingSettingsUpdate>,
 }
 
 // ── Card Content ──────────────────────────────────────────────────────────────
@@ -691,6 +727,7 @@ mod tests {
             card_count: Some(42),
             visibility: Some("private".to_string()),
             version: 1,
+            speaking_settings: None,
         };
         let summary: CatalogSummary = dto.into();
         assert_eq!(summary.name, "Rust");
@@ -1281,5 +1318,105 @@ mod tests {
         let params_schema = schemars::schema_for!(crate::tools::generate::GenerateCardParams);
         let params_s = serde_json::to_string(&params_schema).unwrap();
         assert!(params_s.contains("CJK ideographs"), "{params_s}");
+    }
+
+    fn catalog_json(extra: serde_json::Value) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "Rust",
+            "version": 1
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        v
+    }
+
+    #[test]
+    fn test_catalog_dto_deserializes_speaking_settings_language() {
+        let dto: CatalogDto = serde_json::from_value(catalog_json(
+            serde_json::json!({"speakingSettings": {"language": "es-ES"}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            dto.speaking_settings.unwrap().language.as_deref(),
+            Some("es-ES")
+        );
+    }
+
+    #[test]
+    fn test_catalog_dto_deserializes_empty_speaking_settings() {
+        let dto: CatalogDto =
+            serde_json::from_value(catalog_json(serde_json::json!({"speakingSettings": {}})))
+                .unwrap();
+        assert!(dto.speaking_settings.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_catalog_dto_deserializes_without_speaking_settings() {
+        let dto: CatalogDto = serde_json::from_value(catalog_json(serde_json::json!({}))).unwrap();
+        assert!(dto.speaking_settings.is_none());
+    }
+
+    #[test]
+    fn test_catalog_dto_serialization_omits_empty_speaking_settings() {
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"speakingSettings": {}}),
+            serde_json::json!({"speakingSettings": null}),
+        ] {
+            let dto: CatalogDto = serde_json::from_value(catalog_json(extra)).unwrap();
+            let out = serde_json::to_value(&dto).unwrap();
+            assert!(out.get("speakingSettings").is_none(), "{out}");
+        }
+    }
+
+    #[test]
+    fn test_catalog_dto_serialization_includes_speaking_settings_language() {
+        let dto: CatalogDto = serde_json::from_value(catalog_json(
+            serde_json::json!({"speakingSettings": {"language": "es-ES"}}),
+        ))
+        .unwrap();
+        let out = serde_json::to_string(&dto).unwrap();
+        assert!(
+            out.contains(r#""speakingSettings":{"language":"es-ES"}"#),
+            "{out}"
+        );
+    }
+
+    fn update_req(s: Option<SpeakingSettingsUpdate>) -> serde_json::Value {
+        serde_json::to_value(UpdateCatalogRequest {
+            name: None,
+            description: None,
+            tags: None,
+            visibility: None,
+            version: 3,
+            speaking_settings: s,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_update_catalog_request_omits_speaking_settings_when_none() {
+        assert!(update_req(None).get("speakingSettings").is_none());
+    }
+
+    #[test]
+    fn test_update_catalog_request_serializes_null_language_to_turn_off() {
+        let v = update_req(Some(SpeakingSettingsUpdate { language: None }));
+        let ss = v.get("speakingSettings").expect("key present");
+        assert!(ss.as_object().unwrap().contains_key("language"));
+        assert!(ss["language"].is_null());
+    }
+
+    #[test]
+    fn test_update_catalog_request_serializes_language() {
+        let v = update_req(Some(SpeakingSettingsUpdate {
+            language: Some("es-ES".to_string()),
+        }));
+        assert_eq!(
+            v["speakingSettings"],
+            serde_json::json!({"language": "es-ES"})
+        );
     }
 }

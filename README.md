@@ -485,9 +485,10 @@ storage quotas, and needs no paid EngrAmo plan.
 ### Catalogs
 | Tool | Description |
 |---|---|
-| `list_catalogs` | List all flashcard catalogs |
+| `list_catalogs` | List all flashcard catalogs; `speaking_only` limits it to catalogs with shadowing on |
 | `get_catalog` | Get a single catalog by ID |
 | `update_catalog` | Update a catalog's name or description |
+| `set_catalog_shadowing` | Turn shadowing (speaking practice) on or off for a catalog, or change its language |
 | `delete_catalog` | Delete a catalog |
 
 ### Cards

@@ -295,7 +295,7 @@ where
 async fn read_catalogs(client: &EngramoClient) -> Result<String, ApiError> {
     let summaries: Vec<CatalogSummary> = collect_pages(|c| async move {
         client
-            .list_catalogs(Some(MAX_PAGE_LIMIT), c.as_deref())
+            .list_catalogs(Some(MAX_PAGE_LIMIT), c.as_deref(), false)
             .await
     })
     .await?;
@@ -443,6 +443,35 @@ mod tests {
         let params = ReadResourceRequestParams::new("engramo://unknown");
         let err = read(&client, params).await.unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_read_catalogs_does_not_filter_by_speaking_only() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param_is_missing("speakingOnly"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "00000000-0000-0000-0000-000000000001", "name": "Rust", "version": 1}],
+                "nextCursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
+            .await
+            .unwrap();
+        if let ResourceContents::TextResourceContents { text, .. } = &result.contents[0] {
+            assert!(text.contains("Rust"), "{text}");
+        } else {
+            panic!("expected text resource contents");
+        }
     }
 
     #[tokio::test]
