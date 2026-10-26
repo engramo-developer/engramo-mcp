@@ -4472,10 +4472,8 @@ mod tests {
             }
             assert_eq!(count_requests(&mock_server, "PATCH").await, 0, "{status}");
         }
-        let dead = wiremock::MockServer::start().await;
-        let uri = dead.uri();
-        drop(dead);
-        let result = mock_server_for(&uri)
+        // Not a dropped MockServer: wiremock pools those and hands them to parallel tests.
+        let result = mock_server_for("http://127.0.0.1:1")
             .set_catalog_shadowing(Parameters(shadowing_params(TEST_ID, true, Some("es"))))
             .await
             .unwrap();
