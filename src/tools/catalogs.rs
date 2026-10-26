@@ -169,16 +169,24 @@ pub(crate) fn parse_user_ids(raw: &[String]) -> Result<Vec<Uuid>, String> {
 /// other error passes through unchanged.
 pub(crate) fn share_write_error(e: ApiError) -> ApiError {
     match e {
-        ApiError::PermissionDenied(_) => ApiError::PermissionDenied(
-            "only the catalog's owner can share it or change who has access (editors and viewers can't)."
-                .to_string(),
-        ),
+        // Only the generic 403 (see `forbidden_hint`) is rewritten; a specific backend message
+        // passes through unchanged.
+        ApiError::PermissionDenied(msg) if crate::error::is_generic_forbidden(&msg) => {
+            ApiError::PermissionDenied(
+                "only the catalog's owner can share it or change who has access (editors and viewers can't); \
+                 also check the catalog id: the catalog may not exist or may belong to another user."
+                    .to_string(),
+            )
+        }
         ApiError::NotFound(msg) => {
-            // Only rewrite the "unknown user" 404, recognised by a UUID right after "user ";
-            // any other 404 (e.g. catalog not found) passes through unchanged.
-            let id = msg
-                .split_once("user ")
-                .and_then(|(_, rest)| rest.split_whitespace().next())
+            // Only rewrite the "unknown user" 404, whose message is exactly `[Not found: ]user
+            // <uuid>`; any other 404 (e.g. catalog not found) passes through unchanged.
+            let trimmed = msg.trim();
+            let id = trimmed
+                .strip_prefix("Not found: ")
+                .unwrap_or(trimmed)
+                .strip_prefix("user ")
+                .and_then(|rest| rest.split_whitespace().next())
                 .map(|t| t.trim_end_matches(|c: char| !c.is_ascii_hexdigit()))
                 .and_then(|t| Uuid::parse_str(t).ok());
             match id {
@@ -196,9 +204,12 @@ pub(crate) fn share_write_error(e: ApiError) -> ApiError {
 /// through unchanged.
 pub(crate) fn share_read_error(e: ApiError) -> ApiError {
     match e {
-        ApiError::PermissionDenied(_) => ApiError::PermissionDenied(
-            "only the catalog's owner or its editors can see who it is shared with.".to_string(),
-        ),
+        ApiError::PermissionDenied(msg) if crate::error::is_generic_forbidden(&msg) => {
+            ApiError::PermissionDenied(
+                "only the catalog's owner or its editors can see who it is shared with; also check the catalog id: the catalog may not exist or may belong to another user."
+                    .to_string(),
+            )
+        }
         other => other,
     }
 }
@@ -977,7 +988,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.is_error, Some(false), "{r:?}");
         let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
-        assert_eq!(v["removed"], json!([U1, U2]));
+        assert_eq!(v["requestedRemoval"], json!([U1, U2]));
         assert_eq!(v["collaborators"], json!([]));
     }
 
@@ -1052,7 +1063,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.is_error, Some(false), "{r:?}");
         let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
-        assert_eq!(v["removed"], json!([U1]));
+        assert_eq!(v["requestedRemoval"], json!([U1]));
         assert!(v["note"].as_str().unwrap().contains("could not be fetched"));
         assert!(v.get("collaborators").is_none());
     }
@@ -1127,6 +1138,7 @@ mod tests {
             "Not found: user ",
             "Catalog X not found",
             "catalog not found for user bob",
+            "Catalog 22222222-2222-2222-2222-222222222222 not found for user 11111111-1111-1111-1111-111111111111",
         ] {
             assert!(
                 matches!(share_write_error(ApiError::NotFound(msg.into())), ApiError::NotFound(m) if m == msg),
@@ -1141,18 +1153,129 @@ mod tests {
             share_write_error(ApiError::Internal),
             ApiError::Internal
         ));
-        match share_write_error(ApiError::PermissionDenied("anything".into())) {
-            ApiError::PermissionDenied(m) => assert!(m.contains("only the catalog's owner")),
+        match share_write_error(ApiError::PermissionDenied(
+            crate::error::GENERIC_FORBIDDEN.into(),
+        )) {
+            ApiError::PermissionDenied(m) => {
+                assert!(m.contains("only the catalog's owner") && m.contains("catalog id"))
+            }
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            share_read_error(ApiError::PermissionDenied("x".into())),
+            share_write_error(ApiError::PermissionDenied("not allowed: plan".into())),
+            ApiError::PermissionDenied(m) if m == "not allowed: plan"
+        ));
+        assert!(matches!(
+            share_read_error(ApiError::PermissionDenied("not allowed: plan".into())),
+            ApiError::PermissionDenied(m) if m == "not allowed: plan"
+        ));
+        assert!(matches!(
+            share_read_error(ApiError::PermissionDenied(crate::error::GENERIC_FORBIDDEN.into())),
             ApiError::PermissionDenied(m) if m.contains("owner or its editors")
         ));
         assert!(matches!(
             share_read_error(ApiError::Internal),
             ApiError::Internal
         ));
+    }
+
+    #[test]
+    fn test_share_write_error_user_prefix_with_non_uuid_passes_through() {
+        for msg in [
+            "Not found: user bob",
+            "user bob@example.com",
+            "Not found: user 1234-not-a-uuid.",
+        ] {
+            assert!(
+                matches!(share_write_error(ApiError::NotFound(msg.into())), ApiError::NotFound(m) if m == msg),
+                "{msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_share_catalog_feature_not_entitled_passes_through() {
+        let server = MockServer::start().await;
+        mount_collab_post(
+            &server,
+            None,
+            403,
+            json!({"error":"Forbidden","code":"FEATURE_NOT_ENTITLED","feature":"catalog_share","plan_id":"free"}),
+        )
+        .await;
+        let r = make_server(&server.uri())
+            .share_catalog(Parameters(share_params(&[U1], None)))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let t = tool_text(&r);
+        assert!(t.contains("Catalog sharing"), "{t}");
+        assert!(t.ends_with(crate::error::PLAN_CHANGE_HINT), "{t}");
+        assert!(!t.contains("only the catalog's owner"), "{t}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_share_errors_do_not_rewrite_feature_not_entitled() {
+        let f = || ApiError::FeatureNotEntitled {
+            feature: "catalog_share".into(),
+            plan_id: Some("free".into()),
+        };
+        assert!(matches!(
+            share_write_error(f()),
+            ApiError::FeatureNotEntitled { .. }
+        ));
+        assert!(matches!(
+            share_read_error(f()),
+            ApiError::FeatureNotEntitled { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_share_and_unshare_network_failure_is_error_result() {
+        // Port 1 has no listener; a dropped MockServer's port could be reused by a parallel test.
+        let s = make_server("http://127.0.0.1:1");
+        let r = s
+            .share_catalog(Parameters(share_params(&[U1], None)))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        let r = s
+            .unshare_catalog(Parameters(UnshareCatalogParams {
+                catalog_id: CAT.into(),
+                user_ids: strs(&[U1]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+    }
+
+    #[test]
+    fn test_parse_user_ids_cap_applies_after_dedupe() {
+        let mut raw: Vec<String> = (1..=100u128)
+            .map(|i| Uuid::from_u128(i).to_string())
+            .collect();
+        raw.extend((1..=50u128).map(|i| Uuid::from_u128(i).to_string()));
+        let ids = parse_user_ids(&raw).unwrap();
+        assert_eq!(ids.len(), MAX_SHARE_USER_IDS);
+        assert_eq!(ids[0], Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn test_share_write_error_unknown_user_with_trailing_punctuation() {
+        for msg in [
+            format!("Not found: user {U2}."),
+            format!("Not found: user {U2}, aborting"),
+            format!("user {U2}"),
+        ] {
+            match share_write_error(ApiError::NotFound(msg.clone())) {
+                ApiError::NotFound(m) => assert!(
+                    m.contains("no EngrAmo user has id") && m.contains(U2),
+                    "{msg} -> {m}"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

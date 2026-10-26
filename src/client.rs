@@ -221,6 +221,25 @@ impl EngramoClient {
         self.deserialize(resp).await
     }
 
+    async fn post_json_void<B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .post(self.url(path))
+            .header("X-Api-Key", &self.api_token)
+            .json(body)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(ApiError::from_response(resp).await)
+        }
+    }
+
     async fn post_void(&self, path: &str) -> Result<(), ApiError> {
         let resp = self
             .http
@@ -347,18 +366,8 @@ impl EngramoClient {
     ) -> Result<(), ApiError> {
         // Only the status matters: the share is committed once the API says success, so an
         // empty or non-JSON body must not turn it into an error.
-        let resp = self
-            .http
-            .post(self.url(&format!("/catalogs/{catalog_id}/collaborators")))
-            .header("X-Api-Key", &self.api_token)
-            .json(req)
-            .send()
-            .await?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(ApiError::from_response(resp).await)
-        }
+        self.post_json_void(&format!("/catalogs/{catalog_id}/collaborators"), req)
+            .await
     }
 
     pub async fn get_catalog(&self, catalog_id: Uuid) -> Result<CatalogDto, ApiError> {
@@ -2936,5 +2945,26 @@ mod tests {
         );
         assert!(page_params(None, None).unwrap().is_empty());
         assert!(page_params(None, Some(&format!("{exact}a"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_collaborators_accepts_empty_and_non_json_success_bodies() {
+        for resp in [
+            ResponseTemplate::new(204),
+            ResponseTemplate::new(200).set_body_string(""),
+            ResponseTemplate::new(200).set_body_string("ok"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/catalogs/{}/collaborators", mock_id())))
+                .respond_with(resp)
+                .expect(1)
+                .mount(&server)
+                .await;
+            client(&server.uri())
+                .update_collaborators(mock_id(), &ShareCatalogRequest { changes: vec![] })
+                .await
+                .expect("2xx with empty/non-JSON body must be Ok");
+        }
     }
 }

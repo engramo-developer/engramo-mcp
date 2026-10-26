@@ -523,12 +523,19 @@ fn dedup_or_raw(label: &str, raw: String) -> String {
 fn forbidden_hint(msg: String) -> String {
     let bare = msg.trim();
     if bare.is_empty() || bare.eq_ignore_ascii_case("forbidden") {
-        "Forbidden (the resource may not exist, may belong to another user, or the action — \
-         e.g. setting catalog visibility to 'public'/'unlisted' — may require a higher role)"
-            .to_string()
+        GENERIC_FORBIDDEN.to_string()
     } else {
         msg
     }
+}
+
+/// The generic hint substituted for a bare 403 body.
+pub(crate) const GENERIC_FORBIDDEN: &str = "Forbidden (the resource may not exist, may belong to another user, or the action — \
+     e.g. setting catalog visibility to 'public'/'unlisted' — may require a higher role)";
+
+/// True when a `PermissionDenied` message is the generic hint for a bare 403 body.
+pub(crate) fn is_generic_forbidden(msg: &str) -> bool {
+    msg == GENERIC_FORBIDDEN
 }
 
 /// Extract a human-readable message from a JSON `{ "error": "..." }` body. The message is
