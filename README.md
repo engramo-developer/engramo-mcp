@@ -16,6 +16,65 @@ first. EngrAmo is listed in the [Claude Connectors Directory](https://claude.ai/
 the public docs are at <https://engramo.app/connect/>. You can revoke access any time in the EngrAmo app under
 Settings → Connected apps.
 
+## Set up with your AI assistant
+
+Not a developer? An agentic AI app can do the whole setup for you, including card audio. Tested with
+[Antigravity](#antigravity) in auto mode; other apps that can run terminal commands and edit files (Claude Code,
+Codex, Cursor) should work the same way.
+
+**Prepare two keys first:**
+
+1. **EngrAmo API token**: sign in at <https://study.engramo.app>, open Settings → API Tokens, and create one.
+2. **Gemini API key** (for card audio, free): create one at [Google AI Studio](https://aistudio.google.com/apikey).
+
+Keep both somewhere you can copy them from. **Never paste them into the chat**; the setup asks for them in a
+private pop-up instead.
+
+**Then paste this prompt into your AI app:**
+
+```text
+Set up the EngrAmo MCP server for me, with card audio, following
+https://github.com/engramo-developer/engramo-mcp. I'm not a developer, so do every step yourself and
+tell me in plain words what you're doing.
+
+1. Download the prebuilt engramo-mcp binary for my computer from the latest GitHub release
+   (https://github.com/engramo-developer/engramo-mcp/releases/latest/download/<file>, where <file> is
+   engramo-mcp-darwin-arm64, engramo-mcp-darwin-x64, engramo-mcp-linux-x64, engramo-mcp-linux-arm64
+   or engramo-mcp-win32-x64.exe). Save it to ~/.engramo/bin/ and make it executable. Don't install
+   Node.js or npm.
+2. Add an "engramo" server to this app's MCP config file. Keep any servers already there. Use the
+   binary's full path as "command" and set three env values: ENGRAMO_API_URL=https://api.engramo.app,
+   ENGRAMO_API_TOKEN and ENGRAMO_TTS_GEMINI_API_KEYS.
+3. For the two keys, never ask me to paste them into this chat. Ask for each key in my operating
+   system's own pop-up with a hidden input field (macOS: osascript "display dialog ... with hidden
+   answer"; Windows: Get-Credential in powershell.exe; Linux: zenity --password or kdialog --password),
+   and write the value straight into the config file from that same command. Never print, echo or
+   read back the keys. Only if no pop-up is possible, use a hidden terminal prompt instead. Use one
+   method at a time, and don't make me edit the config file.
+4. Tell me how to reload the MCP servers in this app, and wait until I say done.
+5. Check the connection: call get_server_version and list_tts_voices. If something fails, fix it.
+6. When both work, say "Ready! What cards should we make?" with the server version.
+```
+
+**To check the setup later** (after an update, or if something stops working), paste:
+
+```text
+Check my EngrAmo connection: call get_server_version, list_tts_voices and get_subscription_usage.
+Tell me in plain words the server version, whether card audio is ready (and the default voice), my
+plan, and how many cards I can still create. If any call fails, explain why and how to fix it.
+```
+
+When it says ready, ask for cards in your own words, for example:
+
+```text
+Create a catalog "Job interview English" with 15 cards of useful interview phrases. Put the phrase on
+the front and the meaning plus an example on the back, highlight the key words, and add audio to every
+card.
+```
+
+More ready-to-paste prompts (cover images, adding audio to a deck, turning notes into cards, study
+plans and more): [docs/prompt-examples.md](docs/prompt-examples.md).
+
 ## Prerequisites
 
 - An EngrAmo account
@@ -488,66 +547,76 @@ storage quotas, and needs no paid EngrAmo plan.
 
 ## Available tools
 
+34 tools are always available, and two more appear with [text-to-speech](#text-to-speech-bring-your-own-key)
+(local `stdio` only).
+For ready-to-paste prompts that use them, see [docs/prompt-examples.md](docs/prompt-examples.md).
+
 ### Server info
 | Tool | Description |
 |---|---|
-| `get_server_version` | Get this MCP server's own build version (not a catalog/card's `version` field) |
+| `get_server_version` | Get this MCP server's own build version (not a catalog/card's `version` field). No API call |
 | `get_subscription_usage` | Your userId, plan and features, and every limit: used, remaining, unlimited or not included, its window (lifetime or monthly, plus daily/hourly sub-limits) and when it resets (UTC). Call it after a "Quota exceeded" or "Not included in your plan" error |
 
 ### Catalogs
 | Tool | Description |
 |---|---|
-| `list_catalogs` | List all flashcard catalogs; `filter` (`own` or `shared`) limits it to catalogs you own or that others shared with you, and `speaking_only` to catalogs with shadowing on |
-| `get_catalog` | Get a single catalog by ID |
-| `update_catalog` | Update a catalog's name or description |
+| `list_catalogs` | List your catalogs with id, name, description, tags, card count, visibility and version; `filter` (`own` or `shared`) limits it to catalogs you own or that others shared with you, and `speaking_only` to catalogs with shadowing on |
+| `get_catalog` | Get a single catalog by ID, including its description, tags and shadowing settings |
+| `update_catalog` | Update a catalog's name, description, tags, visibility or cover image (`image_id`, from `upload_media`); needs the current `version` |
 | `set_catalog_shadowing` | Turn shadowing (speaking practice) on or off for a catalog, or change its language |
 | `share_catalog` | Share a catalog you own with other users by user id (UUID, not email) as `viewer` (default) or `editor`; re-sharing changes their level. Returns the full collaborator list. Ask people for their user id; they can get it from `get_subscription_usage` |
 | `unshare_catalog` | Remove users' access to a catalog you own. Returns the remaining collaborators |
 | `list_catalog_shares` | List who a catalog is shared with and their access level (owner or editors) |
-| `delete_catalog` | Delete a catalog |
+| `delete_catalog` | Delete a catalog. It is archived instead if it has cards, a cover image, or is in an active learning path; there is no restore |
 
 ### Cards
 | Tool | Description |
 |---|---|
 | `list_cards` | List cards in a catalog |
-| `get_card` | Get a single card by ID |
-| `update_card` | Update a card's content |
-| `delete_card` | Delete a card |
+| `get_card` | Get a single card by ID, with its face, back and catalog memberships |
+| `update_card` | Update a card's face, back or catalog memberships (needs the current `version`) |
+| `delete_card` | Delete a card; a card with learning progress is archived instead |
 
 ### Learning
 | Tool | Description |
 |---|---|
-| `get_due_cards` | Get cards due for review today |
-| `get_all_learning_cards` | Get all cards in the learning queue |
+| `get_due_cards` | Get cards due for review today, sorted by priority |
+| `get_all_learning_cards` | Get all cards in the learning queue (due and future) |
 | `add_card_to_learning` | Add a card to the learning queue |
 | `add_catalog_to_learning` | Add all cards from a catalog to the learning queue |
+
+Reviews are graded in the EngrAmo app; there is no tool for submitting a review.
 
 ### Learning paths
 | Tool | Description |
 |---|---|
 | `list_learning_paths` | List all learning paths |
-| `get_learning_path` | Get a single learning path by ID |
-| `create_learning_path` | Create a new learning path |
-| `activate_learning_path` | Activate a learning path |
-| `deactivate_learning_path` | Deactivate a learning path |
+| `get_learning_path` | Get a single learning path by ID, including its catalogs |
+| `create_learning_path` | Create a learning path, optionally adding catalogs right away (`catalog_ids`) |
+| `update_learning_path` | Update a path's name, description, tags or visibility (`public` or `private`; needs the current `version`) |
+| `add_catalog_to_learning_path` | Add a catalog to a learning path |
+| `remove_catalog_from_learning_path` | Remove a catalog from a learning path |
+| `activate_learning_path` | Activate a learning path so its catalogs are included in daily reviews |
+| `deactivate_learning_path` | Deactivate a learning path so its catalogs are left out of daily reviews |
 
 ### Search
 | Tool | Description |
 |---|---|
-| `search_global` | Full-text search across all content |
-| `search_catalogs` | Search within a specific catalog |
+| `search_global` | Search across cards, catalogs and (on newer API versions) learning paths |
+| `search_catalogs` | Search catalogs by name, description or short ID (the ~8-character code shown in the app) |
+| `search_learning_paths` | Search learning paths by name or description |
 
 ### Media
 | Tool | Description |
 |---|---|
-| `list_media` | List uploaded media assets |
+| `list_media` | List the files you uploaded, optionally filtered by type (`image`, `audio`, ...) |
 | `upload_media` | Upload a file you already have (a voice recording, an image) and get back a `media_id` to attach to a card or catalog |
 
-### AI generation (bring-your-own-AI)
+### Creating cards (bring-your-own-AI)
 | Tool | Description |
 |---|---|
 | `generate_card` | Create a flashcard — the calling model does any translation/wording itself |
-| `generate_catalog_with_cards` | Create a catalog with cards in one call — same bring-your-own-AI model |
+| `generate_catalog_with_cards` | Create a catalog with cards in one call, optionally with a cover image (`image_id`) — same bring-your-own-AI model. To add or replace the cover of an existing catalog, use `update_catalog` |
 | `generate_cards` | Add multiple cards to an existing catalog — same bring-your-own-AI model |
 
 ### Text-to-speech (stdio, opt-in)
@@ -571,7 +640,7 @@ Beyond plain text, a card's `face`/`back` can carry:
 | `audio_id` | Your own audio (a recording, a clip from your own TTS) — upload it with `upload_media` first, or set it automatically by calling `generate_card_audio` (`stdio` only, see below) |
 | `visual_id` + `visual_type` | Your own image/video, same pattern as `audio_id` |
 
-A catalog can also have `image_id` (cover image) set the same way. None of this needs a paid EngrAmo
+A catalog can also have `image_id` (cover image), set with `generate_catalog_with_cards` or later with `update_catalog` (a cover can be replaced, not removed). None of this needs a paid EngrAmo
 plan — dictionary/translation are done by the calling model, images are entirely bring-your-own via
 `upload_media` (max ~10MB per file), and face audio is either bring-your-own the same way or
 generated locally with your own TTS key via `generate_card_audio`. See `engramo://card-schema` for
@@ -605,10 +674,8 @@ tool could silently start spending itself the moment you ran `engramo-mcp stdio`
 **never reads `GEMINI_API_KEY`** — only the explicit, namespaced `ENGRAMO_TTS_GEMINI_API_KEYS` opts
 you in.
 
-**Whose quota does this spend?** Yours, not EngrAmo's. This is a different mechanism from the paid
-`generate_tts_for_cards` tool (`ENGRAMO_ENABLE_PAID_AI`), which spends EngrAmo's own metered TTS
-quota — `generate_card_audio` spends only your own Gemini API quota/billing, same as if you'd called
-Gemini directly.
+**Whose quota does this spend?** Yours, not EngrAmo's: `generate_card_audio` spends only your own
+Gemini API quota/billing, same as if you'd called Gemini directly.
 
 **Multiple keys / rotation.** `ENGRAMO_TTS_GEMINI_API_KEYS` accepts a comma-separated list. On each
 synthesis call the keys are tried in a random order; a key that's rate-limited, rejected (invalid or
