@@ -56,6 +56,9 @@ pub struct CatalogDto {
     pub card_count: Option<i64>,
     pub visibility: Option<String>,
     pub version: i32,
+    /// Cover image media id; omitted from the tool output when the catalog has no cover.
+    #[serde(rename = "imageId", default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<Uuid>,
     /// Shadowing settings. Absent on the wire (and `None` here) for older payloads; omitted from
     /// the tool output unless a language is set, so non-shadowing catalogs don't grow.
     #[serde(
@@ -184,6 +187,9 @@ pub struct UpdateCatalogRequest {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
+    /// Cover image media id. Omitted = keep the current cover; the API cannot clear one.
+    #[serde(rename = "imageId", skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<Uuid>,
     pub version: i32,
     #[serde(rename = "speakingSettings", skip_serializing_if = "Option::is_none")]
     pub speaking_settings: Option<SpeakingSettingsUpdate>,
@@ -876,6 +882,7 @@ mod tests {
             card_count: Some(42),
             visibility: Some("private".to_string()),
             version: 1,
+            image_id: None,
             speaking_settings: None,
         };
         let summary: CatalogSummary = dto.into();
@@ -1539,6 +1546,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            image_id: None,
             version: 3,
             speaking_settings: s,
         })

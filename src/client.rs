@@ -1182,6 +1182,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            image_id: None,
             version: 1,
             speaking_settings: None,
         };

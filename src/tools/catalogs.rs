@@ -43,6 +43,10 @@ pub struct UpdateCatalogParams {
         description = "New visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id). Setting 'public' or 'unlisted' may require publish permission — non-moderators can get a permission error."
     )]
     pub visibility: Option<String>,
+    #[schemars(
+        description = "New cover image: a media_id from upload_media (an image you own). Omit to keep the current cover. A cover can be replaced but not removed."
+    )]
+    pub image_id: Option<String>,
     #[schemars(description = "Current version of the catalog (required for optimistic locking)")]
     pub version: i32,
 }
@@ -523,6 +527,7 @@ mod tests {
                 description: None,
                 tags: None,
                 visibility: None,
+                image_id: None,
                 version: 1,
             }))
             .await

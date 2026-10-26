@@ -10,7 +10,8 @@
 //! synthesize → encode → upload → attach, per card, with bounded concurrency.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use rmcp::{
     ErrorData, handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool,
@@ -24,7 +25,9 @@ use crate::error::ApiError;
 use crate::server::{EngramoMcpServer, sanitize_text};
 use crate::tools::catalogs::{err_result, ok_json, parse_uuid};
 use crate::tts::mp3::{AudioEncoder, Mp3Encoder};
-use crate::tts::{TtsEngine, TtsRequest, check_lang, check_voice};
+use crate::tts::{
+    DEFAULT_RATE_LIMIT_WAIT_SECS, TtsEngine, TtsError, TtsRequest, check_lang, check_voice,
+};
 
 /// Longest face text `generate_card_audio` will synthesize for a single card — matches
 /// engram-api's `PREMIUM_TTS_MAX_CHARS` for its paid TTS.
@@ -171,8 +174,61 @@ struct GenerateCardAudioResult {
     generated: usize,
     skipped: usize,
     failed: usize,
+    /// Present when the batch stopped on a Gemini rate limit — tells the caller what to do next
+    /// instead of leaving it to guess from per-card reasons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limited: Option<RateLimitedSummary>,
     results: Vec<CardAudioResult>,
 }
+
+/// The first `TtsError::RateLimited` a batch hit. Once set, the cards still waiting are failed
+/// without calling Gemini: every key just answered 429, so they would only burn requests.
+#[derive(Debug, Clone, Copy)]
+struct RateLimitHit {
+    retry_after: Option<Duration>,
+    daily: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RateLimitedSummary {
+    daily_quota_exhausted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<u64>,
+    next_step: String,
+}
+
+impl RateLimitedSummary {
+    fn from_hit(hit: RateLimitHit) -> Self {
+        if hit.daily {
+            return Self {
+                daily_quota_exhausted: true,
+                retry_after_seconds: None,
+                next_step: "Every configured Gemini key has used up its daily TTS quota. Do not \
+                    retry today: tell the user which cards still lack audio; they can be voiced \
+                    after the quota resets (midnight Pacific time) or with another key added to \
+                    ENGRAMO_TTS_GEMINI_API_KEYS."
+                    .to_string(),
+            };
+        }
+        let secs = hit
+            .retry_after
+            .map_or(DEFAULT_RATE_LIMIT_WAIT_SECS, |d| d.as_secs().max(1));
+        Self {
+            daily_quota_exhausted: false,
+            retry_after_seconds: Some(secs),
+            next_step: format!(
+                "Gemini's per-minute TTS limit was reached. Wait about {secs}s, then call \
+                generate_card_audio again with only the card_ids whose status is \"failed\". \
+                Free-tier keys allow only a few TTS requests per minute, so send small batches \
+                (3-4 cards)."
+            ),
+        }
+    }
+}
+
+/// Reason given to cards the batch did not send to Gemini after a rate limit.
+const NOT_ATTEMPTED_RATE_LIMITED: &str =
+    "not attempted: the Gemini rate limit was reached earlier in this batch";
 
 /// The subset of a raw `GET /cards/{id}` response `generate_card_audio` needs, plus the fetched
 /// `face` object kept intact (including fields this crate doesn't model, e.g. `tts`) so it can
@@ -414,6 +470,7 @@ async fn process_card(
     voice: String,
     lang: Option<String>,
     overwrite: bool,
+    rate_limit: Arc<OnceLock<RateLimitHit>>,
 ) -> CardAudioResult {
     let raw = match client.get_card_raw(card_id).await {
         Ok(v) => v,
@@ -450,6 +507,9 @@ async fn process_card(
         );
     }
 
+    if rate_limit.get().is_some() {
+        return CardAudioResult::failed(card_id, NOT_ATTEMPTED_RATE_LIMITED);
+    }
     let pcm = match engine
         .synthesize(TtsRequest {
             text: &text,
@@ -459,7 +519,12 @@ async fn process_card(
         .await
     {
         Ok(pcm) => pcm,
-        Err(e) => return CardAudioResult::failed(card_id, e.to_string()),
+        Err(e) => {
+            if let TtsError::RateLimited { retry_after, daily } = e {
+                let _ = rate_limit.set(RateLimitHit { retry_after, daily });
+            }
+            return CardAudioResult::failed(card_id, e.to_string());
+        }
     };
 
     // CPU-bound FFI (LAME) — run off the async worker threads. Goes through the
@@ -563,8 +628,11 @@ impl EngramoMcpServer {
         text, face text over 500 characters, or no catalog \
         membership are skipped/failed without spending any quota. Partial failure across a \
         batch is normal — check each entry in `results` rather than assuming the whole call \
-        succeeded or failed together. Use list_tts_voices first to see available voices and \
-        the configured default."
+        succeeded or failed together. Free-tier Gemini keys allow only a few TTS requests \
+        per minute and per day: prefer batches of 3-4 cards. If the result has a \
+        `rate_limited` object, follow its `next_step` — it says whether to wait and retry \
+        the failed cards or stop for the day. Use list_tts_voices first to see available \
+        voices and the configured default."
     )]
     pub async fn generate_card_audio(
         &self,
@@ -615,6 +683,7 @@ impl EngramoMcpServer {
         let lang = p.lang;
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(TTS_CONCURRENCY));
+        let rate_limit: Arc<OnceLock<RateLimitHit>> = Arc::new(OnceLock::new());
         let mut join_set: tokio::task::JoinSet<CardAudioResult> = tokio::task::JoinSet::new();
         let mut idx_by_task: HashMap<tokio::task::Id, usize> = HashMap::with_capacity(ids.len());
         for (idx, card_id) in ids.iter().copied().enumerate() {
@@ -623,6 +692,7 @@ impl EngramoMcpServer {
             let voice = voice.clone();
             let lang = lang.clone();
             let sem = Arc::clone(&semaphore);
+            let rate_limit = Arc::clone(&rate_limit);
             let handle = join_set.spawn(async move {
                 let permit = match sem.acquire_owned().await {
                     Ok(permit) => permit,
@@ -633,7 +703,8 @@ impl EngramoMcpServer {
                         );
                     }
                 };
-                let result = process_card(client, engine, card_id, voice, lang, overwrite).await;
+                let result =
+                    process_card(client, engine, card_id, voice, lang, overwrite, rate_limit).await;
                 drop(permit);
                 result
             });
@@ -678,6 +749,7 @@ impl EngramoMcpServer {
             generated,
             skipped,
             failed,
+            rate_limited: rate_limit.get().copied().map(RateLimitedSummary::from_hit),
             results,
         }))
     }
@@ -2814,5 +2886,148 @@ mod tests {
         assert!(!result.is_error.unwrap_or(false));
         let text = result_text(&result);
         assert!(text.contains("\"generated\": 1"), "{text}");
+    }
+
+    // ── generate_card_audio: rate limits ─────────────────────────────────────
+
+    /// Engine whose every call answers like a Gemini 429 on all keys.
+    struct RateLimitedEngine {
+        calls: AtomicUsize,
+        daily: bool,
+    }
+
+    impl TtsEngine for RateLimitedEngine {
+        fn synthesize<'a>(
+            &'a self,
+            _req: TtsRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<TtsPcm, TtsError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(TtsError::RateLimited {
+                    retry_after: Some(Duration::from_secs(17)),
+                    daily: self.daily,
+                })
+            })
+        }
+
+        fn voices(&self) -> &'static [Voice] {
+            FAKE_VOICES
+        }
+
+        fn default_voice(&self) -> &str {
+            "Puck"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    async fn run_rate_limited_batch(daily: bool) -> (serde_json::Value, usize, MockServer) {
+        let server = MockServer::start().await;
+        let cat = Uuid::new_v4();
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        for id in &ids {
+            Mock::given(method("GET"))
+                .and(path(format!("/cards/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                    *id,
+                    1,
+                    1,
+                    &[cat],
+                    json!({"text": "hola"}),
+                )))
+                .mount(&server)
+                .await;
+        }
+        let engine = Arc::new(RateLimitedEngine {
+            calls: AtomicUsize::new(0),
+            daily,
+        });
+        let srv = server_with_engine(&server.uri(), engine.clone());
+        let result = srv
+            .generate_card_audio(Parameters(GenerateCardAudioParams {
+                card_ids: ids.iter().map(Uuid::to_string).collect(),
+                voice: None,
+                lang: None,
+                overwrite: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let body: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        (body, engine.calls.load(Ordering::SeqCst), server)
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_audio_rate_limit_stops_batch_and_says_when_to_retry() {
+        let (body, calls, server) = run_rate_limited_batch(false).await;
+        // The single-threaded test runtime runs each fake synth to completion before another
+        // task reaches its pre-synth check, so only the first card spends a Gemini call.
+        assert_eq!(calls, 1, "{body}");
+        assert_eq!(body["failed"], 6, "{body}");
+        let summary = &body["rate_limited"];
+        assert_eq!(summary["daily_quota_exhausted"], false, "{body}");
+        assert_eq!(summary["retry_after_seconds"], 17, "{body}");
+        assert!(
+            summary["next_step"].as_str().unwrap().contains("17s"),
+            "{body}"
+        );
+        let results = body["results"].as_array().unwrap();
+        let not_attempted = results
+            .iter()
+            .filter(|r| r["reason"] == NOT_ATTEMPTED_RATE_LIMITED)
+            .count();
+        assert_eq!(not_attempted, 5, "{body}");
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|r| r.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_audio_daily_quota_says_not_to_retry_today() {
+        let (body, _, _server) = run_rate_limited_batch(true).await;
+        let summary = &body["rate_limited"];
+        assert_eq!(summary["daily_quota_exhausted"], true, "{body}");
+        assert!(summary.get("retry_after_seconds").is_none(), "{body}");
+        assert!(
+            summary["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("Do not retry today"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_audio_without_rate_limit_omits_summary() {
+        let server = MockServer::start().await;
+        let card = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_json(
+                card,
+                1,
+                1,
+                &[Uuid::new_v4()],
+                json!({"text": "BOOM"}),
+            )))
+            .mount(&server)
+            .await;
+        let srv = server_with_engine(&server.uri(), Arc::new(FakeTtsEngine::failing_on("BOOM")));
+        let result = srv
+            .generate_card_audio(Parameters(GenerateCardAudioParams {
+                card_ids: vec![card.to_string()],
+                voice: None,
+                lang: None,
+                overwrite: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(!text.contains("rate_limited"), "{text}");
     }
 }
