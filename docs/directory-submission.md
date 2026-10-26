@@ -6,16 +6,20 @@ Re-check character limits in the live forms at submission time.
 
 ---
 
-## 1. Reviewer test account
+## 1. Reviewer test accounts
+
+Each directory gets its own account, so one review's test runs can't change the data the other reviewer sees.
 
 | | |
 |---|---|
-| Login | `mcp-review@engramo.app` + password (enter it in the form only, **never in this repo**) |
+| ChatGPT login | `mcp-review@engramo.app` + password (enter it in the form only, **never in this repo**) |
+| Claude login | `mcp-review-claude@engramo.app` + password (same rule) |
 | Login method | Email + password on the EngrAmo OAuth page. No MFA, no email codes, no sign-up step |
 | Plan | Basic, plus a `cards_per_catalog: -1` override (see "Known limitations") |
 | Paid AI tools | Off on prod. Reviewers see **30 tools** |
 
-**Seeded data (2026-10-14):**
+**Seeded data** (identical on both accounts; ChatGPT account 2026-10-14, Claude account 2026-10-18). The Claude
+account also has an empty **My Catalog** (Default) that the app creates on first sign-in.
 
 | Item | Details |
 |---|---|
@@ -27,7 +31,8 @@ Re-check character limits in the live forms at submission time.
 | Public content | About 50 public catalogs, so search returns results beyond the account's own data |
 
 **Before each submission:**
-- Revoke every app under Settings → Connected apps on this account, so the reviewer starts clean.
+- Revoke every app under Settings → Connected apps on the account, so the reviewer starts clean.
+- Revoke any API token used for seeding (API token & MCP → Revoke).
 - Re-check that some cards are still due. If test runs graded or deleted them, re-seed: the script is kept outside the repo.
 
 ---
@@ -235,6 +240,40 @@ ship tool name/annotation/description changes to prod; don't upload a new ZIP un
   content marked public/unlisted.
 - Terms have no moderation/reporting/removal clause for user content.
 - Privacy policy doesn't mention that public/unlisted content is visible to other users.
+
+---
+
+## 5b. Claude submission record
+
+**Submitted 2026-10-18** at claude.ai/directory/manage → Submit new → MCP connector, from a paid Claude account
+(the portal requires Pro, Max, Team or Enterprise). Server v1.2.13. Approved the same day, minutes after
+submission, and published: status **Live** (2026-10-18). Listing: https://claude.ai/directory/engramo
+
+| Step | State |
+|---|---|
+| 1. Connection | `https://mcp.engramo.app`, single URL for all users. Scan: 29 tools, 6 resources, 5 prompts, OAuth |
+| 2. Tools | One warning, non-blocking: `generate_card` params `face` and `back` have no `type` (schemars emits a bare `$ref` for a required struct field; `update_card`'s `anyOf` form passes). Fix queued for after review, see below |
+| 3. Listing | §2.2 copy, description pasted as plain text. Author EngrAmo / https://engramo.app, favicon icon, docs https://engramo.app/connect/, support = GitHub issues, privacy policy |
+| 4. Use cases | Create a deck; review what's due; organise and edit decks. Prerequisite: an EngrAmo account (free plan works), OAuth on connect. Capability: read and write |
+| 5. Company | EngrAmo, https://engramo.app; primary contact is the submitting account's owner |
+| 6. Authentication | Always required, Dynamic Client Registration (both auto-detected), no extra headers |
+| 7. Data handling | We own the API; no personal health data; no sponsored content |
+| 8. Test & launch | Reviewer account `mcp-review-claude@engramo.app` with login steps, seeded data and suggested prompts (password not recorded here). Self-tested box ticked |
+| 9. Compliance | All seven acknowledgements ticked, plus additional notes (first-party API, no stored content, tool cross-references are same-server hints, tool output treated as data, destructive hints, no payments, no AI media) |
+
+**Self-test before submitting (2026-10-18):** all 29 tools run in claude.ai as a custom connector with a
+personal account, 19 prompts in one chat, every prompt calling the expected tools; prompt 1 also checked
+in Claude Desktop and the mobile app.
+
+**While the ChatGPT review is open:** the same freeze as §5a, which now protects both listings. Don't ship tool definition changes (names, annotations,
+descriptions, input schemas) to prod, and keep `mcp-review-claude@engramo.app` unconnected and its data
+intact.
+
+**Queued for the release after the ChatGPT review:**
+- Add `"type": "object"` to `generate_card`'s `face`/`back` schemas (`#[schemars(extend("type" = "object"))]`),
+  with a test that every top-level tool property has a `type` or `anyOf`. Then re-scan from the listing's Tools tab (edits to a live listing may go back through review).
+- Remove the `generate_card_audio` mention from `upload_media`'s description; that tool doesn't exist in http
+  mode.
 
 ---
 
