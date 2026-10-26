@@ -149,6 +149,13 @@ async fn apply_shadowing(
                         .to_string(),
                 ));
             }
+            Err(ApiError::Conflict(_)) => {
+                return Err(ApiError::Conflict(
+                    "the catalog kept changing while shadowing was being set; call \
+                     set_catalog_shadowing again"
+                        .to_string(),
+                ));
+            }
             result => return result,
         }
     }
@@ -190,7 +197,7 @@ impl EngramoMcpServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "List the user's flashcard catalogs with cursor-based pagination. Returns each catalog's id, name, description, tags, card_count, visibility, and version; catalogs with shadowing turned on also carry `speakingSettings.language`. Set `speaking_only` to true to list only those catalogs. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
+        description = "List the user's flashcard catalogs with cursor-based pagination. Returns each catalog's id, name, description, tags, cardCount, visibility, and version; catalogs with shadowing turned on also carry `speakingSettings.language`. Set `speaking_only` to true to list only those catalogs. Returns at most 50 items per call; pass the returned `cursor` back to fetch the next page (`cursor: null` means this is the last page)."
     )]
     pub async fn list_catalogs(
         &self,
@@ -1118,8 +1125,8 @@ impl EngramoMcpServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "List your own media library — files you uploaded with upload_media, \
-        including audio produced by generate_card_audio. This does NOT include media attached \
+        description = "List your own media library — files you uploaded (e.g. with \
+        upload_media). This does NOT include media attached \
         to cards uploaded by other accounts (e.g. in shared/subscribed catalogs); to find a \
         specific card's audio or image, use get_card and read its `audio_id`/`visual_id` instead. \
         Optionally filter by media type ('image', 'audio', etc.). Each item has `id`, `name` \
@@ -1896,6 +1903,16 @@ mod tests {
             !desc.contains("generate_card_audio"),
             "http mode has no generate_card_audio: {desc}"
         );
+    }
+
+    #[test]
+    fn test_no_always_on_tool_description_mentions_generate_card_audio() {
+        let server =
+            EngramoMcpServer::new(EngramoClient::new("http://localhost", "engramo_test"), true);
+        for t in server.tool_router.list_all() {
+            let d = t.description.as_deref().unwrap_or("");
+            assert!(!d.contains("generate_card_audio"), "{}: {d}", t.name);
+        }
     }
 
     #[test]
@@ -4226,7 +4243,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(true), "{result:?}");
-        assert!(first_text(&result).contains("Conflict"), "{result:?}");
+        let text = first_text(&result);
+        assert!(text.contains("Conflict"), "{result:?}");
+        assert!(
+            text.contains("call set_catalog_shadowing again"),
+            "{result:?}"
+        );
+        assert!(!text.contains("Fetch the latest version"), "{result:?}");
         assert_eq!(count_requests(&mock_server, "GET").await, 2);
         assert_eq!(count_requests(&mock_server, "PATCH").await, 2);
     }
@@ -4305,6 +4328,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_set_catalog_shadowing_conflict_then_reread_fails_reports_get_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": TEST_ID, "name": "C", "version": 3, "speakingSettings": {}
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "gone"})),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_json(serde_json::json!({"error": "stale"})),
+            )
+            .mount(&mock_server)
+            .await;
+        let result = mock_server_for(&mock_server.uri())
+            .set_catalog_shadowing(Parameters(shadowing_params(TEST_ID, true, Some("es"))))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Not found"), "{result:?}");
+        assert_eq!(count_requests(&mock_server, "GET").await, 2);
+        assert_eq!(count_requests(&mock_server, "PATCH").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_set_catalog_shadowing_conflict_then_forbidden_uses_owner_message() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mock_server = wiremock::MockServer::start().await;
+        mount_shadowing_get(&mock_server, None).await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_json(serde_json::json!({"error": "stale"})),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/catalogs/{TEST_ID}")))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(serde_json::json!({"error": "Forbidden"})),
+            )
+            .mount(&mock_server)
+            .await;
+        let result = mock_server_for(&mock_server.uri())
+            .set_catalog_shadowing(Parameters(shadowing_params(TEST_ID, true, Some("es"))))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            first_text(&result).contains(
+                "Permission denied: only the catalog's owner can turn shadowing on or off"
+            ),
+            "{result:?}"
+        );
+        assert_eq!(count_requests(&mock_server, "GET").await, 2);
+        assert_eq!(count_requests(&mock_server, "PATCH").await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_set_catalog_shadowing_missing_speaking_settings_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        for body in [
+            serde_json::json!({"id": TEST_ID, "name": "C", "version": 3}),
+            serde_json::json!({"id": TEST_ID, "name": "C", "version": 3, "speakingSettings": null}),
+        ] {
+            // Case A: disabling is a no-op, no PATCH.
+            let mock_server = wiremock::MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/catalogs/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("PATCH"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&mock_server)
+                .await;
+            let result = mock_server_for(&mock_server.uri())
+                .set_catalog_shadowing(Parameters(shadowing_params(TEST_ID, false, None)))
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false), "{result:?}");
+            assert!(first_text(&result).contains("\"version\": 3"), "{result:?}");
+            assert_eq!(count_requests(&mock_server, "PATCH").await, 0);
+
+            // Case B: enabling sends the PATCH.
+            let mock_server = wiremock::MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/catalogs/{TEST_ID}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&mock_server)
+                .await;
+            mount_shadowing_patch(&mock_server, serde_json::json!("es"), 1).await;
+            let result = mock_server_for(&mock_server.uri())
+                .set_catalog_shadowing(Parameters(shadowing_params(TEST_ID, true, Some("es"))))
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_set_catalog_shadowing_get_errors_make_no_patch() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
@@ -4330,10 +4472,8 @@ mod tests {
             }
             assert_eq!(count_requests(&mock_server, "PATCH").await, 0, "{status}");
         }
-        let dead = wiremock::MockServer::start().await;
-        let uri = dead.uri();
-        drop(dead);
-        let result = mock_server_for(&uri)
+        // Not a dropped MockServer: wiremock pools those and hands them to parallel tests.
+        let result = mock_server_for("http://127.0.0.1:1")
             .set_catalog_shadowing(Parameters(shadowing_params(TEST_ID, true, Some("es"))))
             .await
             .unwrap();

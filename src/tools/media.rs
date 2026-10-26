@@ -66,8 +66,8 @@ impl MediaTools {
     }
 
     #[tool(
-        description = "List your own media library — files you uploaded with upload_media, \
-        including audio produced by generate_card_audio. This does NOT include media attached \
+        description = "List your own media library — files you uploaded (e.g. with \
+        upload_media). This does NOT include media attached \
         to cards uploaded by other accounts (e.g. in shared/subscribed catalogs); to find a \
         specific card's audio or image, use get_card and read its `audio_id`/`visual_id` instead. \
         Optionally filter by media type ('image', 'audio', etc.). Each item has `id`, `name` \

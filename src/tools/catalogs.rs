@@ -561,6 +561,20 @@ mod tests {
     }
 
     #[test]
+    fn test_shadowing_target_length_limit() {
+        let ok = "a".repeat(64);
+        assert_eq!(shadowing_target(true, Some(&ok)), Ok(Some(ok.clone())));
+        assert_eq!(
+            shadowing_target(true, Some(&format!("  {ok}  "))),
+            Ok(Some(ok.clone()))
+        );
+        let long = "a".repeat(65);
+        let err = shadowing_target(true, Some(&long)).unwrap_err();
+        assert!(err.contains("too long") && err.contains("64"), "{err}");
+        assert_eq!(shadowing_target(false, Some(&"a".repeat(500))), Ok(None));
+    }
+
+    #[test]
     fn test_shadowing_target() {
         assert_eq!(shadowing_target(false, None), Ok(None));
         assert_eq!(shadowing_target(false, Some("es_es")), Ok(None));
