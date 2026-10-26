@@ -333,6 +333,11 @@ pub enum TtsError {
 /// Wait suggested after a per-minute 429 when Gemini didn't say how long to wait.
 pub const DEFAULT_RATE_LIMIT_WAIT_SECS: u64 = 60;
 
+/// Whole seconds to tell the caller to wait: Gemini's hint (at least 1s), else the default.
+pub fn suggested_wait_secs(retry_after: Option<std::time::Duration>) -> u64 {
+    retry_after.map_or(DEFAULT_RATE_LIMIT_WAIT_SECS, |d| d.as_secs().max(1))
+}
+
 fn rate_limited_message(retry_after: Option<std::time::Duration>, daily: bool) -> String {
     if daily {
         "Gemini TTS daily quota is used up on every configured key \
@@ -340,7 +345,7 @@ fn rate_limited_message(retry_after: Option<std::time::Duration>, daily: bool) -
         time, or add another key."
             .to_string()
     } else {
-        let secs = retry_after.map_or(DEFAULT_RATE_LIMIT_WAIT_SECS, |d| d.as_secs().max(1));
+        let secs = suggested_wait_secs(retry_after);
         format!(
             "Gemini TTS per-minute rate limit hit on every configured key. Wait about {secs}s \
             before retrying."
@@ -377,6 +382,15 @@ pub trait TtsEngine: Send + Sync {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_rate_limited_message_clamps_subsecond_wait_to_one_second() {
+        let e = TtsError::RateLimited {
+            retry_after: Some(std::time::Duration::from_millis(300)),
+            daily: false,
+        };
+        assert!(e.to_string().contains("about 1s"), "{e}");
+    }
 
     /// Builds a `from_lookup`-compatible closure over a fixed map — no process env
     /// mutation anywhere in this module's tests (rollout plan R8).

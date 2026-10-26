@@ -141,12 +141,15 @@ pub enum ApiError {
 /// `ApiError::Network`'s message. Spells out the next step: a bare "error sending request"
 /// leaves the calling LLM guessing whether to retry or work around the call.
 fn network_message(e: &reqwest::Error) -> String {
+    const VERIFY: &str = " If this call creates or changes data, first check (list/get) whether it \
+        already took effect, so a retry doesn't create a duplicate.";
     if e.is_timeout() {
-        "Network error: the Engramo API did not respond in time. Retry this call once; if it \
-        times out again, continue with other tools and come back to it later."
-            .to_string()
+        format!(
+            "Network error: the Engramo API did not respond in time. Retry this call once; if it \
+            times out again, continue with other tools and come back to it later.{VERIFY}"
+        )
     } else {
-        format!("Network error: {e}. This is usually transient — retry this call once.")
+        format!("Network error: {e}. This is usually transient — retry this call once.{VERIFY}")
     }
 }
 
@@ -677,6 +680,22 @@ mod tests {
         let msg = ApiError::Network(reqwest_err).to_string();
         assert!(msg.contains("did not respond in time"), "{msg}");
         assert!(msg.contains("Retry this call once"), "{msg}");
+        assert!(msg.contains("first check (list/get)"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_network_connect_error_display_suggests_single_retry() {
+        let reqwest_err = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!reqwest_err.is_timeout());
+        let msg = ApiError::Network(reqwest_err).to_string();
+        assert!(msg.starts_with("Network error: "), "{msg}");
+        assert!(msg.contains("retry this call once"), "{msg}");
+        assert!(msg.contains("first check (list/get)"), "{msg}");
+        assert!(!msg.contains("did not respond in time"), "{msg}");
     }
 
     #[test]

@@ -124,7 +124,7 @@ enum CallError {
 impl CallError {
     /// Short, key-value-free label used to build the per-position summary in
     /// [`TtsError::AllKeysExhausted`] (e.g. "key #1: rate limited; key #2: rejected"). Never
-    /// includes `detail`/`retry_after` — those are for tracing only, so a future refactor of
+    /// includes `detail`/`retry_after` — those stay out of the key summary, so a future refactor of
     /// the public summary text can't accidentally widen it with upstream detail.
     fn label(&self) -> &'static str {
         match self {
@@ -144,7 +144,8 @@ impl CallError {
         }
     }
 
-    /// Parsed `Retry-After`/`retryDelay`, for tracing only — rotation never sleeps on it.
+    /// Parsed `Retry-After`/`retryDelay`. Rotation never sleeps on it; it feeds
+    /// `TtsError::RateLimited` (the shortest per-minute wait across keys).
     fn retry_after(&self) -> Option<Duration> {
         match self {
             CallError::RateLimited { retry_after, .. } => *retry_after,
@@ -864,9 +865,16 @@ fn parse_retry_delay(body: &str) -> Option<Duration> {
     let details = value.get("error")?.get("details")?.as_array()?;
     for detail in details {
         if let Some(delay) = detail.get("retryDelay").and_then(|v| v.as_str()) {
-            let digits: String = delay.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(secs) = digits.parse::<u64>() {
-                return Some(Duration::from_secs(secs));
+            let num: String = delay
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(secs) = num.parse::<f64>()
+                && secs.is_finite()
+                && secs >= 0.0
+            {
+                // Round up: the value is shown to the model as a wait, so never undershoot.
+                return Some(Duration::from_secs(secs.ceil() as u64));
             }
         }
     }
@@ -890,6 +898,56 @@ mod tests {
                 .collect(),
         )
         .with_api_base_for_tests(server.uri())
+    }
+
+    #[tokio::test]
+    async fn test_every_key_rate_limited_uses_retry_after_header_over_body_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_json(rate_limit_body(
+                        "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                        "41s",
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let client = make_client(&server, vec!["keyA"]);
+        let err = client
+            .do_synthesize(req("hi", "Puck", None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TtsError::RateLimited { retry_after: Some(d), daily: false } if d == Duration::from_secs(7)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("about 7s"), "{err}");
+    }
+
+    #[test]
+    fn test_is_daily_quota_false_for_non_json_and_violation_free_bodies() {
+        assert!(!is_daily_quota("Too Many Requests"));
+        assert!(!is_daily_quota(
+            r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"5s"}]}}"#
+        ));
+        assert!(is_daily_quota(
+            &rate_limit_body("GenerateRequestsPerDayPerProjectPerModel-FreeTier", "1s").to_string()
+        ));
+    }
+
+    #[test]
+    fn test_parse_retry_delay_rounds_fractional_seconds_up() {
+        let body = |d: &str| rate_limit_body("x", d).to_string();
+        assert_eq!(
+            parse_retry_delay(&body("12.5s")),
+            Some(Duration::from_secs(13))
+        );
+        assert_eq!(
+            parse_retry_delay(&body("12s")),
+            Some(Duration::from_secs(12))
+        );
     }
 
     fn req<'a>(text: &'a str, voice: &'a str, lang: Option<&'a str>) -> TtsRequest<'a> {
@@ -2342,7 +2400,8 @@ mod tests {
             "error": {"details": [{"retryDelay": "1.5s"}]}
         })
         .to_string();
-        assert_eq!(parse_retry_delay(&body), Some(Duration::from_secs(1)));
+        // Fractions round up so the caller is never told to wait too little.
+        assert_eq!(parse_retry_delay(&body), Some(Duration::from_secs(2)));
     }
 
     // --- voice catalog ---

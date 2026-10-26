@@ -810,6 +810,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_update_catalog_request_omits_image_id_when_none() {
+        let req = UpdateCatalogRequest {
+            name: Some("x".into()),
+            description: None,
+            tags: None,
+            visibility: None,
+            image_id: None,
+            version: 1,
+            speaking_settings: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("imageId").is_none(), "{v}");
+        let with = UpdateCatalogRequest {
+            image_id: Some(Uuid::nil()),
+            ..req
+        };
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["imageId"],
+            Uuid::nil().to_string()
+        );
+    }
+
+    #[test]
+    fn test_catalog_dto_image_id_absent_or_null_is_omitted_from_output() {
+        for raw in [
+            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"X","version":1}"#,
+            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"X","version":1,"imageId":null}"#,
+        ] {
+            let dto: CatalogDto = serde_json::from_str(raw).unwrap();
+            assert!(dto.image_id.is_none());
+            assert!(!serde_json::to_string(&dto).unwrap().contains("imageId"));
+        }
+    }
+
+    #[test]
     fn test_collaborator_change_serializes_level_and_null() {
         let id = Uuid::nil();
         let some = CollaboratorChange {

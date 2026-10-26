@@ -25,9 +25,7 @@ use crate::error::ApiError;
 use crate::server::{EngramoMcpServer, sanitize_text};
 use crate::tools::catalogs::{err_result, ok_json, parse_uuid};
 use crate::tts::mp3::{AudioEncoder, Mp3Encoder};
-use crate::tts::{
-    DEFAULT_RATE_LIMIT_WAIT_SECS, TtsEngine, TtsError, TtsRequest, check_lang, check_voice,
-};
+use crate::tts::{TtsEngine, TtsError, TtsRequest, check_lang, check_voice, suggested_wait_secs};
 
 /// Longest face text `generate_card_audio` will synthesize for a single card — matches
 /// engram-api's `PREMIUM_TTS_MAX_CHARS` for its paid TTS.
@@ -105,9 +103,19 @@ struct CardAudioResult {
     bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// True when the card failed only because of the Gemini rate limit (hit here, or skipped
+    /// after another card hit it), so retrying it later is worthwhile. Not serialized; feeds
+    /// `RateLimitedSummary::retry_card_ids`.
+    #[serde(skip)]
+    rate_limited: bool,
 }
 
 impl CardAudioResult {
+    fn into_rate_limited(mut self) -> Self {
+        self.rate_limited = true;
+        self
+    }
+
     fn generated(
         card_id: Uuid,
         media_id: Uuid,
@@ -121,6 +129,7 @@ impl CardAudioResult {
             replaced_media_id,
             bytes: Some(bytes),
             reason: None,
+            rate_limited: false,
         }
     }
 
@@ -132,6 +141,7 @@ impl CardAudioResult {
             replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
+            rate_limited: false,
         }
     }
 
@@ -143,6 +153,7 @@ impl CardAudioResult {
             replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
+            rate_limited: false,
         }
     }
 
@@ -154,6 +165,7 @@ impl CardAudioResult {
             replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
+            rate_limited: false,
         }
     }
 
@@ -165,6 +177,7 @@ impl CardAudioResult {
             replaced_media_id: None,
             bytes: None,
             reason: Some(reason.into()),
+            rate_limited: false,
         }
     }
 }
@@ -194,15 +207,18 @@ struct RateLimitedSummary {
     daily_quota_exhausted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after_seconds: Option<u64>,
+    /// Cards that failed only because of the rate limit; retry exactly these.
+    retry_card_ids: Vec<Uuid>,
     next_step: String,
 }
 
 impl RateLimitedSummary {
-    fn from_hit(hit: RateLimitHit) -> Self {
+    fn from_hit(hit: RateLimitHit, results: &[CardAudioResult]) -> Self {
         if hit.daily {
             return Self {
                 daily_quota_exhausted: true,
                 retry_after_seconds: None,
+                retry_card_ids: Vec::new(),
                 next_step: "Every configured Gemini key has used up its daily TTS quota. Do not \
                     retry today: tell the user which cards still lack audio; they can be voiced \
                     after the quota resets (midnight Pacific time) or with another key added to \
@@ -210,15 +226,20 @@ impl RateLimitedSummary {
                     .to_string(),
             };
         }
-        let secs = hit
-            .retry_after
-            .map_or(DEFAULT_RATE_LIMIT_WAIT_SECS, |d| d.as_secs().max(1));
+        let secs = suggested_wait_secs(hit.retry_after);
+        let retry_card_ids = results
+            .iter()
+            .filter(|r| r.rate_limited)
+            .map(|r| r.card_id)
+            .collect();
         Self {
             daily_quota_exhausted: false,
             retry_after_seconds: Some(secs),
+            retry_card_ids,
             next_step: format!(
                 "Gemini's per-minute TTS limit was reached. Wait about {secs}s, then call \
-                generate_card_audio again with only the card_ids whose status is \"failed\". \
+                generate_card_audio again with only the card_ids in \
+                rate_limited.retry_card_ids (other failures will not be fixed by retrying). \
                 Free-tier keys allow only a few TTS requests per minute, so send small batches \
                 (3-4 cards)."
             ),
@@ -508,7 +529,7 @@ async fn process_card(
     }
 
     if rate_limit.get().is_some() {
-        return CardAudioResult::failed(card_id, NOT_ATTEMPTED_RATE_LIMITED);
+        return CardAudioResult::failed(card_id, NOT_ATTEMPTED_RATE_LIMITED).into_rate_limited();
     }
     let pcm = match engine
         .synthesize(TtsRequest {
@@ -520,10 +541,12 @@ async fn process_card(
     {
         Ok(pcm) => pcm,
         Err(e) => {
+            let result = CardAudioResult::failed(card_id, e.to_string());
             if let TtsError::RateLimited { retry_after, daily } = e {
                 let _ = rate_limit.set(RateLimitHit { retry_after, daily });
+                return result.into_rate_limited();
             }
-            return CardAudioResult::failed(card_id, e.to_string());
+            return result;
         }
     };
 
@@ -631,7 +654,7 @@ impl EngramoMcpServer {
         succeeded or failed together. Free-tier Gemini keys allow only a few TTS requests \
         per minute and per day: prefer batches of 3-4 cards. If the result has a \
         `rate_limited` object, follow its `next_step` — it says whether to wait and retry \
-        the failed cards or stop for the day. Use list_tts_voices first to see available \
+        the cards listed in `rate_limited.retry_card_ids` or stop for the day. Use list_tts_voices first to see available \
         voices and the configured default."
     )]
     pub async fn generate_card_audio(
@@ -745,11 +768,15 @@ impl EngramoMcpServer {
             .filter(|r| matches!(r.status, CardAudioStatus::Failed))
             .count();
 
+        let rate_limited = rate_limit
+            .get()
+            .copied()
+            .map(|hit| RateLimitedSummary::from_hit(hit, &results));
         Ok(ok_json(&GenerateCardAudioResult {
             generated,
             skipped,
             failed,
-            rate_limited: rate_limit.get().copied().map(RateLimitedSummary::from_hit),
+            rate_limited,
             results,
         }))
     }
@@ -759,6 +786,7 @@ impl EngramoMcpServer {
 mod tests {
     use super::*;
     use crate::config::Redacted;
+    use crate::tts::DEFAULT_RATE_LIMIT_WAIT_SECS;
     use crate::tts::gemini::GeminiTts;
     use crate::tts::{TtsError, TtsPcm, Voice};
     use base64::Engine;
@@ -770,6 +798,48 @@ mod tests {
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_rate_limited_summary_clamps_zero_wait_and_defaults_missing_wait() {
+        let s = RateLimitedSummary::from_hit(
+            RateLimitHit {
+                retry_after: Some(Duration::ZERO),
+                daily: false,
+            },
+            &[],
+        );
+        assert_eq!(s.retry_after_seconds, Some(1));
+        let s = RateLimitedSummary::from_hit(
+            RateLimitHit {
+                retry_after: None,
+                daily: false,
+            },
+            &[],
+        );
+        assert_eq!(s.retry_after_seconds, Some(DEFAULT_RATE_LIMIT_WAIT_SECS));
+        assert!(
+            s.next_step
+                .contains(&format!("{DEFAULT_RATE_LIMIT_WAIT_SECS}s"))
+        );
+    }
+
+    #[test]
+    fn test_rate_limited_summary_lists_only_rate_limited_card_ids() {
+        let limited = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let results = vec![
+            CardAudioResult::failed(limited, NOT_ATTEMPTED_RATE_LIMITED).into_rate_limited(),
+            CardAudioResult::failed(other, "upload failed"),
+        ];
+        let s = RateLimitedSummary::from_hit(
+            RateLimitHit {
+                retry_after: None,
+                daily: false,
+            },
+            &results,
+        );
+        assert_eq!(s.retry_card_ids, vec![limited]);
+    }
 
     fn fake_engine() -> Arc<GeminiTts> {
         Arc::new(GeminiTts::new(
@@ -2977,6 +3047,16 @@ mod tests {
             summary["next_step"].as_str().unwrap().contains("17s"),
             "{body}"
         );
+        let retry: Vec<&str> = summary["retry_card_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(retry.len(), 6, "{body}");
+        for r in body["results"].as_array().unwrap() {
+            assert!(retry.contains(&r["card_id"].as_str().unwrap()), "{body}");
+        }
         let results = body["results"].as_array().unwrap();
         let not_attempted = results
             .iter()
@@ -2993,6 +3073,10 @@ mod tests {
         let summary = &body["rate_limited"];
         assert_eq!(summary["daily_quota_exhausted"], true, "{body}");
         assert!(summary.get("retry_after_seconds").is_none(), "{body}");
+        assert!(
+            summary["retry_card_ids"].as_array().unwrap().is_empty(),
+            "{body}"
+        );
         assert!(
             summary["next_step"]
                 .as_str()
