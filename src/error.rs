@@ -407,6 +407,13 @@ fn quota_message(
                     " The limit applies to each catalog separately: put further cards in \
                      another catalog, or delete cards you no longer need from this one."
                 }
+                "shared_catalogs" => {
+                    " Stop sharing a catalog you no longer need to share (unshare_catalog \
+                     removes everyone from it) to free a slot."
+                }
+                "collaborators_per_catalog" => {
+                    " Remove people who no longer need access with unshare_catalog."
+                }
                 _ => "",
             });
         }
@@ -1092,6 +1099,43 @@ mod tests {
         );
         assert!(m.contains("applies to each catalog separately"), "{m}");
         assert!(m.contains("another catalog"), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_collaborators_per_catalog_batch_and_hint() {
+        let m = quota(
+            "collaborators_per_catalog",
+            Some(4),
+            Some(5),
+            Some(3),
+            None,
+            Some("absolute"),
+        );
+        assert!(m.contains("People per shared catalog"), "{m}");
+        assert!(m.contains("smaller batch (up to 1)"), "{m}");
+        assert!(
+            m.contains("Remove people who no longer need access with unshare_catalog."),
+            "{m}"
+        );
+        assert!(m.contains("doesn't reset"), "{m}");
+        assert!(!m.contains("resets 20"), "{m}");
+        assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_shared_catalogs_lifetime_and_hint() {
+        let m = quota(
+            "shared_catalogs",
+            Some(1),
+            Some(1),
+            Some(1),
+            None,
+            Some("absolute"),
+        );
+        assert!(m.contains("Shared catalogs"), "{m}");
+        assert!(m.contains("lifetime limit reached"), "{m}");
+        assert!(m.contains("unshare_catalog removes everyone"), "{m}");
+        assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
     }
 
     #[test]

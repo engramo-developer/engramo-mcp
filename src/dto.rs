@@ -85,6 +85,58 @@ fn speaking_settings_is_empty(s: &Option<SpeakingSettings>) -> bool {
     s.as_ref().is_none_or(SpeakingSettings::is_empty)
 }
 
+// ── Catalog sharing ───────────────────────────────────────────────────────────
+
+/// Access level granted to a collaborator. Wire form is lowercase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLevel {
+    Viewer,
+    Editor,
+}
+
+/// One entry of `GET /catalogs/{id}/collaborators`. The author is not listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaboratorDto {
+    #[serde(rename = "userId")]
+    pub user_id: Uuid,
+    #[serde(rename = "accessLevel")]
+    pub access_level: AccessLevel,
+}
+
+/// One change in a share request. `access_level: None` serializes as `null`, which
+/// revokes the user's access, so the field is deliberately not skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CollaboratorChange {
+    #[serde(rename = "userId")]
+    pub user_id: Uuid,
+    #[serde(rename = "accessLevel")]
+    pub access_level: Option<AccessLevel>,
+}
+
+/// Body of `POST /catalogs/{id}/collaborators`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShareCatalogRequest {
+    pub changes: Vec<CollaboratorChange>,
+}
+
+/// Which catalogs `GET /catalogs` returns (its `filter` query param). Omitting it means all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogFilter {
+    Own,
+    Shared,
+}
+
+impl CatalogFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Shared => "shared",
+        }
+    }
+}
+
 /// Request-side shadowing settings. `language: None` serializes as `null`, which turns
 /// shadowing off, so the field is deliberately not skipped.
 #[derive(Debug, Serialize)]
@@ -750,6 +802,69 @@ pub struct UsageEntryDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_collaborator_change_serializes_level_and_null() {
+        let id = Uuid::nil();
+        let some = CollaboratorChange {
+            user_id: id,
+            access_level: Some(AccessLevel::Viewer),
+        };
+        assert_eq!(
+            serde_json::to_value(&some).unwrap(),
+            serde_json::json!({"userId": id, "accessLevel": "viewer"})
+        );
+        let none = CollaboratorChange {
+            user_id: id,
+            access_level: None,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(v.as_object().unwrap().contains_key("accessLevel"));
+        assert!(v["accessLevel"].is_null());
+    }
+
+    #[test]
+    fn test_share_request_serializes_changes() {
+        let req = ShareCatalogRequest {
+            changes: vec![CollaboratorChange {
+                user_id: Uuid::nil(),
+                access_level: Some(AccessLevel::Editor),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({"changes": [{"userId": Uuid::nil(), "accessLevel": "editor"}]})
+        );
+    }
+
+    #[test]
+    fn test_collaborator_dto_deserializes_list_and_empty() {
+        let id = Uuid::nil();
+        let list: Vec<CollaboratorDto> =
+            serde_json::from_value(serde_json::json!([{"userId": id, "accessLevel": "editor"}]))
+                .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].user_id, id);
+        assert_eq!(list[0].access_level, AccessLevel::Editor);
+        let empty: Vec<CollaboratorDto> = serde_json::from_str("[]").unwrap();
+        assert!(empty.is_empty());
+        assert!(
+            serde_json::from_value::<CollaboratorDto>(
+                serde_json::json!({"userId": id, "accessLevel": "owner"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_catalog_filter_wire_values() {
+        assert_eq!(CatalogFilter::Own.as_str(), "own");
+        assert_eq!(CatalogFilter::Shared.as_str(), "shared");
+        assert_eq!(
+            serde_json::to_value(CatalogFilter::Shared).unwrap(),
+            serde_json::json!("shared")
+        );
+    }
 
     #[test]
     fn test_catalog_summary_from_dto() {

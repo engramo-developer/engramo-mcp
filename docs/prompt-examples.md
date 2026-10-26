@@ -91,7 +91,20 @@ with `enabled: true` and `language: "es-ES"` (the language of the card fronts). 
 in the app's Shadowing tab. To see only those catalogs later, ask for "my shadowing catalogs"
 (`list_catalogs` with `speaking_only`).
 
-## 8. Check your plan, limits and usage
+## 8. Share a catalog with another user
+
+```
+Share my Spanish travel catalog with user 3f2b8c1e-5d4a-4e7b-9a10-2c6d8e9f0a11 as a viewer.
+```
+
+The model finds the catalog, then calls `share_catalog` with the user id (a UUID, not an email) and the
+default `viewer` level; say "editor" to let them edit cards too. It replies with the full collaborator list.
+Ask each person for their own user id: they can get it by asking their assistant "what's my EngrAmo user id?"
+(`get_subscription_usage`). Later, "who has access to my Spanish travel catalog?" calls `list_catalog_shares`,
+"stop sharing it with that user" calls `unshare_catalog`, and "show catalogs shared with me" calls
+`list_catalogs` with `filter: "shared"`. Only the owner can change shares.
+
+## 9. Check your plan, limits and usage
 
 ```
 How much of my EngrAmo plan have I used? When do my limits reset?

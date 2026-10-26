@@ -21,6 +21,8 @@ pub fn resource_label(resource_type: &str) -> Option<&'static str> {
         "tts_generations" => "Text-to-speech generations",
         "premium_tts_generations" => "Premium text-to-speech generations",
         "translation_chunks" => "Translations",
+        "shared_catalogs" => "Shared catalogs",
+        "collaborators_per_catalog" => "People per shared catalog",
         _ => return None,
     })
 }
@@ -443,6 +445,8 @@ mod tests {
             "tts_generations",
             "premium_tts_generations",
             "translation_chunks",
+            "shared_catalogs",
+            "collaborators_per_catalog",
         ] {
             assert!(resource_label(rt).is_some(), "{rt}");
         }

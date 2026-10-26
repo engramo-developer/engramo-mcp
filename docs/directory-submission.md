@@ -16,7 +16,7 @@ Each directory gets its own account, so one review's test runs can't change the 
 | Claude login | `mcp-review-claude@engramo.app` + password (same rule) |
 | Login method | Email + password on the EngrAmo OAuth page. No MFA, no email codes, no sign-up step |
 | Plan | Basic, plus a `cards_per_catalog: -1` override (see "Known limitations") |
-| Paid AI tools | Off on prod. Reviewers see **30 tools** |
+| Paid AI tools | Off on prod. Reviewers see **34 tools** |
 
 **Seeded data** (identical on both accounts; ChatGPT account 2026-10-14, Claude account 2026-10-18). The Claude
 account also has an empty **My Catalog** (Default) that the app creates on first sign-in.
@@ -116,7 +116,7 @@ account also has an empty **My Catalog** (Default) that the app creates on first
 
 ## 3. Tool annotations and justifications
 
-The 31 tools on prod. They touch only the signed-in user's EngrAmo account, never the wider internet. 28 have `openWorldHint: false`. Three have `openWorldHint: true`: `generate_catalog_with_cards`, `update_catalog` and `update_learning_path`. They accept `visibility: public` (or `unlisted` for catalogs), which makes the content visible to other EngrAmo users. *(Flagged by the ChatGPT scan on 2026-10-17; fixed in v1.2.12 (engramo-mcp #106).)*
+The 34 tools on prod. They touch only the signed-in user's EngrAmo account, never the wider internet. 30 have `openWorldHint: false`. Four have `openWorldHint: true`: `generate_catalog_with_cards`, `update_catalog`, `update_learning_path` and `share_catalog`. The first three accept `visibility: public` (or `unlisted` for catalogs), which makes the content visible to other EngrAmo users; `share_catalog` gives chosen users access to one of your catalogs. *(Flagged by the ChatGPT scan on 2026-10-17; fixed in v1.2.12 (engramo-mcp #106).)*
 
 ### 3.1 Read-only (`readOnlyHint: true`, `destructiveHint: false`)
 
@@ -125,6 +125,7 @@ The 31 tools on prod. They touch only the signed-in user's EngrAmo account, neve
 | `get_server_version` | Returns the server's name and version. |
 | `get_subscription_usage` | Reads the user's own plan, limits and usage. |
 | `list_catalogs`, `get_catalog` | Read the user's catalogs. |
+| `list_catalog_shares` | Lists who a catalog is shared with (owner or editors only). |
 | `list_cards`, `get_card` | Read cards. |
 | `get_due_cards`, `get_all_learning_cards` | Read the review schedule; grading happens in the app, not here. |
 | `list_learning_paths`, `get_learning_path` | Read learning paths. |
@@ -149,6 +150,8 @@ The 31 tools on prod. They touch only the signed-in user's EngrAmo account, neve
 | `update_card`, `update_catalog`, `update_learning_path` | Overwrite existing content; the previous values are not kept. |
 | `delete_card`, `delete_catalog` | Remove content (archived when it has learning history, otherwise hard-deleted). No restore tool. |
 | `set_catalog_shadowing` | Turns shadowing on or off for a catalog, or changes its language; overwrites the previous setting, and repeating the same call changes nothing. |
+| `share_catalog` | Gives the named users viewer or editor access to a catalog the user owns, or changes their level; repeating the call changes nothing. Marked destructive and open-world because it exposes content to other users. |
+| `unshare_catalog` | Removes the named users' access to a catalog the user owns; repeating the call changes nothing. |
 | `remove_catalog_from_learning_path` | Removes a membership. |
 | `deactivate_learning_path` | Stops the path's catalogs from being scheduled. Marked destructive on purpose because it changes what the user reviews. |
 
@@ -158,7 +161,7 @@ The 31 tools on prod. They touch only the signed-in user's EngrAmo account, neve
 
 Prompts are run against the reviewer account in a fresh conversation with the app connected. Expected tool calls are the main ones; the model may add reads (e.g. `list_catalogs`) first.
 
-### 4.1 Positive (5)
+### 4.1 Positive (6)
 
 | # | Prompt | Expected tools | Expected result |
 |---|---|---|---|
@@ -167,6 +170,7 @@ Prompts are run against the reviewer account in a fresh conversation with the ap
 | P3 | "Find my card about the train station and change the English side to 'Excuse me, where is the train station?'" | `search_global` (or `list_cards`), `update_card` | The card *¿Dónde está la estación de tren?* now has the new back text. `update_card` is annotated `destructiveHint`, so the client may ask for confirmation first (whether it does depends on the client's approval settings). |
 | P4 | "What learning paths do I have, and what's in the active one?" | `list_learning_paths`, `get_learning_path` | Shows two paths, both active: **Spanish for Travellers** (custom) containing both Spanish catalogs, and **My Learning Path** (the auto-created default). |
 | P5 | "Add five cards about pharmacy vocabulary to my Spanish health catalog." | `search_catalogs` or `list_catalogs`, `generate_cards` | Five new cards appear in **Spanish: Health & Daily Life (A2–B1)** (12 → 17 cards). |
+| P6 | "Share my Spanish deck with user <id> as a viewer." | `list_catalogs` or `search_catalogs`, `share_catalog` | The catalog lists that user as a viewer in the returned collaborator list. Use a second test account's user id (from its `get_subscription_usage`). Undo with `unshare_catalog`. |
 
 ### 4.2 Negative (3)
 
