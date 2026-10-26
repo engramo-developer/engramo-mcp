@@ -7,6 +7,7 @@ pub mod http_auth;
 pub mod prompts;
 pub mod resources;
 pub mod server;
+pub mod subscription;
 pub mod tools;
 pub mod tts;
 pub mod version;

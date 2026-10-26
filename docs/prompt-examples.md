@@ -90,3 +90,14 @@ The model finds the catalog with `list_catalogs` or `search_catalogs`, then call
 with `enabled: true` and `language: "es-ES"` (the language of the card fronts). The catalog then shows up
 in the app's Shadowing tab. To see only those catalogs later, ask for "my shadowing catalogs"
 (`list_catalogs` with `speaking_only`).
+
+## 8. Check your plan, limits and usage
+
+```
+How much of my EngrAmo plan have I used? When do my limits reset?
+```
+
+The model calls `get_subscription_usage`. It gets your userId, plan and, for each limit, used / remaining,
+whether it is lifetime or monthly, and the reset time in UTC. After a "Quota exceeded" or "Not included in
+your plan" error the model calls it on its own to explain what ran out and when it comes back. Plan changes
+aren't self-service yet; quote the userId when you contact the EngrAmo team.

@@ -182,6 +182,32 @@ impl EngramoMcpServer {
     pub async fn get_server_version(&self) -> Result<CallToolResult, ErrorData> {
         Ok(ok_json(&crate::version::server_version()))
     }
+
+    #[tool(
+        title = "Get subscription and usage",
+        annotations(
+            title = "Get subscription and usage",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Get the user's EngrAmo account: their userId, current plan (id, name, \
+        dates, any pending/lapsed/deactivated plan, unlocked features) and, for every limit, \
+        used / limit / remaining, whether it is unlimited or not included in the plan, its window \
+        ('absolute' = lifetime, never resets; 'monthly') and when it resets (UTC), plus daily and \
+        hourly sub-limits. Call this when the user asks about their plan, limits or usage, and \
+        after any 'Quota exceeded' or 'Not included in your plan' error, to explain what ran out \
+        and when it resets. howToChange says how the plan can be changed."
+    )]
+    pub async fn get_subscription_usage(&self) -> Result<CallToolResult, ErrorData> {
+        Ok(
+            match crate::subscription::subscription_usage(&self.client).await {
+                Ok(view) => ok_json(&view),
+                Err(e) => err_result(e),
+            },
+        )
+    }
 }
 
 // ── Catalog tools ─────────────────────────────────────────────────────────────
@@ -780,11 +806,10 @@ impl EngramoMcpServer {
                 Ok(()) => added.push(raw_id),
                 Err(e) => {
                     let e = disambiguate_catalog_forbidden(&self.client, id, e).await;
-                    // Unauthorized/QuotaExceeded won't clear up on the next id in this same
-                    // batch — stop instead of firing the rest of the requests under a token
-                    // that's already known to be rejected/rate-limited.
-                    let fatal =
-                        matches!(e, ApiError::Unauthorized | ApiError::QuotaExceeded { .. });
+                    // Unauthorized/QuotaExceeded/FeatureNotEntitled won't clear up on the next
+                    // id in this same batch — stop instead of firing the rest of the requests
+                    // under a token that's already known to be rejected/rate-limited.
+                    let fatal = e.stops_batch();
                     failed.push(CatalogAddFailure {
                         catalog_id: raw_id,
                         error: e.to_string(),
@@ -1802,12 +1827,11 @@ impl EngramoMcpServer {
                         ". "
                     };
                     let n = created_cards.len();
-                    let advice =
-                        if matches!(e, ApiError::Unauthorized | ApiError::QuotaExceeded { .. }) {
-                            "do not retry until the error above is resolved".to_string()
-                        } else {
-                            format!("retry only the remaining cards starting at index {n}")
-                        };
+                    let advice = if e.stops_batch() {
+                        "do not retry until the error above is resolved".to_string()
+                    } else {
+                        format!("retry only the remaining cards starting at index {n}")
+                    };
                     return Ok(err_result(format!(
                         "{e}{sep}{n} of {total} cards were created before this failure and \
                          were NOT rolled back (ids: {}); {advice}.",
@@ -4567,6 +4591,74 @@ mod tests {
     }
 
     #[test]
+    fn test_get_subscription_usage_registered_in_stdio_and_http_session() {
+        for flag in [false, true] {
+            let plain = EngramoMcpServer::new(EngramoClient::new("http://localhost", "t"), flag);
+            assert!(tool_names(&plain).contains(&"get_subscription_usage".to_string()));
+        }
+        let http = EngramoClient::build_http_client();
+        let session = build_session_server(&http, "http://localhost", "session-token", false);
+        assert!(tool_names(&session).contains(&"get_subscription_usage".to_string()));
+    }
+
+    #[test]
+    fn test_get_subscription_usage_annotations_and_description() {
+        let server = EngramoMcpServer::new(EngramoClient::new("http://localhost", "t"), false);
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "get_subscription_usage")
+            .expect("registered");
+        let a = tool.annotations.clone().expect("annotations");
+        assert_eq!(a.read_only_hint, Some(true));
+        assert_eq!(a.destructive_hint, Some(false));
+        assert_eq!(a.idempotent_hint, Some(true));
+        assert_eq!(a.open_world_hint, Some(false));
+        let d = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            d.contains("Quota exceeded") && d.contains("Not included in your plan"),
+            "{d}"
+        );
+        assert!(d.contains("userId"), "{d}");
+    }
+
+    #[tokio::test]
+    async fn test_get_subscription_usage_ok() {
+        let ms = wiremock::MockServer::start().await;
+        crate::subscription::fixtures::mount_account(&ms).await;
+        let result = mock_server_for(&ms.uri())
+            .get_subscription_usage()
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(first_text(&result)).unwrap();
+        assert_eq!(v["userId"], crate::subscription::fixtures::USER_ID);
+        assert_eq!(v["plan"]["id"], "free");
+        assert_eq!(v["usage"].as_array().unwrap().len(), 5);
+        assert_eq!(v["howToChange"], crate::error::PLAN_CHANGE_HINT);
+    }
+
+    #[tokio::test]
+    async fn test_get_subscription_usage_error_is_tool_error_not_err() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/usage"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&ms)
+            .await;
+        crate::subscription::fixtures::mount_account(&ms).await;
+        let result = mock_server_for(&ms.uri())
+            .get_subscription_usage()
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(first_text(&result).contains("Unauthorized"), "{result:?}");
+    }
+
+    #[test]
     fn test_set_catalog_shadowing_annotations() {
         let server = EngramoMcpServer::new(EngramoClient::new("http://localhost", "t"), false);
         let tool = server
@@ -5745,6 +5837,14 @@ mod tests {
     }
 
     async fn assert_fatal_status_skips_remaining(status: u16, expect_text: &str) {
+        assert_fatal_response_skips_remaining(wiremock::ResponseTemplate::new(status), expect_text)
+            .await;
+    }
+
+    async fn assert_fatal_response_skips_remaining(
+        response: wiremock::ResponseTemplate,
+        expect_text: &str,
+    ) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let path_id = "00000000-0000-0000-0000-000000000001";
@@ -5755,7 +5855,7 @@ mod tests {
         mount_path_create(&ms, path_id).await;
         Mock::given(method("POST"))
             .and(path(format!("/learning-paths/{path_id}/catalogs/{c1}")))
-            .respond_with(ResponseTemplate::new(status))
+            .respond_with(response)
             .expect(1)
             .mount(&ms)
             .await;
@@ -5799,6 +5899,19 @@ mod tests {
     #[tokio::test]
     async fn test_create_learning_path_quota_exceeded_catalog_add_skips_remaining_ids() {
         assert_fatal_status_skips_remaining(429, "").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_learning_path_feature_not_entitled_catalog_add_skips_remaining_ids() {
+        let body = serde_json::json!({
+            "error": "Forbidden", "code": "FEATURE_NOT_ENTITLED",
+            "feature": "catalog_share", "plan_id": "free"
+        });
+        assert_fatal_response_skips_remaining(
+            wiremock::ResponseTemplate::new(403).set_body_json(body),
+            "Not included in your plan",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -6200,7 +6313,7 @@ mod tests {
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, true).with_tts(fake_tts_engine());
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 37, "30 core + 5 paid AI + 2 local TTS");
+        assert_eq!(tools.len(), 38, "31 core + 5 paid AI + 2 local TTS");
         for t in &tools {
             let n = &t.name;
             assert!(t.title.is_some(), "{n}: missing title");

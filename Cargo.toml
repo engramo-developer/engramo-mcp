@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8"
 base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 mp3lame-encoder = "0.2.5"
 rand = "0.10"

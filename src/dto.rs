@@ -696,21 +696,58 @@ pub struct AiChatResponseDto {
 
 // ── Subscription ──────────────────────────────────────────────────────────────
 
+/// Response of `GET /me/subscription` (camelCase on the wire). The plan's raw `limits` JSON
+/// is not read: `GET /me/usage` reports the same limits per resource, already merged with
+/// per-user overrides.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserSubscriptionDto {
-    pub plan_id: Option<String>,
+    /// The currently effective plan (e.g. `free`, `basic`, `professional`, `payg`).
+    pub plan_id: String,
+    pub plan_name: String,
+    /// RFC 3339. When a pending/lapsed/deactivated plan is set, the dates describe that plan.
+    pub starts_at: String,
+    pub expires_at: Option<String>,
+    /// A paid plan whose window hasn't started yet (`plan_id` is still the effective one).
+    #[serde(default)]
+    pub pending_plan_id: Option<String>,
+    /// The most recent paid plan, now expired.
+    #[serde(default)]
+    pub lapsed_plan_id: Option<String>,
+    /// A plan still inside its dates but switched off server-side.
+    #[serde(default)]
+    pub deactivated_plan_id: Option<String>,
+    /// Features the effective plan unlocks (e.g. `ai_chat`, `tts_generate`).
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
+/// Response of `GET /me/usage` (snake_case on the wire).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UsageSummaryDto {
-    pub resources: Option<Vec<UsageResourceDto>>,
+    pub plan_id: String,
+    pub usage: Vec<UsageEntryDto>,
 }
 
+/// One resource of `GET /me/usage`. `limit` is `-1` for unlimited and `0` for "not part of
+/// the plan". `window`, the `resets_at*` fields and `scope_id` are absent on API builds that
+/// predate them, so they stay optional.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct UsageResourceDto {
+pub struct UsageEntryDto {
     pub resource_type: String,
     pub used: i64,
-    pub limit: Option<i64>,
+    pub limit: i64,
+    pub used_daily: Option<i64>,
+    pub limit_daily: Option<i64>,
+    pub used_hourly: Option<i64>,
+    pub limit_hourly: Option<i64>,
+    /// `"absolute"` (lifetime) or `"monthly"`.
+    pub window: Option<String>,
+    pub resets_at: Option<String>,
+    pub resets_at_daily: Option<String>,
+    pub resets_at_hourly: Option<String>,
+    /// `cards_per_catalog` only: the fullest catalog, whose count `used` reports.
+    pub scope_id: Option<Uuid>,
 }
 
 #[cfg(test)]

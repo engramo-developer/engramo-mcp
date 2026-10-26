@@ -1,12 +1,48 @@
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::subscription::{feature_label, format_reset, next_reset, resource_label};
+
+/// How a user changes plan, appended to every quota / plan-feature message and returned as
+/// `howToChange` by `get_subscription_usage`. There is no self-service plan management yet
+/// (plans are changed by the EngrAmo team), so never point at an app screen here.
+pub const PLAN_CHANGE_HINT: &str =
+    "Plan changes aren't self-service yet — contact the EngrAmo team to change your plan.";
+
 /// Structured error body returned by the Engramo API for quota exceeded (HTTP 429).
 #[derive(Debug, Deserialize)]
 pub struct QuotaExceededBody {
     pub resource_type: Option<String>,
     pub used: Option<i64>,
     pub limit: Option<i64>,
+    /// Size of the rejected request; explains a rejection while `used < limit`.
+    pub requested: Option<i64>,
+    pub plan_id: Option<String>,
+    /// `monthly`, `absolute`, `daily` or `hourly` — the window that ran out.
+    pub window: Option<String>,
+}
+
+/// `code` of the API's 403 body when the caller's plan doesn't unlock a feature.
+const FEATURE_NOT_ENTITLED_CODE: &str = "FEATURE_NOT_ENTITLED";
+
+/// Structured 403 body for a plan-feature denial; a plain ownership 403 is just
+/// `{"error":"Forbidden"}` and has no `code`.
+#[derive(Debug, Deserialize)]
+struct FeatureNotEntitledBody {
+    code: Option<String>,
+    feature: Option<String>,
+    plan_id: Option<String>,
+}
+
+/// Keeps an identifier from an upstream body only if it looks like one (`snake_case`, short),
+/// so it can be echoed into a message without carrying markup or control characters.
+fn ident(raw: Option<String>) -> Option<String> {
+    raw.filter(|s| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    })
 }
 
 /// Short, escaped preview of an untrusted (LLM-supplied) value for error text / logs —
@@ -37,13 +73,24 @@ pub enum ApiError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
-    #[error(
-        "Quota exceeded: {resource_type} limit reached ({used}/{limit}). Delete unused resources, or manage your plan in the EngrAmo app."
-    )]
+    /// HTTP 402/429. Fields are `None` when the body didn't carry them (an older API build,
+    /// or an unparseable body); the message then says the details are unavailable.
+    #[error("{}", quota_message(.resource_type, *.used, *.limit, *.requested, .plan_id.as_deref(), .window.as_deref()))]
     QuotaExceeded {
         resource_type: String,
-        used: i64,
-        limit: i64,
+        used: Option<i64>,
+        limit: Option<i64>,
+        requested: Option<i64>,
+        plan_id: Option<String>,
+        window: Option<String>,
+    },
+
+    /// HTTP 403 with `code: FEATURE_NOT_ENTITLED`: the caller's plan doesn't include the
+    /// feature. Retrying, or retrying with another id, won't help.
+    #[error("{}", feature_message(.feature, .plan_id.as_deref()))]
+    FeatureNotEntitled {
+        feature: String,
+        plan_id: Option<String>,
     },
 
     #[error("Bad request: {0}")]
@@ -128,6 +175,15 @@ impl From<reqwest::Error> for ApiError {
 }
 
 impl ApiError {
+    /// Whether this error will recur for every remaining item of a batch (same token, same
+    /// plan), so a per-item loop should stop instead of firing the rest of its requests.
+    pub fn stops_batch(&self) -> bool {
+        matches!(
+            self,
+            Self::Unauthorized | Self::QuotaExceeded { .. } | Self::FeatureNotEntitled { .. }
+        )
+    }
+
     /// Builds a `Decode` error from a `serde_json` failure while parsing an otherwise
     /// successful (2xx) response body. Logs at ERROR — this is a genuine contract mismatch
     /// between this crate's DTOs and the real API, not a routine tool-call outcome — but
@@ -220,28 +276,34 @@ impl ApiError {
                         .unwrap_or_default()
                 ))
             }
-            403 => Self::PermissionDenied(forbidden_hint(strip_duplicate_prefix(
-                "Permission denied",
-                extract_error_message(&body),
-            ))),
+            403 => match serde_json::from_str::<FeatureNotEntitledBody>(&body) {
+                Ok(b) if b.code.as_deref() == Some(FEATURE_NOT_ENTITLED_CODE) => {
+                    Self::FeatureNotEntitled {
+                        feature: ident(b.feature).unwrap_or_else(|| "unknown".to_string()),
+                        plan_id: ident(b.plan_id),
+                    }
+                }
+                _ => Self::PermissionDenied(forbidden_hint(strip_duplicate_prefix(
+                    "Permission denied",
+                    extract_error_message(&body),
+                ))),
+            },
             404 => Self::NotFound(dedup_or_raw("Not found", extract_error_message(&body))),
             409 => Self::Conflict(
                 "resource was modified by another client. Fetch the latest version and retry."
                     .to_string(),
             ),
             402 | 429 => {
-                if let Ok(quota) = serde_json::from_str::<QuotaExceededBody>(&body) {
-                    Self::QuotaExceeded {
-                        resource_type: quota.resource_type.unwrap_or_else(|| "unknown".to_string()),
-                        used: quota.used.unwrap_or(0),
-                        limit: quota.limit.unwrap_or(0),
-                    }
-                } else {
-                    Self::QuotaExceeded {
-                        resource_type: "unknown".to_string(),
-                        used: 0,
-                        limit: 0,
-                    }
+                let q = serde_json::from_str::<QuotaExceededBody>(&body).ok();
+                let q = q.as_ref();
+                Self::QuotaExceeded {
+                    resource_type: ident(q.and_then(|q| q.resource_type.clone()))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    used: q.and_then(|q| q.used),
+                    limit: q.and_then(|q| q.limit),
+                    requested: q.and_then(|q| q.requested),
+                    plan_id: ident(q.and_then(|q| q.plan_id.clone())),
+                    window: ident(q.and_then(|q| q.window.clone())),
                 }
             }
             // 422 is axum's rejection status for a request body that parses as JSON but
@@ -274,6 +336,112 @@ impl ApiError {
             }
         }
     }
+}
+
+/// Text of [`ApiError::QuotaExceeded`]: names the limit, its window and reset time (UTC),
+/// separates "this batch is too big" from "you're at the limit" and "not in your plan", and
+/// always ends by pointing at `get_subscription_usage` and [`PLAN_CHANGE_HINT`]. Keeps the
+/// `Quota exceeded:` prefix callers and tests match on.
+fn quota_message(
+    resource_type: &str,
+    used: Option<i64>,
+    limit: Option<i64>,
+    requested: Option<i64>,
+    plan_id: Option<&str>,
+    window: Option<&str>,
+) -> String {
+    quota_message_at(
+        resource_type,
+        used,
+        limit,
+        requested,
+        plan_id,
+        window,
+        chrono::Utc::now(),
+    )
+}
+
+fn quota_message_at(
+    resource_type: &str,
+    used: Option<i64>,
+    limit: Option<i64>,
+    requested: Option<i64>,
+    plan_id: Option<&str>,
+    window: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let what = match resource_label(resource_type) {
+        Some(label) => format!("{label} ({resource_type})"),
+        None => resource_type.to_string(),
+    };
+    let on_plan = plan_id
+        .map(|p| format!(" on your {p} plan"))
+        .unwrap_or_default();
+    let mut msg = format!("Quota exceeded: {what}");
+    match (used, limit) {
+        (_, Some(0)) => msg.push_str(&format!(
+            " isn't included in your {} plan.",
+            plan_id.unwrap_or("current")
+        )),
+        (Some(used), Some(limit)) => {
+            let kind = match window {
+                Some("absolute") => "lifetime ",
+                Some(w @ ("monthly" | "daily" | "hourly")) => &format!("{w} "),
+                _ => "",
+            };
+            match requested {
+                Some(req) if used < limit && used.saturating_add(req) > limit => {
+                    msg.push_str(&format!(
+                        " — this request needed {req}, but only {} of the {kind}limit of {limit} \
+                         {} left ({used} used{on_plan}). Try a smaller batch (up to {}).",
+                        limit - used,
+                        if limit - used == 1 { "is" } else { "are" },
+                        limit - used,
+                    ));
+                }
+                _ => msg.push_str(&format!(
+                    " — {kind}limit reached: {used} of {limit} used{on_plan}."
+                )),
+            }
+            match window {
+                Some("absolute") => msg.push_str(" This limit doesn't reset."),
+                Some(w) => {
+                    if let Some(at) = next_reset(w, now) {
+                        msg.push_str(&format!(" It resets {}.", format_reset(at)));
+                    }
+                }
+                None => {}
+            }
+            msg.push_str(match resource_type {
+                "catalogs_total" => " Deleting catalogs you no longer need frees room.",
+                "cards_total" => " Deleting cards you no longer need frees room.",
+                "cards_per_catalog" => {
+                    " The limit applies to each catalog separately: put further cards in \
+                     another catalog, or delete cards you no longer need from this one."
+                }
+                _ => "",
+            });
+        }
+        _ => msg.push_str(" limit reached (limit details unavailable)."),
+    }
+    msg.push_str(" Call get_subscription_usage to see all your limits and usage. ");
+    msg.push_str(PLAN_CHANGE_HINT);
+    msg
+}
+
+/// Text of [`ApiError::FeatureNotEntitled`].
+fn feature_message(feature: &str, plan_id: Option<&str>) -> String {
+    let what = match feature_label(feature) {
+        Some(label) => format!("{label} ({feature})"),
+        None => feature.to_string(),
+    };
+    let plan = plan_id
+        .map(|p| format!("the {p} plan"))
+        .unwrap_or_else(|| "your current plan".to_string());
+    format!(
+        "Not included in your plan: {what} isn't available on {plan}. Call \
+         get_subscription_usage to see what your plan includes. {PLAN_CHANGE_HINT}"
+    )
 }
 
 /// Redacts a redirect `Location` before it is echoed to the caller or written to logs — a
@@ -755,31 +923,228 @@ mod tests {
         assert!(e.to_string().contains("Fetch the latest version"));
     }
 
+    fn quota(
+        resource_type: &str,
+        used: Option<i64>,
+        limit: Option<i64>,
+        requested: Option<i64>,
+        plan_id: Option<&str>,
+        window: Option<&str>,
+    ) -> String {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-26T13:45:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        quota_message_at(resource_type, used, limit, requested, plan_id, window, now)
+    }
+
     #[test]
     fn test_error_texts_are_neutral() {
         let q = ApiError::QuotaExceeded {
             resource_type: "cards_total".into(),
-            used: 1,
-            limit: 1,
+            used: Some(1),
+            limit: Some(1),
+            requested: None,
+            plan_id: None,
+            window: None,
         }
         .to_string();
-        assert!(q.contains("manage your plan in the EngrAmo app"), "{q}");
+        assert!(q.ends_with(PLAN_CHANGE_HINT), "{q}");
+        assert!(
+            !q.contains("EngrAmo app"),
+            "no in-app plan management exists: {q}"
+        );
         assert!(!q.to_lowercase().contains("upgrade"), "{q}");
+        let f = ApiError::FeatureNotEntitled {
+            feature: "ai_chat".into(),
+            plan_id: Some("free".into()),
+        }
+        .to_string();
+        assert!(!f.to_lowercase().contains("upgrade"), "{f}");
         let u = ApiError::Unauthorized.to_string();
         assert!(u.contains("Reconnect EngrAmo"), "{u}");
         assert!(!u.contains("Check your ENGRAMO_API_TOKEN"), "{u}");
     }
 
     #[test]
-    fn test_quota_exceeded_display() {
-        let e = ApiError::QuotaExceeded {
-            resource_type: "cards_total".to_string(),
-            used: 500,
-            limit: 500,
-        };
-        let msg = e.to_string();
-        assert!(msg.contains("cards_total"));
-        assert!(msg.contains("500/500"));
+    fn test_quota_message_monthly_names_window_plan_and_reset() {
+        let m = quota(
+            "cards_total",
+            Some(500),
+            Some(500),
+            Some(1),
+            Some("basic"),
+            Some("monthly"),
+        );
+        assert!(
+            m.starts_with("Quota exceeded: Cards (total) (cards_total)"),
+            "{m}"
+        );
+        assert!(
+            m.contains("monthly limit reached: 500 of 500 used on your basic plan."),
+            "{m}"
+        );
+        assert!(m.contains("It resets 2026-11-01 00:00 UTC."), "{m}");
+        assert!(m.contains("Deleting cards you no longer need"), "{m}");
+        assert!(m.contains("Call get_subscription_usage"), "{m}");
+        assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_daily_and_hourly_resets() {
+        let m = quota(
+            "ai_agent_messages",
+            Some(20),
+            Some(20),
+            Some(1),
+            Some("free"),
+            Some("daily"),
+        );
+        assert!(
+            m.contains("AI chat messages (ai_agent_messages) — daily limit reached"),
+            "{m}"
+        );
+        assert!(m.contains("It resets 2026-10-27 00:00 UTC."), "{m}");
+        let m = quota(
+            "translation_chunks",
+            Some(20),
+            Some(20),
+            None,
+            None,
+            Some("hourly"),
+        );
+        assert!(m.contains("hourly limit reached: 20 of 20 used."), "{m}");
+        assert!(m.contains("It resets 2026-10-26 14:00 UTC."), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_absolute_says_it_never_resets() {
+        let m = quota(
+            "catalogs_total",
+            Some(5),
+            Some(5),
+            Some(1),
+            Some("free"),
+            Some("absolute"),
+        );
+        assert!(
+            m.contains("lifetime limit reached: 5 of 5 used on your free plan."),
+            "{m}"
+        );
+        assert!(m.contains("This limit doesn't reset."), "{m}");
+        assert!(m.contains("Deleting catalogs you no longer need"), "{m}");
+        assert!(!m.contains("resets 20"), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_batch_larger_than_headroom() {
+        let m = quota(
+            "cards_total",
+            Some(480),
+            Some(500),
+            Some(30),
+            Some("free"),
+            Some("absolute"),
+        );
+        assert!(
+            m.contains("this request needed 30, but only 20 of the lifetime limit of 500 are left"),
+            "{m}"
+        );
+        assert!(m.contains("Try a smaller batch (up to 20)."), "{m}");
+        assert!(
+            !m.contains("limit reached"),
+            "used < limit must not read as 'reached': {m}"
+        );
+    }
+
+    #[test]
+    fn test_quota_message_limit_zero_is_not_included() {
+        let m = quota(
+            "tts_generations",
+            Some(0),
+            Some(0),
+            Some(1),
+            Some("free"),
+            Some("monthly"),
+        );
+        assert!(
+            m.contains(
+                "Text-to-speech generations (tts_generations) isn't included in your free plan."
+            ),
+            "{m}"
+        );
+        assert!(!m.contains("0 of 0"), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_cards_per_catalog_hint() {
+        let m = quota(
+            "cards_per_catalog",
+            Some(100),
+            Some(100),
+            Some(1),
+            None,
+            Some("absolute"),
+        );
+        assert!(m.contains("applies to each catalog separately"), "{m}");
+        assert!(m.contains("another catalog"), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_without_details_never_shows_zero_over_zero() {
+        let m = quota("unknown", None, None, None, None, None);
+        assert!(
+            m.starts_with("Quota exceeded: unknown limit reached (limit details unavailable)."),
+            "{m}"
+        );
+        assert!(!m.contains("0/0") && !m.contains("0 of 0"), "{m}");
+        assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
+        // An old body with used/limit but no window: no reset sentence, still clear.
+        let m = quota("future_thing", Some(3), Some(3), None, None, None);
+        assert!(
+            m.starts_with("Quota exceeded: future_thing — limit reached: 3 of 3 used."),
+            "{m}"
+        );
+        assert!(!m.contains("resets"), "{m}");
+    }
+
+    #[test]
+    fn test_feature_message_names_feature_and_plan() {
+        let f = ApiError::FeatureNotEntitled {
+            feature: "ai_chat".into(),
+            plan_id: Some("free".into()),
+        }
+        .to_string();
+        assert!(
+            f.starts_with(
+                "Not included in your plan: AI chat (ai_chat) isn't available on the free plan."
+            ),
+            "{f}"
+        );
+        assert!(f.contains("Call get_subscription_usage"), "{f}");
+        assert!(f.ends_with(PLAN_CHANGE_HINT), "{f}");
+        let f = ApiError::FeatureNotEntitled {
+            feature: "new_feature".into(),
+            plan_id: None,
+        }
+        .to_string();
+        assert!(
+            f.contains("new_feature isn't available on your current plan."),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn test_stops_batch() {
+        assert!(ApiError::Unauthorized.stops_batch());
+        assert!(
+            ApiError::FeatureNotEntitled {
+                feature: "ai_chat".into(),
+                plan_id: None
+            }
+            .stops_batch()
+        );
+        assert!(!ApiError::NotFound("x".into()).stops_batch());
+        assert!(!ApiError::PermissionDenied("x".into()).stops_batch());
     }
 
     #[test]
@@ -794,36 +1159,151 @@ mod tests {
         assert_eq!(e.to_string(), "Bad request: 'name' field is required");
     }
 
-    #[tokio::test]
-    async fn test_from_response_quota_exceeded_with_body() {
+    async fn from_status_body(status: u16, body: Option<serde_json::Value>) -> ApiError {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        let mut template = ResponseTemplate::new(status);
+        if let Some(body) = body {
+            template = template.set_body_json(body);
+        }
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        ApiError::from_response(resp).await
+    }
+
+    #[tokio::test]
+    async fn test_from_response_quota_exceeded_with_body() {
+        // The API's real 429 body (`routes/mod.rs` IntoResponse for QuotaExceeded).
+        let err = from_status_body(
+            429,
+            Some(serde_json::json!({
                 "error": "quota_exceeded",
                 "resource_type": "cards_total",
                 "used": 100,
-                "limit": 100
-            })))
-            .mount(&server)
-            .await;
-
-        let resp = reqwest::get(server.uri()).await.unwrap();
-        let err = ApiError::from_response(resp).await;
-
+                "limit": 100,
+                "requested": 5,
+                "plan_id": "free",
+                "window": "absolute"
+            })),
+        )
+        .await;
         match err {
             ApiError::QuotaExceeded {
                 resource_type,
                 used,
                 limit,
+                requested,
+                plan_id,
+                window,
             } => {
                 assert_eq!(resource_type, "cards_total");
-                assert_eq!(used, 100);
-                assert_eq!(limit, 100);
+                assert_eq!((used, limit, requested), (Some(100), Some(100), Some(5)));
+                assert_eq!(plan_id.as_deref(), Some("free"));
+                assert_eq!(window.as_deref(), Some("absolute"));
             }
             other => panic!("expected QuotaExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_response_quota_exceeded_old_body_and_no_body() {
+        let err = from_status_body(
+            429,
+            Some(serde_json::json!({"resource_type": "cards_total", "used": 1, "limit": 1})),
+        )
+        .await;
+        assert!(
+            matches!(
+                &err,
+                ApiError::QuotaExceeded {
+                    used: Some(1),
+                    window: None,
+                    plan_id: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let err = from_status_body(402, None).await;
+        assert!(
+            matches!(
+                &err,
+                ApiError::QuotaExceeded {
+                    used: None,
+                    limit: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("limit details unavailable"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_response_quota_exceeded_drops_non_identifier_strings() {
+        let err = from_status_body(
+            429,
+            Some(serde_json::json!({
+                "resource_type": "<b>x</b>",
+                "used": 1, "limit": 1,
+                "plan_id": "free\nINJECTED",
+                "window": "monthly"
+            })),
+        )
+        .await;
+        match err {
+            ApiError::QuotaExceeded {
+                resource_type,
+                plan_id,
+                window,
+                ..
+            } => {
+                assert_eq!(resource_type, "unknown");
+                assert_eq!(plan_id, None);
+                assert_eq!(window.as_deref(), Some("monthly"));
+            }
+            other => panic!("expected QuotaExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_response_feature_not_entitled() {
+        let err = from_status_body(
+            403,
+            Some(serde_json::json!({
+                "error": "Forbidden",
+                "code": "FEATURE_NOT_ENTITLED",
+                "feature": "ai_chat",
+                "plan_id": "free"
+            })),
+        )
+        .await;
+        match &err {
+            ApiError::FeatureNotEntitled { feature, plan_id } => {
+                assert_eq!(feature, "ai_chat");
+                assert_eq!(plan_id.as_deref(), Some("free"));
+            }
+            other => panic!("expected FeatureNotEntitled, got {other:?}"),
+        }
+        assert!(err.stops_batch());
+    }
+
+    #[tokio::test]
+    async fn test_from_response_bare_forbidden_stays_permission_denied() {
+        let err = from_status_body(403, Some(serde_json::json!({"error": "Forbidden"}))).await;
+        match err {
+            ApiError::PermissionDenied(msg) => {
+                assert!(msg.contains("may belong to another user"), "{msg}")
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
         }
     }
 

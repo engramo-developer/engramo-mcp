@@ -9,7 +9,7 @@
 //!   engramo://learning/due          — due cards for today (card_id, face_text)
 //!   engramo://learning/stats        — learning stats (due_count, total_count)
 //!   engramo://learning-paths        — all learning paths (id, name)
-//!   engramo://subscription          — user subscription / plan info
+//!   engramo://subscription          — userId, plan, limits and usage (= get_subscription_usage)
 
 use rmcp::model::{
     ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
@@ -194,7 +194,8 @@ pub fn list_all() -> ListResourcesResult {
         make_resource(
             URI_SUBSCRIPTION,
             "Subscription",
-            "User subscription plan information.",
+            "Your userId, plan and features, and every limit with used / remaining and when it resets \
+             (same view as the get_subscription_usage tool).",
             "application/json",
         ),
     ])
@@ -329,8 +330,8 @@ async fn read_learning_paths(client: &EngramoClient) -> Result<String, ApiError>
 }
 
 async fn read_subscription(client: &EngramoClient) -> Result<String, ApiError> {
-    let sub = client.get_subscription().await?;
-    Ok(serde_json::to_string(&sub).unwrap_or_default())
+    let view = crate::subscription::subscription_usage(client).await?;
+    Ok(serde_json::to_string(&view).unwrap_or_default())
 }
 
 fn read_card_schema() -> ReadResourceResult {
@@ -860,23 +861,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_subscription_ok() {
-        use serde_json::json;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/me/subscription"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plan_id": "pro"})))
-            .mount(&server)
-            .await;
+        let server = wiremock::MockServer::start().await;
+        crate::subscription::fixtures::mount_account(&server).await;
 
         let client = EngramoClient::new(server.uri(), "tok");
         let result = read(&client, ReadResourceRequestParams::new(URI_SUBSCRIPTION))
             .await
             .unwrap();
         assert_eq!(result.contents.len(), 1);
-        let text = resource_text(&result);
-        assert!(text.contains("pro"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(resource_text(&result)).unwrap();
+        // Same normalized view as the get_subscription_usage tool.
+        let tool = crate::subscription::subscription_usage(&client)
+            .await
+            .unwrap();
+        assert_eq!(v, serde_json::to_value(tool).unwrap());
+        assert_eq!(v["userId"], crate::subscription::fixtures::USER_ID);
+        assert_eq!(v["plan"]["id"], "free");
     }
 }

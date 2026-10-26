@@ -2016,12 +2016,32 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/me/subscription"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plan_id": "pro"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::subscription::fixtures::subscription()),
+            )
             .mount(&server)
             .await;
 
         let result = client(&server.uri()).get_subscription().await.unwrap();
-        assert_eq!(result.plan_id.as_deref(), Some("pro"));
+        assert_eq!(result.plan_id, "free");
+        assert_eq!(result.plan_name, "Free");
+        assert_eq!(result.features, vec!["api_token_create".to_string()]);
+        assert_eq!(result.pending_plan_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_subscription_rejects_snake_case_shape() {
+        // The API sends camelCase; the old snake_case DTO silently read `plan_id: null`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/subscription"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plan_id": "pro"})))
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri()).get_subscription().await.unwrap_err();
+        assert!(matches!(err, ApiError::Decode(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -2029,16 +2049,38 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/me/usage"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "resources": [{"resource_type": "cards_total", "used": 42, "limit": 500}]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(crate::subscription::fixtures::usage()),
+            )
             .mount(&server)
             .await;
 
         let result = client(&server.uri()).get_usage().await.unwrap();
-        let resources = result.resources.unwrap();
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].used, 42);
+        assert_eq!(result.plan_id, "free");
+        assert_eq!(result.usage.len(), 5);
+        let per_catalog = &result.usage[1];
+        assert_eq!(per_catalog.resource_type, "cards_per_catalog");
+        assert_eq!(per_catalog.window.as_deref(), Some("absolute"));
+        assert!(per_catalog.scope_id.is_some());
+        assert_eq!(result.usage[3].limit_hourly, Some(20));
+    }
+
+    #[tokio::test]
+    async fn test_get_usage_accepts_body_without_window_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/usage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::subscription::fixtures::usage_before_windows()),
+            )
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri()).get_usage().await.unwrap();
+        assert_eq!(result.usage[0].used, 42);
+        assert_eq!(result.usage[0].window, None);
+        assert_eq!(result.usage[0].resets_at, None);
     }
 
     #[tokio::test]

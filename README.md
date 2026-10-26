@@ -492,6 +492,7 @@ storage quotas, and needs no paid EngrAmo plan.
 | Tool | Description |
 |---|---|
 | `get_server_version` | Get this MCP server's own build version (not a catalog/card's `version` field) |
+| `get_subscription_usage` | Your userId, plan and features, and every limit: used, remaining, unlimited or not included, its window (lifetime or monthly, plus daily/hourly sub-limits) and when it resets (UTC). Call it after a "Quota exceeded" or "Not included in your plan" error |
 
 ### Catalogs
 | Tool | Description |
@@ -650,7 +651,7 @@ The server also exposes **MCP Resources** (live data readable as context):
 | `engramo://learning/due` | Cards due for review today |
 | `engramo://learning/stats` | Learning stats (due_count, total_count) |
 | `engramo://learning-paths` | All learning paths (id, name) |
-| `engramo://subscription` | User subscription/plan information |
+| `engramo://subscription` | Your userId, plan, limits and usage (same view as `get_subscription_usage`) |
 
 And **MCP Prompts** (guided workflows):
 

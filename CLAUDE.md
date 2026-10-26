@@ -25,10 +25,15 @@ src/
 │                       only for stdio, see require_token()), ENGRAMO_ENABLE_PAID_AI (default off)
 ├── client.rs        — EngramoClient: typed HTTP client, attaches X-Api-Key header
 ├── error.rs         — ApiError enum: maps HTTP status → typed error
+│                       (402/429 → QuotaExceeded, 403 `FEATURE_NOT_ENTITLED` → FeatureNotEntitled; both
+│                       messages end with PLAN_CHANGE_HINT — plans aren't self-service, never point at an app screen)
 ├── http_auth.rs     — http mode's auth edge: bearer extraction/validation, the CURRENT_BEARER_TOKEN
 │                       task-local, and SessionTokens (binds each MCP session to the token that
 │                       opened it — rmcp authorizes later requests on the session id alone)
 ├── dto.rs           — lightweight DTOs mirroring API JSON shapes
+├── subscription.rs  — the caller's userId/plan/limits/usage as one normalized view (shared by the
+│                       `get_subscription_usage` tool and `engramo://subscription`), plus the resource /
+│                       feature labels and UTC reset rules `error.rs` uses for quota / plan-feature messages
 ├── server.rs        — EngramoMcpServer: ServerHandler impl + always-on tool handlers; `new()`
 │                       conditionally sums in `Self::paid_ai_tools_router()` when the flag is on;
 │                       `with_tts()` separately sums in the local-TTS router (see `tts/` below)
