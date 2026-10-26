@@ -84,6 +84,9 @@ pub struct SubscriptionUsageView {
 pub struct PlanView {
     pub id: String,
     pub name: String,
+    /// The plan `startsAt`/`expiresAt` describe: the pending/lapsed/deactivated plan when one
+    /// is set, else the effective plan (`id`).
+    pub dates_plan_id: String,
     pub starts_at: String,
     pub expires_at: Option<String>,
     pub pending_plan_id: Option<String>,
@@ -173,7 +176,14 @@ impl From<UsageEntryDto> for UsageView {
 
 impl From<UserSubscriptionDto> for PlanView {
     fn from(s: UserSubscriptionDto) -> Self {
+        let dates_plan_id = s
+            .pending_plan_id
+            .clone()
+            .or_else(|| s.lapsed_plan_id.clone())
+            .or_else(|| s.deactivated_plan_id.clone())
+            .unwrap_or_else(|| s.plan_id.clone());
         Self {
+            dates_plan_id,
             id: s.plan_id,
             name: s.plan_name,
             starts_at: s.starts_at,
@@ -280,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn next_reset_follows_utc_calendar_boundaries() {
+    fn test_next_reset_follows_utc_calendar_boundaries() {
         let now = at("2026-10-26T13:45:10Z");
         assert_eq!(next_reset("monthly", now), Some(at("2026-11-01T00:00:00Z")));
         assert_eq!(next_reset("daily", now), Some(at("2026-10-27T00:00:00Z")));
@@ -290,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn next_reset_rolls_over_year_month_and_day_ends() {
+    fn test_next_reset_rolls_over_year_month_and_day_ends() {
         let now = at("2026-12-31T23:59:59Z");
         assert_eq!(next_reset("monthly", now), Some(at("2027-01-01T00:00:00Z")));
         assert_eq!(next_reset("daily", now), Some(at("2027-01-01T00:00:00Z")));
@@ -298,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_normalize_unlimited_not_included_and_overuse() {
+    fn test_counts_new_normalizes_unlimited_not_included_and_overuse() {
         let c = Counts::new(7, -1);
         assert!(c.unlimited && c.included);
         assert_eq!((c.limit, c.remaining), (None, None));
@@ -313,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_usage_normalizes_the_three_responses() {
+    async fn test_subscription_usage_normalizes_the_three_responses() {
         use serde_json::json;
         let server = wiremock::MockServer::start().await;
         fixtures::mount_account(&server).await;
@@ -324,7 +334,7 @@ mod tests {
         assert_eq!(
             v["plan"],
             json!({
-                "id": "free", "name": "Free",
+                "id": "free", "name": "Free", "datesPlanId": "free",
                 "startsAt": "2026-01-01T00:00:00Z", "expiresAt": null,
                 "pendingPlanId": null, "lapsedPlanId": null, "deactivatedPlanId": null,
                 "features": ["api_token_create"]
@@ -379,7 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_usage_against_an_api_without_windows() {
+    async fn test_subscription_usage_against_an_api_without_windows() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -403,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_usage_fails_whole_when_any_call_fails() {
+    async fn test_subscription_usage_fails_whole_when_any_call_fails() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         for (failing, status) in [("/me", 401), ("/me/subscription", 500), ("/me/usage", 401)] {
@@ -424,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn every_known_resource_and_feature_has_a_label() {
+    fn test_labels_cover_every_known_resource_and_feature() {
         for rt in [
             "catalogs_total",
             "cards_total",
@@ -449,5 +459,54 @@ mod tests {
             assert!(feature_label(f).is_some(), "{f}");
         }
         assert_eq!(resource_label("future_thing"), None);
+    }
+
+    #[test]
+    fn test_usage_view_sub_window_without_used_defaults_to_zero_and_plan_ids_pass_through() {
+        let e: UsageEntryDto = serde_json::from_value(serde_json::json!({
+            "resource_type": "ai_agent_messages", "used": 1, "limit": 10,
+            "limit_daily": 5, "resets_at_daily": "2026-10-27T00:00:00Z"
+        }))
+        .unwrap();
+        let v = serde_json::to_value(UsageView::from(e)).unwrap();
+        assert_eq!(v["daily"]["used"], 0);
+        assert_eq!(v["daily"]["remaining"], 5);
+        assert!(v.get("hourly").is_none() && v.get("catalogId").is_none());
+
+        let mut s = fixtures::subscription();
+        s["pendingPlanId"] = "basic".into();
+        s["lapsedPlanId"] = "professional".into();
+        s["deactivatedPlanId"] = "payg".into();
+        let dto: UserSubscriptionDto = serde_json::from_value(s).unwrap();
+        let p = serde_json::to_value(PlanView::from(dto)).unwrap();
+        assert_eq!(
+            (
+                p["pendingPlanId"].as_str(),
+                p["lapsedPlanId"].as_str(),
+                p["deactivatedPlanId"].as_str()
+            ),
+            (Some("basic"), Some("professional"), Some("payg"))
+        );
+        assert_eq!(p["id"], "free");
+        assert_eq!(p["datesPlanId"], "basic", "pending plan owns the dates");
+    }
+
+    #[test]
+    fn test_plan_view_dates_plan_id_precedence() {
+        let plan = |pending: Option<&str>, lapsed: Option<&str>, deact: Option<&str>| {
+            let mut s = fixtures::subscription();
+            s["pendingPlanId"] = pending.into();
+            s["lapsedPlanId"] = lapsed.into();
+            s["deactivatedPlanId"] = deact.into();
+            let dto: UserSubscriptionDto = serde_json::from_value(s).unwrap();
+            PlanView::from(dto).dates_plan_id
+        };
+        assert_eq!(plan(None, None, None), "free");
+        assert_eq!(plan(None, Some("basic"), Some("payg")), "basic");
+        assert_eq!(plan(None, None, Some("payg")), "payg");
+        assert_eq!(
+            plan(Some("professional"), Some("basic"), None),
+            "professional"
+        );
     }
 }

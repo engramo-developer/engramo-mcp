@@ -75,14 +75,17 @@ pub enum ApiError {
 
     /// HTTP 402/429. Fields are `None` when the body didn't carry them (an older API build,
     /// or an unparseable body); the message then says the details are unavailable.
-    #[error("{}", quota_message(.resource_type, *.used, *.limit, *.requested, .plan_id.as_deref(), .window.as_deref()))]
+    #[error("{}", quota_message(.resource_type, *.used, *.limit, *.requested, .plan_id.as_deref(), .window.as_deref(), resets_at_ref(.resets_at)))]
     QuotaExceeded {
         resource_type: String,
         used: Option<i64>,
         limit: Option<i64>,
         requested: Option<i64>,
-        plan_id: Option<String>,
+        plan_id: Option<Box<str>>,
         window: Option<String>,
+        /// Computed once when the 429 arrived, so `Display` stays a pure function of the fields.
+        /// `plan_id` and this are boxed to keep `ApiError` under clippy's `result_large_err` threshold.
+        resets_at: Option<Box<chrono::DateTime<chrono::Utc>>>,
     },
 
     /// HTTP 403 with `code: FEATURE_NOT_ENTITLED`: the caller's plan doesn't include the
@@ -296,14 +299,20 @@ impl ApiError {
             402 | 429 => {
                 let q = serde_json::from_str::<QuotaExceededBody>(&body).ok();
                 let q = q.as_ref();
+                let window = ident(q.and_then(|q| q.window.clone()));
+                let resets_at = window
+                    .as_deref()
+                    .and_then(|w| next_reset(w, chrono::Utc::now()))
+                    .map(Box::new);
                 Self::QuotaExceeded {
                     resource_type: ident(q.and_then(|q| q.resource_type.clone()))
                         .unwrap_or_else(|| "unknown".to_string()),
                     used: q.and_then(|q| q.used),
                     limit: q.and_then(|q| q.limit),
                     requested: q.and_then(|q| q.requested),
-                    plan_id: ident(q.and_then(|q| q.plan_id.clone())),
-                    window: ident(q.and_then(|q| q.window.clone())),
+                    plan_id: ident(q.and_then(|q| q.plan_id.clone())).map(String::into_boxed_str),
+                    window,
+                    resets_at,
                 }
             }
             // 422 is axum's rejection status for a request body that parses as JSON but
@@ -349,26 +358,7 @@ fn quota_message(
     requested: Option<i64>,
     plan_id: Option<&str>,
     window: Option<&str>,
-) -> String {
-    quota_message_at(
-        resource_type,
-        used,
-        limit,
-        requested,
-        plan_id,
-        window,
-        chrono::Utc::now(),
-    )
-}
-
-fn quota_message_at(
-    resource_type: &str,
-    used: Option<i64>,
-    limit: Option<i64>,
-    requested: Option<i64>,
-    plan_id: Option<&str>,
-    window: Option<&str>,
-    now: chrono::DateTime<chrono::Utc>,
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> String {
     let what = match resource_label(resource_type) {
         Some(label) => format!("{label} ({resource_type})"),
@@ -391,12 +381,11 @@ fn quota_message_at(
             };
             match requested {
                 Some(req) if used < limit && used.saturating_add(req) > limit => {
+                    let left = limit.saturating_sub(used);
                     msg.push_str(&format!(
-                        " — this request needed {req}, but only {} of the {kind}limit of {limit} \
-                         {} left ({used} used{on_plan}). Try a smaller batch (up to {}).",
-                        limit - used,
-                        if limit - used == 1 { "is" } else { "are" },
-                        limit - used,
+                        " — this request needed {req}, but only {left} of the {kind}limit of {limit} \
+                         {} left ({used} used{on_plan}). Try a smaller batch (up to {left}).",
+                        if left == 1 { "is" } else { "are" },
                     ));
                 }
                 _ => msg.push_str(&format!(
@@ -405,12 +394,11 @@ fn quota_message_at(
             }
             match window {
                 Some("absolute") => msg.push_str(" This limit doesn't reset."),
-                Some(w) => {
-                    if let Some(at) = next_reset(w, now) {
+                _ => {
+                    if let Some(at) = resets_at {
                         msg.push_str(&format!(" It resets {}.", format_reset(at)));
                     }
                 }
-                None => {}
             }
             msg.push_str(match resource_type {
                 "catalogs_total" => " Deleting catalogs you no longer need frees room.",
@@ -427,6 +415,13 @@ fn quota_message_at(
     msg.push_str(" Call get_subscription_usage to see all your limits and usage. ");
     msg.push_str(PLAN_CHANGE_HINT);
     msg
+}
+
+/// Unboxes `QuotaExceeded::resets_at` for the `#[error]` format expression.
+fn resets_at_ref(
+    at: &Option<Box<chrono::DateTime<chrono::Utc>>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    at.as_deref().copied()
 }
 
 /// Text of [`ApiError::FeatureNotEntitled`].
@@ -934,7 +929,16 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-26T13:45:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        quota_message_at(resource_type, used, limit, requested, plan_id, window, now)
+        let resets_at = window.and_then(|w| next_reset(w, now));
+        quota_message(
+            resource_type,
+            used,
+            limit,
+            requested,
+            plan_id,
+            window,
+            resets_at,
+        )
     }
 
     #[test]
@@ -946,6 +950,7 @@ mod tests {
             requested: None,
             plan_id: None,
             window: None,
+            resets_at: None,
         }
         .to_string();
         assert!(q.ends_with(PLAN_CHANGE_HINT), "{q}");
@@ -1200,7 +1205,9 @@ mod tests {
                 requested,
                 plan_id,
                 window,
+                resets_at,
             } => {
+                assert_eq!(resets_at, None, "absolute never resets");
                 assert_eq!(resource_type, "cards_total");
                 assert_eq!((used, limit, requested), (Some(100), Some(100), Some(5)));
                 assert_eq!(plan_id.as_deref(), Some("free"));
@@ -1264,11 +1271,13 @@ mod tests {
                 resource_type,
                 plan_id,
                 window,
+                resets_at,
                 ..
             } => {
                 assert_eq!(resource_type, "unknown");
                 assert_eq!(plan_id, None);
                 assert_eq!(window.as_deref(), Some("monthly"));
+                assert!(resets_at.is_some(), "monthly window has a reset");
             }
             other => panic!("expected QuotaExceeded, got {other:?}"),
         }
@@ -1294,6 +1303,113 @@ mod tests {
             other => panic!("expected FeatureNotEntitled, got {other:?}"),
         }
         assert!(err.stops_batch());
+    }
+
+    #[tokio::test]
+    async fn test_from_response_feature_not_entitled_drops_non_identifier_strings() {
+        let err = from_status_body(
+            403,
+            Some(serde_json::json!({
+                "error": "Forbidden", "code": "FEATURE_NOT_ENTITLED",
+                "feature": "<img src=x>", "plan_id": "free\nINJECTED"
+            })),
+        )
+        .await;
+        match &err {
+            ApiError::FeatureNotEntitled { feature, plan_id } => {
+                assert_eq!(feature, "unknown");
+                assert_eq!(plan_id, &None);
+            }
+            other => panic!("expected FeatureNotEntitled, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(!msg.contains('<') && !msg.contains('\n'), "{msg}");
+        assert!(msg.contains("your current plan"), "{msg}");
+        let err = from_status_body(
+            403,
+            Some(serde_json::json!({"code": "FEATURE_NOT_ENTITLED"})),
+        )
+        .await;
+        assert!(
+            matches!(&err, ApiError::FeatureNotEntitled { feature, plan_id: None } if feature == "unknown"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_response_403_other_code_or_text_body_stays_permission_denied() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let err = from_status_body(
+            403,
+            Some(serde_json::json!({
+                "error": "Forbidden", "code": "SOMETHING_ELSE", "feature": "ai_chat"
+            })),
+        )
+        .await;
+        assert!(matches!(err, ApiError::PermissionDenied(_)), "{err:?}");
+        assert!(!err.stops_batch());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let err = ApiError::from_response(resp).await;
+        assert!(matches!(err, ApiError::PermissionDenied(_)), "{err:?}");
+        assert!(!err.stops_batch());
+    }
+
+    #[test]
+    fn test_quota_message_batch_with_one_left_uses_singular() {
+        let m = quota(
+            "cards_total",
+            Some(499),
+            Some(500),
+            Some(5),
+            None,
+            Some("monthly"),
+        );
+        assert!(
+            m.contains("only 1 of the monthly limit of 500 is left (499 used)."),
+            "{m}"
+        );
+        assert!(m.contains("Try a smaller batch (up to 1)."), "{m}");
+        assert!(m.contains("It resets 2026-11-01 00:00 UTC."), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_unknown_window_and_partial_counts() {
+        let m = quota("cards_total", Some(3), Some(3), None, None, Some("weekly"));
+        assert!(
+            m.contains("Cards (total) (cards_total) — limit reached: 3 of 3 used."),
+            "{m}"
+        );
+        assert!(!m.contains("weekly") && !m.contains("resets"), "{m}");
+        for (used, limit) in [(Some(3), None), (None, Some(5))] {
+            let m = quota("cards_total", used, limit, None, None, None);
+            assert!(
+                m.contains("limit reached (limit details unavailable)."),
+                "{used:?}/{limit:?}: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ident_rejects_empty_and_overlong() {
+        assert_eq!(ident(Some(String::new())), None);
+        assert_eq!(ident(Some("a".repeat(65))), None);
+        assert_eq!(
+            ident(Some("a".repeat(64))).as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(ident(Some("Free".into())), None, "uppercase rejected");
+        assert_eq!(
+            ident(Some("cards_total_2".into())).as_deref(),
+            Some("cards_total_2")
+        );
+        assert_eq!(ident(None), None);
     }
 
     #[tokio::test]

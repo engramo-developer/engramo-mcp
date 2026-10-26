@@ -285,9 +285,14 @@ impl AuthState {
     async fn probe(&self, token: &str) -> TokenProbe {
         let client = EngramoClient::with_http(self.http.clone(), &self.api_url, token);
         match tokio::time::timeout(PROBE_TIMEOUT, client.get_me()).await {
-            Ok(Ok(_) | Err(ApiError::PermissionDenied(_) | ApiError::Decode(_))) => {
-                TokenProbe::Valid
-            }
+            Ok(
+                Ok(_)
+                | Err(
+                    ApiError::PermissionDenied(_)
+                    | ApiError::FeatureNotEntitled { .. }
+                    | ApiError::Decode(_),
+                ),
+            ) => TokenProbe::Valid,
             Ok(Err(ApiError::Unauthorized)) => TokenProbe::Invalid,
             Ok(Err(_)) | Err(_) => TokenProbe::Unavailable,
         }
@@ -1221,6 +1226,24 @@ mod tests {
     async fn test_upstream_403_counts_as_valid() {
         let server = MockServer::start().await;
         mock_me(&server, 403).await;
+        let resp = app_with(SessionTokens::new(), &server.uri())
+            .oneshot(open_req("POST", VICTIM, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_403_feature_not_entitled_counts_as_valid() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "Forbidden", "code": "FEATURE_NOT_ENTITLED",
+                "feature": "api_token_create", "plan_id": "free"
+            })))
+            .mount(&server)
+            .await;
         let resp = app_with(SessionTokens::new(), &server.uri())
             .oneshot(open_req("POST", VICTIM, None))
             .await

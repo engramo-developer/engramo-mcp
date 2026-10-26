@@ -878,4 +878,22 @@ mod tests {
         assert_eq!(v["userId"], crate::subscription::fixtures::USER_ID);
         assert_eq!(v["plan"]["id"], "free");
     }
+
+    #[tokio::test]
+    async fn test_read_subscription_api_error_returns_internal_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/subscription"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        crate::subscription::fixtures::mount_account(&server).await;
+        let client = EngramoClient::new(server.uri(), "tok");
+        let err = read(&client, ReadResourceRequestParams::new(URI_SUBSCRIPTION))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+    }
 }

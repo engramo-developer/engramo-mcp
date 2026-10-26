@@ -193,7 +193,7 @@ impl EngramoMcpServer {
             open_world_hint = false
         ),
         description = "Get the user's EngrAmo account: their userId, current plan (id, name, \
-        dates, any pending/lapsed/deactivated plan, unlocked features) and, for every limit, \
+        dates, with datesPlanId naming the plan those dates belong to, any pending/lapsed/deactivated plan, unlocked features) and, for every limit, \
         used / limit / remaining, whether it is unlimited or not included in the plan, its window \
         ('absolute' = lifetime, never resets; 'monthly') and when it resets (UTC), plus daily and \
         hourly sub-limits. Call this when the user asks about their plan, limits or usage, and \

@@ -709,13 +709,10 @@ pub struct UserSubscriptionDto {
     pub starts_at: String,
     pub expires_at: Option<String>,
     /// A paid plan whose window hasn't started yet (`plan_id` is still the effective one).
-    #[serde(default)]
     pub pending_plan_id: Option<String>,
     /// The most recent paid plan, now expired.
-    #[serde(default)]
     pub lapsed_plan_id: Option<String>,
     /// A plan still inside its dates but switched off server-side.
-    #[serde(default)]
     pub deactivated_plan_id: Option<String>,
     /// Features the effective plan unlocks (e.g. `ai_chat`, `tts_generate`).
     #[serde(default)]
