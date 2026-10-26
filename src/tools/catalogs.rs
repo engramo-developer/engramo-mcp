@@ -2,7 +2,8 @@ use rmcp::{model::CallToolResult, schemars};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::error::preview;
+use crate::dto::{AccessLevel, CatalogFilter};
+use crate::error::{ApiError, preview};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListCatalogsParams {
@@ -16,6 +17,10 @@ pub struct ListCatalogsParams {
         description = "If true, return only catalogs with shadowing turned on. Keep the same value for every page: a cursor from one value is rejected with the other."
     )]
     pub speaking_only: Option<bool>,
+    #[schemars(
+        description = "Optional: 'own' lists only catalogs you created; 'shared' lists only catalogs other users shared with you. Omit for the default listing. Keep the same value for every page."
+    )]
+    pub filter: Option<CatalogFilter>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -62,6 +67,36 @@ pub struct SetCatalogShadowingParams {
     pub language: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShareCatalogParams {
+    #[schemars(description = "UUID of the catalog to share (must be one you own)")]
+    pub catalog_id: String,
+    #[schemars(
+        description = "EngrAmo user ids (UUIDs, not emails) to grant access to: 1 to 100 per call"
+    )]
+    pub user_ids: Vec<String>,
+    #[schemars(
+        description = "'viewer' (default) can read and study the catalog; 'editor' can also edit its cards and details (not share it, delete it, or change shadowing)"
+    )]
+    pub access_level: Option<AccessLevel>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnshareCatalogParams {
+    #[schemars(description = "UUID of the catalog to stop sharing (must be one you own)")]
+    pub catalog_id: String,
+    #[schemars(
+        description = "EngrAmo user ids (UUIDs, not emails) to remove access from: 1 to 100 per call"
+    )]
+    pub user_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListCatalogSharesParams {
+    #[schemars(description = "UUID of the catalog")]
+    pub catalog_id: String,
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub(crate) fn ok_json<T: serde::Serialize>(value: &T) -> CallToolResult {
@@ -91,6 +126,92 @@ pub(crate) fn err_result(e: impl std::fmt::Display) -> CallToolResult {
 
 pub(crate) fn parse_uuid(s: &str) -> Result<Uuid, String> {
     Uuid::parse_str(s).map_err(|_| format!("Invalid UUID: '{}'", preview(s)))
+}
+
+/// Upper bound on user ids per `share_catalog` / `unshare_catalog` call (after dedupe).
+pub(crate) const MAX_SHARE_USER_IDS: usize = 100;
+
+fn too_many_user_ids() -> String {
+    format!(
+        "Too many user ids: at most {MAX_SHARE_USER_IDS} per call; split the list into smaller calls."
+    )
+}
+
+/// Validates the `user_ids` of a sharing call: non-empty, every entry a UUID (trimmed),
+/// duplicates dropped silently in first-seen order (the backend rejects duplicates), at most
+/// `MAX_SHARE_USER_IDS` remaining. Pure, so no HTTP call is made on failure.
+pub(crate) fn parse_user_ids(raw: &[String]) -> Result<Vec<Uuid>, String> {
+    if raw.is_empty() {
+        return Err("`user_ids` must contain at least one EngrAmo user id (UUID).".to_string());
+    }
+    // Reject absurd input before doing any per-entry work (dedupe can only shrink the list, so
+    // allow some headroom for duplicates).
+    if raw.len() > MAX_SHARE_USER_IDS * 10 {
+        return Err(too_many_user_ids());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut ids: Vec<Uuid> = Vec::with_capacity(raw.len().min(MAX_SHARE_USER_IDS));
+    for (i, entry) in raw.iter().enumerate() {
+        let id = parse_uuid(entry.trim()).map_err(|e| {
+            format!("user_ids[{i}]: {e} — user ids are UUIDs, not emails or names; ask the person for their EngrAmo user id")
+        })?;
+        if seen.insert(id) {
+            ids.push(id);
+            if ids.len() > MAX_SHARE_USER_IDS {
+                return Err(too_many_user_ids());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Rewrites the backend errors of the sharing write endpoints that need clearer wording; every
+/// other error passes through unchanged.
+pub(crate) fn share_write_error(e: ApiError) -> ApiError {
+    match e {
+        // Only the generic 403 (see `forbidden_hint`) is rewritten; a specific backend message
+        // passes through unchanged.
+        ApiError::PermissionDenied(msg) if crate::error::is_generic_forbidden(&msg) => {
+            ApiError::PermissionDenied(
+                "only the catalog's owner can share it or change who has access (editors and viewers can't); \
+                 also check the catalog id: the catalog may not exist or may belong to another user."
+                    .to_string(),
+            )
+        }
+        ApiError::NotFound(msg) => {
+            // Only rewrite the "unknown user" 404, whose message is exactly `[Not found: ]user
+            // <uuid>`; any other 404 (e.g. catalog not found) passes through unchanged.
+            let trimmed = msg.trim();
+            let id = trimmed
+                .strip_prefix("Not found: ")
+                .unwrap_or(trimmed)
+                .strip_prefix("user ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(|t| t.trim_end_matches(|c: char| !c.is_ascii_hexdigit()))
+                .and_then(|t| Uuid::parse_str(t).ok());
+            match id {
+                Some(id) => ApiError::NotFound(format!(
+                    "no EngrAmo user has id {id}; nothing was shared or changed (the request is all-or-nothing). Check the id with its owner."
+                )),
+                None => ApiError::NotFound(msg),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Rewrites the backend errors of the read-only collaborator listing; every other error passes
+/// through unchanged.
+pub(crate) fn share_read_error(e: ApiError) -> ApiError {
+    match e {
+        ApiError::PermissionDenied(msg) if crate::error::is_generic_forbidden(&msg) => {
+            ApiError::PermissionDenied(
+                "only the catalog's owner or its editors can see who it is shared with; also check the catalog id: the catalog may not exist or may belong to another user."
+                    .to_string(),
+            )
+        }
+        other => other,
+    }
 }
 
 /// Fixes the case and separator of a BCP-47-like tag (`es_es` -> `es-ES`, `sr-latn` ->
@@ -182,6 +303,7 @@ mod tests {
                 limit: None,
                 cursor: None,
                 speaking_only: None,
+                filter: None,
             }))
             .await
             .unwrap();
@@ -220,6 +342,7 @@ mod tests {
                     limit: None,
                     cursor: None,
                     speaking_only: flag,
+                    filter: None,
                 }))
                 .await
                 .unwrap();
@@ -249,6 +372,7 @@ mod tests {
                 limit: None,
                 cursor: None,
                 speaking_only: None,
+                filter: None,
             }))
             .await
             .unwrap();
@@ -313,6 +437,7 @@ mod tests {
                 limit: None,
                 cursor: None,
                 speaking_only: None,
+                filter: None,
             }))
             .await
             .unwrap();
@@ -343,6 +468,7 @@ mod tests {
                 limit: None,
                 cursor: None,
                 speaking_only: None,
+                filter: None,
             }))
             .await
             .unwrap();
@@ -494,6 +620,7 @@ mod tests {
                 limit: None,
                 cursor: None,
                 speaking_only: None,
+                filter: None,
             }))
             .await
             .unwrap();
@@ -527,6 +654,7 @@ mod tests {
                 limit: None,
                 cursor: Some("SECRET_CURSOR".to_string()),
                 speaking_only: None,
+                filter: None,
             }))
             .await
             .unwrap(); // must NOT be Err — MCP contract
@@ -584,6 +712,626 @@ mod tests {
         );
         for bad in [None, Some(""), Some("   ")] {
             assert!(shadowing_target(true, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // ── sharing tools ────────────────────────────────────────────────────────
+
+    use rmcp::handler::server::wrapper::Parameters;
+    use wiremock::matchers::body_json;
+
+    const CAT: &str = "00000000-0000-0000-0000-000000000001";
+    const U1: &str = "11111111-1111-1111-1111-111111111111";
+    const U2: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn share_params(ids: &[&str], level: Option<AccessLevel>) -> ShareCatalogParams {
+        ShareCatalogParams {
+            catalog_id: CAT.into(),
+            user_ids: strs(ids),
+            access_level: level,
+        }
+    }
+
+    async fn mount_collab_get(server: &MockServer, status: u16, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{CAT}/collaborators")))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_collab_post(
+        server: &MockServer,
+        body: Option<serde_json::Value>,
+        status: u16,
+        resp: serde_json::Value,
+    ) {
+        let m = Mock::given(method("POST")).and(path(format!("/catalogs/{CAT}/collaborators")));
+        let m = match body {
+            Some(b) => m.and(body_json(b)),
+            None => m,
+        };
+        m.respond_with(ResponseTemplate::new(status).set_body_json(resp))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn test_parse_user_ids_rules() {
+        assert!(parse_user_ids(&[]).unwrap_err().contains("at least one"));
+        let err = parse_user_ids(&strs(&[U1, "bob@example.com"])).unwrap_err();
+        assert!(err.contains("user_ids[1]"), "{err}");
+        assert!(err.contains("not emails"), "{err}");
+        let padded = format!("  {U1}\n");
+        assert_eq!(
+            parse_user_ids(&[padded]).unwrap(),
+            vec![Uuid::parse_str(U1).unwrap()]
+        );
+        let dup = parse_user_ids(&strs(&[U2, U1, U2, U1])).unwrap();
+        assert_eq!(
+            dup,
+            vec![Uuid::parse_str(U2).unwrap(), Uuid::parse_str(U1).unwrap()]
+        );
+        let many =
+            |n: u128| -> Vec<String> { (1..=n).map(|i| Uuid::from_u128(i).to_string()).collect() };
+        assert_eq!(parse_user_ids(&many(100)).unwrap().len(), 100);
+        assert!(parse_user_ids(&many(101)).unwrap_err().contains("at most"));
+    }
+
+    #[tokio::test]
+    async fn test_share_catalog_default_viewer_posts_then_lists() {
+        let server = MockServer::start().await;
+        mount_collab_post(
+            &server,
+            Some(json!({"changes": [
+                {"userId": U1, "accessLevel": "viewer"},
+                {"userId": U2, "accessLevel": "viewer"}
+            ]})),
+            200,
+            json!({"id": CAT, "shared": "successfully"}),
+        )
+        .await;
+        mount_collab_get(
+            &server,
+            200,
+            json!([{"userId": U1, "accessLevel": "viewer"}, {"userId": U2, "accessLevel": "viewer"}]),
+        )
+        .await;
+        let r = make_server(&server.uri())
+            .share_catalog(Parameters(share_params(&[U1, U2], None)))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(false), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["granted"], json!([U1, U2]));
+        assert_eq!(v["accessLevel"], "viewer");
+        assert_eq!(v["collaborators"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_share_catalog_editor_and_dedupe() {
+        let server = MockServer::start().await;
+        mount_collab_post(
+            &server,
+            Some(json!({"changes": [{"userId": U1, "accessLevel": "editor"}]})),
+            200,
+            json!({"id": CAT}),
+        )
+        .await;
+        mount_collab_get(
+            &server,
+            200,
+            json!([{"userId": U1, "accessLevel": "editor"}]),
+        )
+        .await;
+        let r = make_server(&server.uri())
+            .share_catalog(Parameters(share_params(
+                &[U1, U1],
+                Some(AccessLevel::Editor),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(false), "{r:?}");
+        assert!(tool_text(&r).contains("editor"));
+    }
+
+    #[tokio::test]
+    async fn test_sharing_tools_local_validation_makes_no_request() {
+        let server = MockServer::start().await;
+        let s = make_server(&server.uri());
+        let r = s
+            .share_catalog(Parameters(ShareCatalogParams {
+                catalog_id: "nope".into(),
+                user_ids: strs(&[U1]),
+                access_level: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        for ids in [vec![], vec!["bob@example.com"]] {
+            let r = s
+                .share_catalog(Parameters(share_params(&ids, None)))
+                .await
+                .unwrap();
+            assert_eq!(r.is_error, Some(true), "{ids:?}");
+            let r = s
+                .unshare_catalog(Parameters(UnshareCatalogParams {
+                    catalog_id: CAT.into(),
+                    user_ids: strs(&ids),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(r.is_error, Some(true), "{ids:?}");
+        }
+        let r = s
+            .unshare_catalog(Parameters(UnshareCatalogParams {
+                catalog_id: "nope".into(),
+                user_ids: strs(&[U1]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let r = s
+            .list_catalog_shares(Parameters(ListCatalogSharesParams {
+                catalog_id: "nope".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let too_many: Vec<String> = (1..=101u128)
+            .map(|i| Uuid::from_u128(i).to_string())
+            .collect();
+        let r = s
+            .share_catalog(Parameters(ShareCatalogParams {
+                catalog_id: CAT.into(),
+                user_ids: too_many,
+                access_level: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_share_catalog_error_messages() {
+        for (status, body, needles) in [
+            (
+                403,
+                json!({"error": "Forbidden"}),
+                vec!["Permission denied", "only the catalog's owner"],
+            ),
+            (
+                404,
+                json!({"error": format!("Not found: user {U2}")}),
+                vec![
+                    "no EngrAmo user has id",
+                    U2,
+                    "all-or-nothing",
+                    "nothing was shared",
+                ],
+            ),
+            (
+                404,
+                json!({"error": format!("Not found: Catalog with id {CAT} not found")}),
+                vec!["Catalog with id"],
+            ),
+            (
+                400,
+                json!({"error": "Cannot share a catalog with yourself"}),
+                vec!["Bad request", "yourself"],
+            ),
+            (
+                429,
+                json!({"error": "limit", "resource_type": "collaborators_per_catalog",
+                       "used": 4, "limit": 5, "requested": 3, "window": "absolute"}),
+                vec!["Quota exceeded"],
+            ),
+        ] {
+            let server = MockServer::start().await;
+            mount_collab_post(&server, None, status, body).await;
+            let r = make_server(&server.uri())
+                .share_catalog(Parameters(share_params(&[U1], None)))
+                .await
+                .unwrap();
+            assert_eq!(r.is_error, Some(true), "{status}");
+            for n in needles {
+                assert!(
+                    tool_text(&r).contains(n),
+                    "{status}: {n} in {}",
+                    tool_text(&r)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_share_catalog_reread_failure_still_succeeds() {
+        let server = MockServer::start().await;
+        mount_collab_post(&server, None, 200, json!({"id": CAT})).await;
+        mount_collab_get(&server, 500, json!({"error": "boom"})).await;
+        let r = make_server(&server.uri())
+            .share_catalog(Parameters(share_params(&[U1], None)))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(false), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["granted"], json!([U1]));
+        assert!(v["note"].as_str().unwrap().contains("could not be fetched"));
+        assert!(v.get("collaborators").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unshare_catalog_posts_null_levels_then_lists() {
+        let server = MockServer::start().await;
+        mount_collab_post(
+            &server,
+            Some(json!({"changes": [
+                {"userId": U1, "accessLevel": null},
+                {"userId": U2, "accessLevel": null}
+            ]})),
+            200,
+            json!({"id": CAT}),
+        )
+        .await;
+        mount_collab_get(&server, 200, json!([])).await;
+        let r = make_server(&server.uri())
+            .unshare_catalog(Parameters(UnshareCatalogParams {
+                catalog_id: CAT.into(),
+                user_ids: strs(&[U1, U2, U1]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(false), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["requestedRemoval"], json!([U1, U2]));
+        assert_eq!(v["collaborators"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_unshare_catalog_forbidden_is_owner_only() {
+        let server = MockServer::start().await;
+        mount_collab_post(&server, None, 403, json!({"error": "Forbidden"})).await;
+        let r = make_server(&server.uri())
+            .unshare_catalog(Parameters(UnshareCatalogParams {
+                catalog_id: CAT.into(),
+                user_ids: strs(&[U1]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert!(tool_text(&r).contains("only the catalog's owner"));
+    }
+
+    #[tokio::test]
+    async fn test_list_catalog_shares_happy_empty_and_forbidden() {
+        let p = || {
+            Parameters(ListCatalogSharesParams {
+                catalog_id: CAT.into(),
+            })
+        };
+        let server = MockServer::start().await;
+        mount_collab_get(
+            &server,
+            200,
+            json!([{"userId": U1, "accessLevel": "editor"}]),
+        )
+        .await;
+        let r = make_server(&server.uri())
+            .list_catalog_shares(p())
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(false));
+        let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["collaborators"][0]["userId"], U1);
+        assert_eq!(v["collaborators"][0]["accessLevel"], "editor");
+
+        let server = MockServer::start().await;
+        mount_collab_get(&server, 200, json!([])).await;
+        let r = make_server(&server.uri())
+            .list_catalog_shares(p())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["collaborators"], json!([]));
+
+        let server = MockServer::start().await;
+        mount_collab_get(&server, 403, json!({"error": "Forbidden"})).await;
+        let r = make_server(&server.uri())
+            .list_catalog_shares(p())
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert!(tool_text(&r).contains("owner or its editors"));
+    }
+
+    #[tokio::test]
+    async fn test_unshare_catalog_reread_failure_still_succeeds() {
+        let server = MockServer::start().await;
+        mount_collab_post(&server, None, 200, json!({"id": CAT})).await;
+        mount_collab_get(&server, 500, json!({"error": "boom"})).await;
+        let r = make_server(&server.uri())
+            .unshare_catalog(Parameters(UnshareCatalogParams {
+                catalog_id: CAT.into(),
+                user_ids: strs(&[U1]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(false), "{r:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["requestedRemoval"], json!([U1]));
+        assert!(v["note"].as_str().unwrap().contains("could not be fetched"));
+        assert!(v.get("collaborators").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unshare_catalog_error_passthrough() {
+        for (status, body, needles) in [
+            (
+                404,
+                json!({"error": format!("Not found: user {U2}")}),
+                vec!["no EngrAmo user has id", U2],
+            ),
+            (500, json!({"error": "boom"}), vec!["Server error"]),
+        ] {
+            let server = MockServer::start().await;
+            mount_collab_post(&server, None, status, body).await;
+            let r = make_server(&server.uri())
+                .unshare_catalog(Parameters(UnshareCatalogParams {
+                    catalog_id: CAT.into(),
+                    user_ids: strs(&[U2]),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(r.is_error, Some(true), "{status}");
+            for n in needles {
+                assert!(tool_text(&r).contains(n), "{status}: {}", tool_text(&r));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_catalog_shares_not_found_and_server_error() {
+        let p = || {
+            Parameters(ListCatalogSharesParams {
+                catalog_id: CAT.into(),
+            })
+        };
+        let server = MockServer::start().await;
+        mount_collab_get(&server, 404, json!({"error": "Not found: Catalog"})).await;
+        let r = make_server(&server.uri())
+            .list_catalog_shares(p())
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert!(tool_text(&r).contains("Not found"), "{}", tool_text(&r));
+        assert!(!tool_text(&r).contains("owner or its editors"));
+
+        let server = MockServer::start().await;
+        mount_collab_get(&server, 500, json!({"error": "boom"})).await;
+        let r = make_server(&server.uri())
+            .list_catalog_shares(p())
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        drop(server);
+        let r = make_server(&uri).list_catalog_shares(p()).await.unwrap();
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn test_share_write_error_rewrites_and_passes_through() {
+        match share_write_error(ApiError::NotFound(format!("Not found: user {U2}"))) {
+            ApiError::NotFound(m) => {
+                assert!(m.contains("no EngrAmo user has id") && m.contains(U2))
+            }
+            other => panic!("{other:?}"),
+        }
+        for msg in [
+            "Not found: user ",
+            "Catalog X not found",
+            "catalog not found for user bob",
+            "Catalog 22222222-2222-2222-2222-222222222222 not found for user 11111111-1111-1111-1111-111111111111",
+        ] {
+            assert!(
+                matches!(share_write_error(ApiError::NotFound(msg.into())), ApiError::NotFound(m) if m == msg),
+                "{msg}"
+            );
+        }
+        assert!(matches!(
+            share_write_error(ApiError::BadRequest("x".into())),
+            ApiError::BadRequest(m) if m == "x"
+        ));
+        assert!(matches!(
+            share_write_error(ApiError::Internal),
+            ApiError::Internal
+        ));
+        match share_write_error(ApiError::PermissionDenied(
+            crate::error::GENERIC_FORBIDDEN.into(),
+        )) {
+            ApiError::PermissionDenied(m) => {
+                assert!(m.contains("only the catalog's owner") && m.contains("catalog id"))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            share_write_error(ApiError::PermissionDenied("not allowed: plan".into())),
+            ApiError::PermissionDenied(m) if m == "not allowed: plan"
+        ));
+        assert!(matches!(
+            share_read_error(ApiError::PermissionDenied("not allowed: plan".into())),
+            ApiError::PermissionDenied(m) if m == "not allowed: plan"
+        ));
+        assert!(matches!(
+            share_read_error(ApiError::PermissionDenied(crate::error::GENERIC_FORBIDDEN.into())),
+            ApiError::PermissionDenied(m) if m.contains("owner or its editors")
+        ));
+        assert!(matches!(
+            share_read_error(ApiError::Internal),
+            ApiError::Internal
+        ));
+    }
+
+    #[test]
+    fn test_share_write_error_user_prefix_with_non_uuid_passes_through() {
+        for msg in [
+            "Not found: user bob",
+            "user bob@example.com",
+            "Not found: user 1234-not-a-uuid.",
+        ] {
+            assert!(
+                matches!(share_write_error(ApiError::NotFound(msg.into())), ApiError::NotFound(m) if m == msg),
+                "{msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_share_catalog_feature_not_entitled_passes_through() {
+        let server = MockServer::start().await;
+        mount_collab_post(
+            &server,
+            None,
+            403,
+            json!({"error":"Forbidden","code":"FEATURE_NOT_ENTITLED","feature":"catalog_share","plan_id":"free"}),
+        )
+        .await;
+        let r = make_server(&server.uri())
+            .share_catalog(Parameters(share_params(&[U1], None)))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let t = tool_text(&r);
+        assert!(t.contains("Catalog sharing"), "{t}");
+        assert!(t.ends_with(crate::error::PLAN_CHANGE_HINT), "{t}");
+        assert!(!t.contains("only the catalog's owner"), "{t}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_share_errors_do_not_rewrite_feature_not_entitled() {
+        let f = || ApiError::FeatureNotEntitled {
+            feature: "catalog_share".into(),
+            plan_id: Some("free".into()),
+        };
+        assert!(matches!(
+            share_write_error(f()),
+            ApiError::FeatureNotEntitled { .. }
+        ));
+        assert!(matches!(
+            share_read_error(f()),
+            ApiError::FeatureNotEntitled { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_share_and_unshare_network_failure_is_error_result() {
+        // Port 1 has no listener; a dropped MockServer's port could be reused by a parallel test.
+        let s = make_server("http://127.0.0.1:1");
+        let r = s
+            .share_catalog(Parameters(share_params(&[U1], None)))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        let r = s
+            .unshare_catalog(Parameters(UnshareCatalogParams {
+                catalog_id: CAT.into(),
+                user_ids: strs(&[U1]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+    }
+
+    #[test]
+    fn test_parse_user_ids_cap_applies_after_dedupe() {
+        let mut raw: Vec<String> = (1..=100u128)
+            .map(|i| Uuid::from_u128(i).to_string())
+            .collect();
+        raw.extend((1..=50u128).map(|i| Uuid::from_u128(i).to_string()));
+        let ids = parse_user_ids(&raw).unwrap();
+        assert_eq!(ids.len(), MAX_SHARE_USER_IDS);
+        assert_eq!(ids[0], Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn test_share_write_error_unknown_user_with_trailing_punctuation() {
+        for msg in [
+            format!("Not found: user {U2}."),
+            format!("Not found: user {U2}, aborting"),
+            format!("user {U2}"),
+        ] {
+            match share_write_error(ApiError::NotFound(msg.clone())) {
+                ApiError::NotFound(m) => assert!(
+                    m.contains("no EngrAmo user has id") && m.contains(U2),
+                    "{msg} -> {m}"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_user_ids_rejects_absurd_length_early() {
+        let raw = vec!["not-a-uuid".to_string(); MAX_SHARE_USER_IDS * 10 + 1];
+        let err = parse_user_ids(&raw).unwrap_err();
+        assert!(err.contains("Too many user ids"), "{err}");
+    }
+
+    #[test]
+    fn test_sharing_params_deserialize_enums() {
+        let p: ListCatalogsParams = serde_json::from_value(json!({"filter": "shared"})).unwrap();
+        assert_eq!(p.filter, Some(CatalogFilter::Shared));
+        assert!(serde_json::from_value::<ListCatalogsParams>(json!({"filter": "all"})).is_err());
+        let p: ShareCatalogParams = serde_json::from_value(
+            json!({"catalog_id": CAT, "user_ids": [U1], "access_level": "editor"}),
+        )
+        .unwrap();
+        assert_eq!(p.access_level, Some(AccessLevel::Editor));
+        assert!(
+            serde_json::from_value::<ShareCatalogParams>(
+                json!({"catalog_id": CAT, "user_ids": [U1], "access_level": "owner"})
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_filter_param_reaches_api() {
+        for (filter, expected) in [
+            (Some(CatalogFilter::Own), Some("own")),
+            (Some(CatalogFilter::Shared), Some("shared")),
+            (None, None),
+        ] {
+            let server = MockServer::start().await;
+            let mock = Mock::given(method("GET")).and(path("/catalogs"));
+            let mock = match expected {
+                Some(v) => mock.and(query_param("filter", v)),
+                None => mock.and(query_param_is_missing("filter")),
+            };
+            mock.respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": [], "nextCursor": null})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+            let r = make_server(&server.uri())
+                .list_catalogs(Parameters(ListCatalogsParams {
+                    limit: None,
+                    cursor: None,
+                    speaking_only: None,
+                    filter,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(r.is_error, Some(false), "{filter:?}");
         }
     }
 }

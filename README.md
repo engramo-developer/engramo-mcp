@@ -497,10 +497,13 @@ storage quotas, and needs no paid EngrAmo plan.
 ### Catalogs
 | Tool | Description |
 |---|---|
-| `list_catalogs` | List all flashcard catalogs; `speaking_only` limits it to catalogs with shadowing on |
+| `list_catalogs` | List all flashcard catalogs; `filter` (`own` or `shared`) limits it to catalogs you own or that others shared with you, and `speaking_only` to catalogs with shadowing on |
 | `get_catalog` | Get a single catalog by ID |
 | `update_catalog` | Update a catalog's name or description |
 | `set_catalog_shadowing` | Turn shadowing (speaking practice) on or off for a catalog, or change its language |
+| `share_catalog` | Share a catalog you own with other users by user id (UUID, not email) as `viewer` (default) or `editor`; re-sharing changes their level. Returns the full collaborator list. Ask people for their user id; they can get it from `get_subscription_usage` |
+| `unshare_catalog` | Remove users' access to a catalog you own. Returns the remaining collaborators |
+| `list_catalog_shares` | List who a catalog is shared with and their access level (owner or editors) |
 | `delete_catalog` | Delete a catalog |
 
 ### Cards

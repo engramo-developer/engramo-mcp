@@ -5,11 +5,12 @@ use uuid::Uuid;
 
 use crate::dto::{
     AiChatRequest, AiChatResponseDto, CardAiBatchResultDto, CardAiRequest, CardDto, CatalogDto,
-    CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CreateCardRequest, CreateCatalogRequest,
-    CreateCatalogWithCardsApiRequest, CreateLearningPathRequest, GlobalSearchResult,
-    LearningCardDto, LearningPathDetailDto, LearningPathDto, MeDto, MediaDto, PagedResponse,
-    PagedResponseWithCount, UpdateCardRequest, UpdateCatalogRequest, UpdateLearningPathRequest,
-    UploadMediaResponseDto, UsageSummaryDto, UserSubscriptionDto,
+    CatalogFilter, CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CollaboratorDto,
+    CreateCardRequest, CreateCatalogRequest, CreateCatalogWithCardsApiRequest,
+    CreateLearningPathRequest, GlobalSearchResult, LearningCardDto, LearningPathDetailDto,
+    LearningPathDto, MeDto, MediaDto, PagedResponse, PagedResponseWithCount, ShareCatalogRequest,
+    UpdateCardRequest, UpdateCatalogRequest, UpdateLearningPathRequest, UploadMediaResponseDto,
+    UsageSummaryDto, UserSubscriptionDto,
 };
 use crate::error::{ApiError, preview, read_bounded};
 
@@ -220,6 +221,25 @@ impl EngramoClient {
         self.deserialize(resp).await
     }
 
+    async fn post_json_void<B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .post(self.url(path))
+            .header("X-Api-Key", &self.api_token)
+            .json(body)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(ApiError::from_response(resp).await)
+        }
+    }
+
     async fn post_void(&self, path: &str) -> Result<(), ApiError> {
         let resp = self
             .http
@@ -306,11 +326,48 @@ impl EngramoClient {
         cursor: Option<&str>,
         speaking_only: bool,
     ) -> Result<PagedResponse<CatalogDto>, ApiError> {
+        self.list_catalogs_filtered(limit, cursor, speaking_only, None)
+            .await
+    }
+
+    /// Like `list_catalogs`, with an optional `own` / `shared` filter (`None` = no filter).
+    pub async fn list_catalogs_filtered(
+        &self,
+        limit: Option<i64>,
+        cursor: Option<&str>,
+        speaking_only: bool,
+        filter: Option<CatalogFilter>,
+    ) -> Result<PagedResponse<CatalogDto>, ApiError> {
         let mut params = page_params(limit, cursor)?;
         if speaking_only {
             params.push(("speakingOnly", "true".to_string()));
         }
+        if let Some(f) = filter {
+            params.push(("filter", f.as_str().to_string()));
+        }
         self.get_with_query("/catalogs", &params).await
+    }
+
+    /// `GET /catalogs/{id}/collaborators` (author or editor). The author is not listed.
+    pub async fn list_collaborators(
+        &self,
+        catalog_id: Uuid,
+    ) -> Result<Vec<CollaboratorDto>, ApiError> {
+        self.get(&format!("/catalogs/{catalog_id}/collaborators"))
+            .await
+    }
+
+    /// `POST /catalogs/{id}/collaborators` (author only). Grants, changes or (with a `null`
+    /// level) revokes access; all-or-nothing. The response body is ignored.
+    pub async fn update_collaborators(
+        &self,
+        catalog_id: Uuid,
+        req: &ShareCatalogRequest,
+    ) -> Result<(), ApiError> {
+        // Only the status matters: the share is committed once the API says success, so an
+        // empty or non-JSON body must not turn it into an error.
+        self.post_json_void(&format!("/catalogs/{catalog_id}/collaborators"), req)
+            .await
     }
 
     pub async fn get_catalog(&self, catalog_id: Uuid) -> Result<CatalogDto, ApiError> {
@@ -668,7 +725,7 @@ impl EngramoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dto::SearchItemType;
+    use crate::dto::{AccessLevel, CollaboratorChange, SearchItemType};
     use serde_json::json;
     use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -803,6 +860,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.cursor, Some("abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_filter_sends_query_param() {
+        for (f, v) in [
+            (CatalogFilter::Own, "own"),
+            (CatalogFilter::Shared, "shared"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/catalogs"))
+                .and(query_param("filter", v))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [], "nextCursor": null
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            client(&server.uri())
+                .list_catalogs_filtered(None, None, false, Some(f))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_default_omits_filter() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param_is_missing("filter"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [], "nextCursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client(&server.uri())
+            .list_catalogs(None, None, false)
+            .await
+            .unwrap();
+    }
+
+    // ── Collaborators ─────────────────────────────────────────────────────────
+
+    fn other_id() -> Uuid {
+        Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_list_collaborators_parses_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{}/collaborators", mock_id())))
+            .and(header("x-api-key", "engramo_test_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"userId": other_id(), "accessLevel": "editor"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let list = client(&server.uri())
+            .list_collaborators(mock_id())
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].user_id, other_id());
+        assert_eq!(list[0].access_level, AccessLevel::Editor);
+        assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_collaborators_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{}/collaborators", mock_id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let list = client(&server.uri())
+            .list_collaborators(mock_id())
+            .await
+            .unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_collaborators_403_is_permission_denied() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{}/collaborators", mock_id())))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({"error": "Forbidden"})))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .list_collaborators(mock_id())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn test_update_collaborators_sends_exact_body_with_null_removal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/catalogs/{}/collaborators", mock_id())))
+            .and(header("x-api-key", "engramo_test_token"))
+            .and(wiremock::matchers::body_json(json!({"changes": [
+                {"userId": mock_id(), "accessLevel": "viewer"},
+                {"userId": other_id(), "accessLevel": null}
+            ]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mock_id(), "shared": "successfully"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let req = ShareCatalogRequest {
+            changes: vec![
+                CollaboratorChange {
+                    user_id: mock_id(),
+                    access_level: Some(AccessLevel::Viewer),
+                },
+                CollaboratorChange {
+                    user_id: other_id(),
+                    access_level: None,
+                },
+            ],
+        };
+        client(&server.uri())
+            .update_collaborators(mock_id(), &req)
+            .await
+            .unwrap();
+        assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_collaborators_error_mapping() {
+        let cases = [
+            (403, json!({"error": "Forbidden"}), "perm"),
+            (
+                404,
+                json!({"error": format!("Not found: user {}", other_id())}),
+                "notfound",
+            ),
+            (
+                400,
+                json!({"error": "cannot share a catalog with its own author"}),
+                "bad",
+            ),
+            (
+                429,
+                json!({"error":"quota_exceeded","code":"QUOTA_EXCEEDED",
+                    "resource_type":"collaborators_per_catalog","used":4,"limit":5,
+                    "requested":3,"plan_id":"free","window":"absolute"}),
+                "quota",
+            ),
+        ];
+        for (status, body, kind) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/catalogs/{}/collaborators", mock_id())))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            let err = client(&server.uri())
+                .update_collaborators(mock_id(), &ShareCatalogRequest { changes: vec![] })
+                .await
+                .unwrap_err();
+            match kind {
+                "perm" => assert!(matches!(err, ApiError::PermissionDenied(_)), "{err:?}"),
+                "notfound" => {
+                    assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+                    assert!(err.to_string().contains(&other_id().to_string()));
+                }
+                "bad" => assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}"),
+                _ => match err {
+                    ApiError::QuotaExceeded {
+                        resource_type,
+                        window,
+                        ..
+                    } => {
+                        assert_eq!(resource_type, "collaborators_per_catalog");
+                        assert_eq!(window.as_deref(), Some("absolute"));
+                    }
+                    other => panic!("expected QuotaExceeded, got {other:?}"),
+                },
+            }
+        }
     }
 
     #[tokio::test]
@@ -2699,5 +2945,26 @@ mod tests {
         );
         assert!(page_params(None, None).unwrap().is_empty());
         assert!(page_params(None, Some(&format!("{exact}a"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_collaborators_accepts_empty_and_non_json_success_bodies() {
+        for resp in [
+            ResponseTemplate::new(204),
+            ResponseTemplate::new(200).set_body_string(""),
+            ResponseTemplate::new(200).set_body_string("ok"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/catalogs/{}/collaborators", mock_id())))
+                .respond_with(resp)
+                .expect(1)
+                .mount(&server)
+                .await;
+            client(&server.uri())
+                .update_collaborators(mock_id(), &ShareCatalogRequest { changes: vec![] })
+                .await
+                .expect("2xx with empty/non-JSON body must be Ok");
+        }
     }
 }

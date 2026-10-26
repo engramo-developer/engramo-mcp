@@ -407,6 +407,13 @@ fn quota_message(
                     " The limit applies to each catalog separately: put further cards in \
                      another catalog, or delete cards you no longer need from this one."
                 }
+                "shared_catalogs" => {
+                    " Stop sharing a catalog you no longer need to share (unshare_catalog \
+                     removes everyone from it) to free a slot."
+                }
+                "collaborators_per_catalog" => {
+                    " Remove people who no longer need access with unshare_catalog."
+                }
                 _ => "",
             });
         }
@@ -516,12 +523,19 @@ fn dedup_or_raw(label: &str, raw: String) -> String {
 fn forbidden_hint(msg: String) -> String {
     let bare = msg.trim();
     if bare.is_empty() || bare.eq_ignore_ascii_case("forbidden") {
-        "Forbidden (the resource may not exist, may belong to another user, or the action — \
-         e.g. setting catalog visibility to 'public'/'unlisted' — may require a higher role)"
-            .to_string()
+        GENERIC_FORBIDDEN.to_string()
     } else {
         msg
     }
+}
+
+/// The generic hint substituted for a bare 403 body.
+pub(crate) const GENERIC_FORBIDDEN: &str = "Forbidden (the resource may not exist, may belong to another user, or the action — \
+     e.g. setting catalog visibility to 'public'/'unlisted' — may require a higher role)";
+
+/// True when a `PermissionDenied` message is the generic hint for a bare 403 body.
+pub(crate) fn is_generic_forbidden(msg: &str) -> bool {
+    msg == GENERIC_FORBIDDEN
 }
 
 /// Extract a human-readable message from a JSON `{ "error": "..." }` body. The message is
@@ -1092,6 +1106,43 @@ mod tests {
         );
         assert!(m.contains("applies to each catalog separately"), "{m}");
         assert!(m.contains("another catalog"), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_collaborators_per_catalog_batch_and_hint() {
+        let m = quota(
+            "collaborators_per_catalog",
+            Some(4),
+            Some(5),
+            Some(3),
+            None,
+            Some("absolute"),
+        );
+        assert!(m.contains("People per shared catalog"), "{m}");
+        assert!(m.contains("smaller batch (up to 1)"), "{m}");
+        assert!(
+            m.contains("Remove people who no longer need access with unshare_catalog."),
+            "{m}"
+        );
+        assert!(m.contains("doesn't reset"), "{m}");
+        assert!(!m.contains("resets 20"), "{m}");
+        assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_shared_catalogs_lifetime_and_hint() {
+        let m = quota(
+            "shared_catalogs",
+            Some(1),
+            Some(1),
+            Some(1),
+            None,
+            Some("absolute"),
+        );
+        assert!(m.contains("Shared catalogs"), "{m}");
+        assert!(m.contains("lifetime limit reached"), "{m}");
+        assert!(m.contains("unshare_catalog removes everyone"), "{m}");
+        assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
     }
 
     #[test]
