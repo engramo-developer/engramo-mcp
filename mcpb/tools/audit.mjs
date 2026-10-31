@@ -7,11 +7,6 @@ import { fileURLToPath } from "node:url";
 
 // Each entry needs a reason; drop it as soon as a fixed version ships.
 const ALLOWED = {
-  // node-forge: PKCS#1 v1.5 signature verification accepts malformed
-  // DigestAlgorithm (no fixed version). mcpb uses node-forge only in
-  // node/sign.js; we never run `sign`/`verify`, and `info` only "verifies" the
-  // unsigned bundle we just packed — no signature result is trusted anywhere.
-  "GHSA-86w9-cpqp-85rv": "node-forge signature verification, unused",
   // zod: unbounded issue accumulation on oversized arrays can exhaust memory.
   // Fixed only in zod 4.6.6; @anthropic-ai/mcpb 2.1.2 (latest) requires
   // zod ^3.25.67 and no 3.x patch exists. mcpb's zod only validates our own
