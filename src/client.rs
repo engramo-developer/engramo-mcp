@@ -5,12 +5,12 @@ use uuid::Uuid;
 
 use crate::dto::{
     AiChatRequest, AiChatResponseDto, CardAiBatchResultDto, CardAiRequest, CardDto, CatalogDto,
-    CatalogFilter, CatalogWithCardsCreatedDto, CatalogWithCardsResponse, CollaboratorDto,
-    CreateCardRequest, CreateCatalogRequest, CreateCatalogWithCardsApiRequest,
-    CreateLearningPathRequest, GlobalSearchResult, LearningCardDto, LearningPathDetailDto,
-    LearningPathDto, MeDto, MediaDto, PagedResponse, PagedResponseWithCount, ShareCatalogRequest,
-    UpdateCardRequest, UpdateCatalogRequest, UpdateLearningPathRequest, UploadMediaResponseDto,
-    UsageSummaryDto, UserSubscriptionDto,
+    CatalogFilter, CatalogListQuery, CatalogWithCardsCreatedDto, CatalogWithCardsResponse,
+    CollaboratorDto, CreateCardRequest, CreateCatalogRequest, CreateCatalogWithCardsApiRequest,
+    CreateLearningPathRequest, FacetCountsDto, FilterSchemaDto, GlobalSearchResult,
+    LearningCardDto, LearningPathDetailDto, LearningPathDto, MeDto, MediaDto, PagedResponse,
+    PagedResponseWithCount, ShareCatalogRequest, UpdateCardRequest, UpdateCatalogRequest,
+    UpdateLearningPathRequest, UploadMediaResponseDto, UsageSummaryDto, UserSubscriptionDto,
 };
 use crate::error::{ApiError, preview, read_bounded};
 
@@ -35,7 +35,7 @@ pub(crate) const MAX_PAGE_LIMIT: i64 = 50;
 /// Real cursors, search queries and media-type filters are short; anything longer is a
 /// malformed or abusive value that would only produce an oversized upstream URL (and a noisy
 /// 414/431 error log).
-const MAX_QUERY_PARAM_LEN: usize = 512;
+pub(crate) const MAX_QUERY_PARAM_LEN: usize = 512;
 
 /// Validates one free-form, LLM-supplied query value and returns it as a query pair. Rejects
 /// an over-long value before any request is sent, so there is a single limit for `cursor`,
@@ -67,6 +67,33 @@ fn page_params(
     }
     if let Some(c) = cursor {
         params.push(bounded_param("cursor", c)?);
+    }
+    Ok(params)
+}
+
+/// Query pairs shared by `GET /catalogs` and `GET /catalogs/facets` (everything but paging).
+/// Free-form values go through `bounded_param`, so an over-long one is rejected before any
+/// request is sent.
+fn filter_params(query: &CatalogListQuery) -> Result<Vec<(&'static str, String)>, ApiError> {
+    let mut params = Vec::new();
+    if query.speaking_only {
+        params.push(("speakingOnly", "true".to_string()));
+    }
+    if let Some(f) = query.filter {
+        params.push(("filter", f.as_str().to_string()));
+    }
+    if let Some(q) = query.q.as_deref().filter(|q| !q.is_empty()) {
+        params.push(bounded_param("q", q)?);
+    }
+    for (name, values) in [
+        ("speak", &query.speak),
+        ("learn", &query.learn),
+        ("levels", &query.levels),
+        ("tags", &query.tags),
+    ] {
+        if !values.is_empty() {
+            params.push(bounded_param(name, &values.join(","))?);
+        }
     }
     Ok(params)
 }
@@ -330,7 +357,7 @@ impl EngramoClient {
             .await
     }
 
-    /// Like `list_catalogs`, with an optional `own` / `shared` filter (`None` = no filter).
+    /// Like `list_catalogs`, with an optional `own` / `shared` / `public` filter (`None` = no filter).
     pub async fn list_catalogs_filtered(
         &self,
         limit: Option<i64>,
@@ -338,14 +365,40 @@ impl EngramoClient {
         speaking_only: bool,
         filter: Option<CatalogFilter>,
     ) -> Result<PagedResponse<CatalogDto>, ApiError> {
-        let mut params = page_params(limit, cursor)?;
-        if speaking_only {
-            params.push(("speakingOnly", "true".to_string()));
-        }
-        if let Some(f) = filter {
-            params.push(("filter", f.as_str().to_string()));
-        }
+        self.list_catalogs_query(&CatalogListQuery {
+            limit,
+            cursor: cursor.map(str::to_owned),
+            speaking_only,
+            filter,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// `GET /catalogs` with every filter. Each list param goes out as ONE comma-joined value
+    /// (the API does not accept repeated keys); empty / `None` fields are omitted.
+    pub async fn list_catalogs_query(
+        &self,
+        query: &CatalogListQuery,
+    ) -> Result<PagedResponse<CatalogDto>, ApiError> {
+        let mut params = page_params(query.limit, query.cursor.as_deref())?;
+        params.extend(filter_params(query)?);
         self.get_with_query("/catalogs", &params).await
+    }
+
+    /// `GET /catalogs/facets`: counts per language / topic / level / tag over the catalogs the
+    /// caller can see, under the same filters as the list. Paging fields of `query` are ignored.
+    pub async fn get_catalog_facets(
+        &self,
+        query: &CatalogListQuery,
+    ) -> Result<FacetCountsDto, ApiError> {
+        let params = filter_params(query)?;
+        self.get_with_query("/catalogs/facets", &params).await
+    }
+
+    /// `GET /catalogs/facets/schema`: the allowed topics, levels and language codes.
+    pub async fn get_catalog_filter_schema(&self) -> Result<FilterSchemaDto, ApiError> {
+        self.get("/catalogs/facets/schema").await
     }
 
     /// `GET /catalogs/{id}/collaborators` (author or editor). The author is not listed.
@@ -1133,6 +1186,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            ..Default::default()
         };
         let result = client(&server.uri()).create_catalog(&req).await.unwrap();
         assert_eq!(result.name, "New Catalog");
@@ -1157,6 +1211,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            ..Default::default()
         };
         let err = client(&server.uri())
             .create_catalog(&req)
@@ -1184,7 +1239,7 @@ mod tests {
             visibility: None,
             image_id: None,
             version: 1,
-            speaking_settings: None,
+            ..Default::default()
         };
         let err = client(&server.uri())
             .update_catalog(mock_id(), &req)
@@ -2002,6 +2057,7 @@ mod tests {
                     back: CardContent::plain("A2"),
                 },
             ],
+            ..Default::default()
         };
         let result = client(&server.uri())
             .create_catalog_with_cards(&req)
@@ -2503,6 +2559,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            ..Default::default()
         };
         let result = client(&server.uri())
             .translate_batch_import("es", &metadata, "import.json", b"[]".to_vec())
@@ -2528,6 +2585,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            ..Default::default()
         };
         let err = client(&server.uri())
             .translate_batch_import("es", &metadata, "import.json", vec![])
@@ -2607,6 +2665,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            ..Default::default()
         };
         for bad in ["es/../../me/subscription", "es?x=1", "", "es#frag", "en US"] {
             let err = client(&server.uri())
@@ -2967,5 +3026,288 @@ mod tests {
                 .await
                 .expect("2xx with empty/non-JSON body must be Ok");
         }
+    }
+
+    // ── Catalog filters / facets ──────────────────────────────────────────────
+
+    fn empty_page() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"data": [], "nextCursor": null}))
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_query_sends_comma_joined_params() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param("limit", "10"))
+            .and(query_param("filter", "public"))
+            .and(query_param("speakingOnly", "true"))
+            .and(query_param("q", "heart & soul"))
+            .and(query_param("speak", "en,zxx"))
+            .and(query_param("learn", "lang:es,medicine"))
+            .and(query_param("levels", "A1,A2"))
+            .and(query_param("tags", "anatomy,exam"))
+            .respond_with(empty_page())
+            .expect(1)
+            .mount(&server)
+            .await;
+        client(&server.uri())
+            .list_catalogs_query(&CatalogListQuery {
+                limit: Some(10),
+                speaking_only: true,
+                filter: Some(CatalogFilter::Public),
+                q: Some("heart & soul".into()),
+                speak: strs(&["en", "zxx"]),
+                learn: strs(&["lang:es", "medicine"]),
+                levels: strs(&["A1", "A2"]),
+                tags: strs(&["anatomy", "exam"]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_query_omits_empty_params() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param_is_missing("q"))
+            .and(query_param_is_missing("speak"))
+            .and(query_param_is_missing("learn"))
+            .and(query_param_is_missing("levels"))
+            .and(query_param_is_missing("tags"))
+            .and(query_param_is_missing("filter"))
+            .and(query_param_is_missing("speakingOnly"))
+            .respond_with(empty_page())
+            .expect(2)
+            .mount(&server)
+            .await;
+        let c = client(&server.uri());
+        c.list_catalogs_query(&CatalogListQuery::default())
+            .await
+            .unwrap();
+        c.list_catalogs_query(&CatalogListQuery {
+            q: Some(String::new()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_query_over_long_value_sends_no_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(empty_page())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let c = client(&server.uri());
+        // 200 tags of 3 bytes + commas = 799 bytes > 512
+        let err = c
+            .list_catalogs_query(&CatalogListQuery {
+                tags: vec!["abc".to_string(); 200],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("tags")),
+            "{err}"
+        );
+        let err = c
+            .list_catalogs_query(&CatalogListQuery {
+                q: Some("x".repeat(513)),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains('q')),
+            "{err}"
+        );
+    }
+
+    const FACETS_BODY: &str = r#"{"total":5,"speak":[{"key":"en","count":4}],
+        "learn":[{"key":"lang:es","count":3},{"key":"medicine","count":2}],
+        "levels":[{"key":"A1","count":1}],"buckets":[{"key":"beginner","count":1}],
+        "tags":[{"key":"anatomy","count":2}],"futureField":1}"#;
+
+    #[tokio::test]
+    async fn test_get_catalog_facets_sends_filters_not_paging_and_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .and(query_param("filter", "public"))
+            .and(query_param("q", "heart"))
+            .and(query_param("speak", "en"))
+            .and(query_param("learn", "lang:es,medicine"))
+            .and(query_param("levels", "A1,A2"))
+            .and(query_param("tags", "anatomy"))
+            .and(query_param_is_missing("limit"))
+            .and(query_param_is_missing("cursor"))
+            .and(header("X-Api-Key", "engramo_test_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(FACETS_BODY, "application/json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let f = client(&server.uri())
+            .get_catalog_facets(&CatalogListQuery {
+                limit: Some(5),
+                cursor: Some("c".into()),
+                filter: Some(CatalogFilter::Public),
+                q: Some("heart".into()),
+                speak: strs(&["en"]),
+                learn: strs(&["lang:es", "medicine"]),
+                levels: strs(&["A1", "A2"]),
+                tags: strs(&["anatomy"]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(f.total, 5);
+        assert_eq!(f.speak[0].key, "en");
+        assert_eq!(f.learn[1].count, 2);
+        assert_eq!(f.buckets[0].key, "beginner");
+        assert_eq!(f.tags[0].key, "anatomy");
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_facets_no_filters_and_sparse_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .and(query_param_is_missing("learn"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"total": 0})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let f = client(&server.uri())
+            .get_catalog_facets(&CatalogListQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(f.total, 0);
+        assert!(f.learn.is_empty() && f.tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_facets_over_long_value_sends_no_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(empty_page())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .get_catalog_facets(&CatalogListQuery {
+                learn: vec!["lang:es".to_string(); 100],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_facets_error_mapping() {
+        for (status, body) in [
+            (
+                400,
+                json!({"error":"invalid language 'xx'","code":"FILTER_INVALID_LANGUAGE"}),
+            ),
+            (401, json!({})),
+            (503, json!({"error":"busy"})),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/catalogs/facets"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            let err = client(&server.uri())
+                .get_catalog_facets(&CatalogListQuery::default())
+                .await
+                .unwrap_err();
+            match status {
+                400 => assert!(
+                    matches!(&err, ApiError::BadRequest(m) if m.contains("invalid language")),
+                    "{err}"
+                ),
+                401 => assert!(matches!(err, ApiError::Unauthorized)),
+                _ => assert!(matches!(err, ApiError::Internal)),
+            }
+        }
+    }
+
+    const SCHEMA_BODY: &str = r#"{"schemaVersion":2,
+        "languages":[{"key":"en","label":"English"},{"key":"es","label":"Spanish"}],
+        "subjects":[{"key":"software_dev","label":"Software development"}],
+        "levels":[{"key":"A1","label":"A1","bucket":"beginner"}],
+        "buckets":[{"key":"beginner","label":"Beginner","levels":["A1","A2"]}],
+        "limits":{"speak":2,"learn":3,"tagsPerCatalog":20,"searchSpeak":2,"searchLearn":8},
+        "extra":true}"#;
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_schema_decodes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(SCHEMA_BODY, "application/json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let s = client(&server.uri())
+            .get_catalog_filter_schema()
+            .await
+            .unwrap();
+        assert_eq!(s.languages.len(), 2);
+        assert_eq!(s.subjects[0].key, "software_dev");
+        assert_eq!(s.buckets[0].levels, strs(&["A1", "A2"]));
+        assert_eq!(s.limits.learn, Some(3));
+        assert_eq!(s.limits.search_learn, Some(8));
+        assert_auth_header(&server).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_schema_without_search_limits() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "languages": [], "subjects": [], "levels": [], "buckets": [],
+                "limits": {"speak": 2, "learn": 3, "tagsPerCatalog": 20}
+            })))
+            .mount(&server)
+            .await;
+        let s = client(&server.uri())
+            .get_catalog_filter_schema()
+            .await
+            .unwrap();
+        assert_eq!(s.limits.search_speak, None);
+        assert_eq!(s.limits.search_learn, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_schema_503_is_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(
+                    json!({"error":"topics unavailable","code":"SUBJECTS_UNAVAILABLE"}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .get_catalog_filter_schema()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Internal), "{err}");
     }
 }

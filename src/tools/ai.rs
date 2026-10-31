@@ -11,9 +11,11 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::catalog_filters::{normalize_lang, with_filter_hint};
 use crate::dto::{AiChatRequest, CardAiRequest, CreateCatalogRequest};
+use crate::error::ApiError;
 use crate::server::EngramoMcpServer;
-use crate::tools::catalogs::{err_result, ok_json, parse_uuid};
+use crate::tools::catalogs::{ClassificationWrite, err_result, ok_json, parse_uuid};
 use crate::tools::media::MAX_UPLOAD_BASE64_LEN;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -40,7 +42,7 @@ pub struct AiAgentChatParams {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct TranslateBatchImportParams {
     #[schemars(description = "Target BCP-47 language code for auto-translation, e.g. 'es'.")]
     pub target_lang: String,
@@ -54,6 +56,22 @@ pub struct TranslateBatchImportParams {
         description = "New catalog visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id). Setting 'public' or 'unlisted' may require publish permission — non-moderators can get a permission error."
     )]
     pub visibility: Option<String>,
+    #[schemars(
+        description = "Optional. Languages the card FRONTS are in (the language being learned), as ISO 639-1 codes, e.g. ['es']. front_languages and topics together: at most 3 values. Not defaulted."
+    )]
+    pub front_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional. Languages of the card BACKS, as ISO 639-1 codes, at most 2; 'zxx' = no language needed. Defaults to [target_lang]; pass [] to leave the catalog without back languages."
+    )]
+    pub back_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional. Topic keys from get_catalog_filter_options (the list changes over time; don't guess). More specific subjects belong in tags."
+    )]
+    pub topics: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional. CEFR levels A1-C2, or 'beginner' (A1,A2), 'intermediate' (B1,B2), 'advanced' (C1,C2)."
+    )]
+    pub levels: Option<Vec<crate::catalog_filters::LevelParam>>,
     #[schemars(
         description = "Base64-encoded content file: either a ZIP archive containing index.json \
         (an array of {original_text, audio_file}) plus referenced media files, or a raw JSON file \
@@ -226,7 +244,9 @@ impl EngramoMcpServer {
         description = "Create a new catalog from an uploaded ZIP/JSON content file, auto-translating \
         every card into target_lang. USES ENGRAMO'S PAID AI — this consumes the account's \
         translation quota. Intended for bulk imports of pre-recorded audio + source text; most \
-        chat-driven deck creation should use generate_catalog_with_cards instead."
+        chat-driven deck creation should use generate_catalog_with_cards instead. The catalog's back \
+        language defaults to target_lang; optional front_languages, back_languages, topics and \
+        levels classify it (see get_catalog_filter_options)."
     )]
     pub async fn translate_batch_import(
         &self,
@@ -240,30 +260,77 @@ impl EngramoMcpServer {
                 "Encoded content_file exceeds the 10MB import limit".to_string(),
             ));
         }
-        let content_file =
+        let mut class = match ClassificationWrite::new(
+            p.front_languages.as_deref(),
+            p.back_languages.as_deref(),
+            p.topics.as_deref(),
+            p.levels.as_deref(),
+        ) {
+            Ok(c) => c,
+            Err(e) => return Ok(err_result(e)),
+        };
+        let learn = match class.learn_for_new() {
+            Ok(l) => l,
+            Err(e) => return Ok(err_result(e)),
+        };
+        // Only caller-supplied classification earns the filter hint on a 400.
+        let has_filters = class.any();
+        // An explicit back_languages (even []) wins; otherwise the translation language is the
+        // back language. A target_lang that is not a 2-letter ISO 639-1 code (e.g. 'zxx', 'fil') is skipped.
+        let mut defaulted_back: Option<String> = None;
+        if p.back_languages.is_none()
+            && let Ok(code) = normalize_lang(&p.target_lang, "back_languages", false)
+            && code.len() == 2
+        {
+            class.speak_langs = Some(vec![code.clone()]);
+            defaulted_back = Some(code);
+        }
+        let mut content_file =
             match base64::engine::general_purpose::STANDARD.decode(&p.content_file_base64) {
                 Ok(bytes) => bytes,
                 Err(e) => return Ok(err_result(format!("Invalid base64 content_file: {e}"))),
             };
-        let metadata = CreateCatalogRequest {
+        let mut metadata = CreateCatalogRequest {
             name: p.name,
             description: p.description,
             tags: p.tags,
             visibility: p.visibility,
+            speak_langs: class.speak_langs,
+            learn,
+            levels: class.levels,
         };
         let file_name = p
             .content_file_name
             .unwrap_or_else(|| "import.zip".to_string());
-        Ok(
-            match self
+        // Clone only when a retry is possible.
+        let first = if defaulted_back.is_some() {
+            content_file.clone()
+        } else {
+            std::mem::take(&mut content_file)
+        };
+        let mut result = self
+            .client
+            .translate_batch_import(&p.target_lang, &metadata, &file_name, first)
+            .await;
+        // The implicit back language may not be in the API's filter schema; the API rejects
+        // that before translating, so retrying without it costs no quota. Retry only when the
+        // 400 names the defaulted language (the API says `invalid language '<code>'`), so
+        // unrelated 400s don't resend the file to the paid endpoint.
+        let retry_marker = defaulted_back.map(|c| format!("invalid language '{c}'"));
+        if let Some(marker) = &retry_marker
+            && matches!(&result, Err(ApiError::BadRequest(m)) if m.contains(marker.as_str()))
+        {
+            metadata.speak_langs = None;
+            result = self
                 .client
                 .translate_batch_import(&p.target_lang, &metadata, &file_name, content_file)
-                .await
-            {
-                Ok(catalog) => ok_json(&catalog),
-                Err(e) => err_result(e),
-            },
-        )
+                .await;
+        }
+        Ok(match result {
+            Ok(catalog) => ok_json(&catalog),
+            Err(e) if has_filters => err_result(with_filter_hint(e)),
+            Err(e) => err_result(e),
+        })
     }
 }
 
@@ -435,6 +502,7 @@ mod tests {
                 visibility: None,
                 content_file_base64: content_b64,
                 content_file_name: Some("import.json".to_string()),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -455,6 +523,7 @@ mod tests {
                 visibility: None,
                 content_file_base64: "A".repeat(MAX_UPLOAD_BASE64_LEN + 1),
                 content_file_name: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -475,6 +544,7 @@ mod tests {
                 visibility: None,
                 content_file_base64: "not-valid-base64!!!".to_string(),
                 content_file_name: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -587,6 +657,7 @@ mod tests {
                 visibility: None,
                 content_file_base64: base64::engine::general_purpose::STANDARD.encode(b"[]"),
                 content_file_name: None,
+                ..Default::default()
             }))
             .await
             .unwrap(),
@@ -629,9 +700,259 @@ mod tests {
                 visibility: Some("unlisted".to_string()),
                 content_file_base64: base64::engine::general_purpose::STANDARD.encode(b"[]"),
                 content_file_name: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
         assert!(!r.is_error.unwrap_or(false), "{r:?}");
+    }
+
+    fn svec(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|x| x.to_string()).collect())
+    }
+
+    fn import_params(target: &str) -> TranslateBatchImportParams {
+        TranslateBatchImportParams {
+            target_lang: target.to_string(),
+            name: "D".to_string(),
+            content_file_base64: base64::engine::general_purpose::STANDARD.encode(b"[]"),
+            ..Default::default()
+        }
+    }
+
+    async fn run_import(p: TranslateBatchImportParams, status: u16) -> (CallToolResult, String) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(if status == 201 {
+                ResponseTemplate::new(201).set_body_json(json!({
+                    "id": mock_id(), "name": "D", "version": 1
+                }))
+            } else {
+                ResponseTemplate::new(status).set_body_json(json!({"error": "bad topic"}))
+            })
+            .mount(&server)
+            .await;
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(p))
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let body = reqs
+            .first()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .unwrap_or_default();
+        (r, body)
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_defaults_back_languages_to_target() {
+        let (r, body) = run_import(import_params("ES-es"), 201).await;
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
+        assert!(body.contains(r#""speakLangs":["es"]"#), "{body}");
+        assert!(
+            !body.contains(r#""learn""#) && !body.contains(r#""levels""#),
+            "{body}"
+        );
+    }
+
+    /// First POST (carrying `speakLangs`) gets a 400, the retry without it succeeds.
+    async fn run_import_rejecting_speak_langs(
+        p: TranslateBatchImportParams,
+    ) -> (CallToolResult, Vec<String>) {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("speakLangs"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": "invalid language 'es'", "code": "FILTER_INVALID_LANGUAGE"}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": mock_id(), "name": "D", "version": 1
+            })))
+            .mount(&server)
+            .await;
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(p))
+            .await
+            .unwrap();
+        let bodies = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        (r, bodies)
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_retries_without_defaulted_back_language_on_400() {
+        let (r, bodies) = run_import_rejecting_speak_langs(import_params("es")).await;
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("speakLangs"));
+        assert!(!bodies[1].contains("speakLangs"));
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_does_not_retry_400_naming_other_language() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": "invalid language 'xx'", "code": "FILTER_INVALID_LANGUAGE"}),
+            ))
+            .mount(&server)
+            .await;
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(import_params("es")))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_does_not_retry_unrelated_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad archive"})))
+            .mount(&server)
+            .await;
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(import_params("es")))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_does_not_retry_explicit_back_languages() {
+        let (r, bodies) = run_import_rejecting_speak_langs(TranslateBatchImportParams {
+            back_languages: svec(&["en"]),
+            ..import_params("es")
+        })
+        .await;
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert_eq!(bodies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_explicit_back_languages_wins() {
+        let (r, body) = run_import(
+            TranslateBatchImportParams {
+                back_languages: svec(&["EN"]),
+                front_languages: svec(&["es"]),
+                topics: svec(&["medicine"]),
+                levels: Some(vec![crate::catalog_filters::LevelParam::Beginner]),
+                ..import_params("es")
+            },
+            201,
+        )
+        .await;
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
+        assert!(body.contains(r#""speakLangs":["en"]"#), "{body}");
+        assert!(body.contains(r#""learn":["lang:es","medicine"]"#), "{body}");
+        assert!(body.contains(r#""levels":["A1","A2"]"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_explicit_empty_back_languages_is_kept() {
+        let (r, body) = run_import(
+            TranslateBatchImportParams {
+                back_languages: Some(vec![]),
+                ..import_params("es")
+            },
+            201,
+        )
+        .await;
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
+        assert!(body.contains(r#""speakLangs":[]"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_skips_default_for_non_iso_target() {
+        let (r, body) = run_import(import_params("zxx"), 201).await;
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
+        assert!(!body.contains("speakLangs"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_skips_default_for_three_letter_target() {
+        let (r, body) = run_import(import_params("fil"), 201).await;
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
+        assert!(!body.contains("speakLangs"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_invalid_classification_makes_no_request() {
+        for (p, expect) in [
+            (
+                TranslateBatchImportParams {
+                    back_languages: svec(&["english!"]),
+                    ..import_params("es")
+                },
+                "not a language code",
+            ),
+            (
+                TranslateBatchImportParams {
+                    front_languages: svec(&["zxx"]),
+                    ..import_params("es")
+                },
+                "only valid in back_languages",
+            ),
+            (
+                TranslateBatchImportParams {
+                    topics: svec(&["lang:es"]),
+                    ..import_params("es")
+                },
+                "is a language",
+            ),
+            (
+                TranslateBatchImportParams {
+                    front_languages: svec(&["es", "fr"]),
+                    topics: svec(&["math", "law"]),
+                    ..import_params("es")
+                },
+                "front_languages and topics together",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let r = make_server(&server.uri())
+                .translate_batch_import(Parameters(p))
+                .await
+                .unwrap();
+            assert!(r.is_error.unwrap_or(false), "{r:?}");
+            let text = r
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map_or("", |t| t.text.as_str());
+            assert!(text.contains(expect), "{text}");
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_400_with_filters_adds_hint() {
+        let (r, _) = run_import(
+            TranslateBatchImportParams {
+                topics: svec(&["nonsense"]),
+                ..import_params("es")
+            },
+            400,
+        )
+        .await;
+        assert_eq!(r.is_error, Some(true));
+        let text = r.content[0].as_text().unwrap().text.clone();
+        assert!(text.contains("get_catalog_filter_options"), "{text}");
+
+        // The defaulted back language alone does not earn the hint.
+        let (r, _) = run_import(import_params("es"), 400).await;
+        let text = r.content[0].as_text().unwrap().text.clone();
+        assert!(!text.contains("get_catalog_filter_options"), "{text}");
     }
 }

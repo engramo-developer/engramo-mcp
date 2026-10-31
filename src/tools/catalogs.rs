@@ -2,25 +2,173 @@ use rmcp::{model::CallToolResult, schemars};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::dto::{AccessLevel, CatalogFilter};
+use crate::catalog_filters::{
+    LevelParam, MAX_SEARCH_BACK, MAX_SEARCH_LEARN, MAX_SEARCH_TAGS, MAX_WRITE_BACK,
+    MAX_WRITE_LEARN, check_raw_len, expand_levels, join_learn, normalize_langs, normalize_topics,
+};
+use crate::client::MAX_QUERY_PARAM_LEN as MAX_QUERY_BYTES; // the client's `q` wire bound
+use crate::dto::{AccessLevel, CatalogClassification, CatalogFilter, CatalogListQuery};
 use crate::error::{ApiError, preview};
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct ListCatalogsParams {
     #[schemars(
         description = "Maximum number of catalogs to return (default 20; values are clamped to 1..=50)"
     )]
     pub limit: Option<i64>,
-    #[schemars(description = "Pagination cursor from a previous response")]
+    #[schemars(
+        description = "Pagination cursor from a previous response. Pass it back with the same filters and query."
+    )]
     pub cursor: Option<String>,
     #[schemars(
         description = "If true, return only catalogs with shadowing turned on. Keep the same value for every page: a cursor from one value is rejected with the other."
     )]
     pub speaking_only: Option<bool>,
     #[schemars(
-        description = "Optional: 'own' lists only catalogs you created; 'shared' lists only catalogs other users shared with you. Omit for the default listing. Keep the same value for every page."
+        description = "Optional: 'own' lists only catalogs you created; 'shared' lists only catalogs other users shared with you; 'public' lists only public catalogs by any user. Omit to include all three: your own, shared with you, and public catalogs. Keep the same value for every page."
     )]
     pub filter: Option<CatalogFilter>,
+    #[schemars(
+        description = "Optional free text matched against catalog name, description and short ID (max 200 characters and 512 bytes)."
+    )]
+    pub query: Option<String>,
+    #[schemars(
+        description = "Front-of-card (learning) languages as ISO 639-1 codes, e.g. ['es']. Matches catalogs whose cards are in any of them. Catalogs with no front language set never match."
+    )]
+    pub front_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Back-of-card (definition/translation) languages as ISO 639-1 codes, at most two. Matches any of them; language-free catalogs (code 'zxx') always match. Catalogs with no back language set never match."
+    )]
+    pub back_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Topic keys from get_catalog_filter_options (e.g. 'medicine', 'software_dev'). Matches any of them. Combined with front_languages using AND."
+    )]
+    pub topics: Option<Vec<String>>,
+    #[schemars(
+        description = "CEFR levels A1-C2, or 'beginner' (A1,A2), 'intermediate' (B1,B2), 'advanced' (C1,C2). Matches any."
+    )]
+    pub levels: Option<Vec<LevelParam>>,
+    #[schemars(
+        description = "Tags; a catalog must have ALL of them (case-insensitive). At most 8."
+    )]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Same filter inputs as [`ListCatalogsParams`] (no paging): narrows the facet counts that
+/// `get_catalog_filter_options` returns, e.g. which topics have Spanish decks.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct CatalogFilterOptionsParams {
+    #[schemars(
+        description = "Optional: 'own', 'shared' or 'public': count only that source. Omit for all visible catalogs."
+    )]
+    pub filter: Option<CatalogFilter>,
+    #[schemars(
+        description = "Optional free text matched against catalog name, description and short ID (max 200 characters and 512 bytes)."
+    )]
+    pub query: Option<String>,
+    #[schemars(
+        description = "Optional: count only catalogs whose cards are in these languages (ISO 639-1 codes, e.g. ['es'])."
+    )]
+    pub front_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional: count only catalogs with these back (definition/translation) languages (ISO 639-1 codes, at most two; 'zxx' = language-free)."
+    )]
+    pub back_languages: Option<Vec<String>>,
+    #[schemars(description = "Optional: count only catalogs with these topic keys.")]
+    pub topics: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional: CEFR levels A1-C2, or 'beginner', 'intermediate', 'advanced'."
+    )]
+    pub levels: Option<Vec<LevelParam>>,
+    #[schemars(description = "Optional: tags a catalog must all have (at most 8).")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Borrowed view of the filter inputs shared by `list_catalogs` and `get_catalog_filter_options`.
+pub(crate) struct FilterInputs<'a> {
+    pub query: Option<&'a str>,
+    pub filter: Option<CatalogFilter>,
+    pub front_languages: Option<&'a [String]>,
+    pub back_languages: Option<&'a [String]>,
+    pub topics: Option<&'a [String]>,
+    pub levels: Option<&'a [LevelParam]>,
+    pub tags: Option<&'a [String]>,
+}
+
+/// Max length of the free-text `query` (the API's `MAX_Q_CHARS`).
+const MAX_QUERY_CHARS: usize = 200;
+
+/// Normalizes the filter inputs into a wire query (search caps) with no request made. Returns
+/// the query and whether any filter param beyond `filter` was given (decides the 400 hint).
+/// A blank `query` is not sent.
+pub(crate) fn build_catalog_query(f: FilterInputs<'_>) -> Result<(CatalogListQuery, bool), String> {
+    let query = f.query.map(str::trim).filter(|q| !q.is_empty());
+    if let Some(q) = query
+        && (q.chars().count() > MAX_QUERY_CHARS || q.len() > MAX_QUERY_BYTES)
+    {
+        return Err(format!(
+            "query is too long: at most {MAX_QUERY_CHARS} characters ({MAX_QUERY_BYTES} bytes)."
+        ));
+    }
+    let front = normalize_langs(
+        f.front_languages.unwrap_or_default(),
+        "front_languages",
+        false,
+        MAX_SEARCH_LEARN,
+    )?;
+    let back = normalize_langs(
+        f.back_languages.unwrap_or_default(),
+        "back_languages",
+        true,
+        MAX_SEARCH_BACK,
+    )?;
+    let topics = normalize_topics(f.topics.unwrap_or_default())?;
+    let learn = join_learn(&front, &topics, MAX_SEARCH_LEARN)?;
+    let levels = expand_levels(f.levels.unwrap_or_default());
+    let tags = normalize_search_tags(f.tags.unwrap_or_default())?;
+    let has_filters = query.is_some()
+        || !(learn.is_empty() && back.is_empty() && levels.is_empty() && tags.is_empty());
+    Ok((
+        CatalogListQuery {
+            filter: f.filter,
+            q: query.map(str::to_owned),
+            speak: back,
+            learn,
+            levels,
+            tags,
+            ..Default::default()
+        },
+        has_filters,
+    ))
+}
+
+/// Trims and lowercases search tags (the API stores them that way), drops blanks and
+/// duplicates, rejects a tag with a comma (the list goes out comma-joined) and caps the count.
+fn normalize_search_tags(raw: &[String]) -> Result<Vec<String>, String> {
+    check_raw_len("tags", raw)?;
+    let mut out: Vec<String> = Vec::new();
+    for tag in raw {
+        if tag.len() > MAX_QUERY_BYTES {
+            return Err("tags: a tag is too long.".to_owned());
+        }
+        let tag = tag.trim().to_lowercase();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.contains(',') {
+            return Err(format!(
+                "tags: '{}' must not contain a comma.",
+                preview(&tag)
+            ));
+        }
+        if !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    if out.len() > MAX_SEARCH_TAGS {
+        return Err(format!("tags: at most {MAX_SEARCH_TAGS} tags per search."));
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -29,7 +177,7 @@ pub struct GetCatalogParams {
     pub catalog_id: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct UpdateCatalogParams {
     #[schemars(description = "UUID of the catalog to update")]
     pub catalog_id: String,
@@ -37,7 +185,9 @@ pub struct UpdateCatalogParams {
     pub name: Option<String>,
     #[schemars(description = "New description")]
     pub description: Option<String>,
-    #[schemars(description = "New tags")]
+    #[schemars(
+        description = "New tags (lowercased; at most 20, each up to 40 characters). Replaces the stored tags."
+    )]
     pub tags: Option<Vec<String>>,
     #[schemars(
         description = "New visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id). Setting 'public' or 'unlisted' may require publish permission — non-moderators can get a permission error."
@@ -47,8 +197,95 @@ pub struct UpdateCatalogParams {
         description = "New cover image: a media_id from upload_media (an image you own). Omit to keep the current cover. A cover can be replaced but not removed."
     )]
     pub image_id: Option<String>,
+    #[schemars(
+        description = "Languages the card FRONTS are in (the language being learned), as ISO 639-1 codes, e.g. ['es']. Replaces the stored list; [] clears it; omit to keep it. front_languages and topics together: at most 3 values."
+    )]
+    pub front_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Languages of the card BACKS (translations/definitions), as ISO 639-1 codes, at most 2; 'zxx' = no language needed (flags, symbols). Replaces the stored list; [] clears it; omit to keep it."
+    )]
+    pub back_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Topic keys from get_catalog_filter_options (the list changes over time; don't guess). Replaces the stored list; [] clears it; omit to keep it. More specific subjects belong in tags."
+    )]
+    pub topics: Option<Vec<String>>,
+    #[schemars(
+        description = "CEFR levels A1-C2, or 'beginner' (A1,A2), 'intermediate' (B1,B2), 'advanced' (C1,C2). Replaces the stored list; [] clears it; omit to keep it."
+    )]
+    pub levels: Option<Vec<LevelParam>>,
     #[schemars(description = "Current version of the catalog (required for optimistic locking)")]
     pub version: i32,
+}
+
+/// Normalized catalog classification for a write (`update_catalog`, `generate_catalog_with_cards`).
+/// Every field keeps the wire semantics: `None` = omitted (unchanged), `Some(vec![])` = clear.
+/// The API stores front languages and topics together in `learn`, so [`Self::learn`] needs the
+/// catalog's current classification when only one of the two was given.
+#[derive(Debug, Default)]
+pub(crate) struct ClassificationWrite {
+    pub front: Option<Vec<String>>,
+    pub topics: Option<Vec<String>>,
+    pub speak_langs: Option<Vec<String>>,
+    pub levels: Option<Vec<String>>,
+}
+
+impl ClassificationWrite {
+    /// Normalizes the four params with the write caps; no I/O, so an error means no request.
+    pub fn new(
+        front: Option<&[String]>,
+        back: Option<&[String]>,
+        topics: Option<&[String]>,
+        levels: Option<&[LevelParam]>,
+    ) -> Result<Self, String> {
+        let front = front
+            .map(|v| normalize_langs(v, "front_languages", false, MAX_WRITE_LEARN))
+            .transpose()?;
+        let topics = topics.map(normalize_topics).transpose()?;
+        if let (Some(f), Some(t)) = (&front, &topics) {
+            join_learn(f, t, MAX_WRITE_LEARN)?;
+        }
+        Ok(Self {
+            front,
+            topics,
+            speak_langs: back
+                .map(|v| normalize_langs(v, "back_languages", true, MAX_WRITE_BACK))
+                .transpose()?,
+            levels: levels.map(expand_levels),
+        })
+    }
+
+    /// True when any of the four fields was given (decides the 400 hint).
+    pub fn any(&self) -> bool {
+        self.front.is_some()
+            || self.topics.is_some()
+            || self.speak_langs.is_some()
+            || self.levels.is_some()
+    }
+
+    /// True when exactly one of front languages / topics was given, so the other half has to
+    /// be read from the catalog before `learn` can be written.
+    pub fn needs_current(&self) -> bool {
+        self.front.is_some() != self.topics.is_some()
+    }
+
+    /// The `learn` value for a new catalog: the half that was not given is empty.
+    pub fn learn_for_new(&self) -> Result<Option<Vec<String>>, String> {
+        self.learn_with(&CatalogClassification::default())
+    }
+
+    /// The `learn` value for an update. `current` is the stored classification; call this with
+    /// the catalog read from the API whenever [`Self::needs_current`].
+    pub fn learn_with(
+        &self,
+        current: &CatalogClassification,
+    ) -> Result<Option<Vec<String>>, String> {
+        match (&self.front, &self.topics) {
+            (None, None) => Ok(None),
+            (Some(f), Some(t)) => join_learn(f, t, MAX_WRITE_LEARN).map(Some),
+            (Some(f), None) => join_learn(f, &current.topics, MAX_WRITE_LEARN).map(Some),
+            (None, Some(t)) => join_learn(&current.front_languages, t, MAX_WRITE_LEARN).map(Some),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -308,6 +545,7 @@ mod tests {
                 cursor: None,
                 speaking_only: None,
                 filter: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -347,6 +585,7 @@ mod tests {
                     cursor: None,
                     speaking_only: flag,
                     filter: None,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap();
@@ -377,6 +616,7 @@ mod tests {
                 cursor: None,
                 speaking_only: None,
                 filter: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -442,6 +682,7 @@ mod tests {
                 cursor: None,
                 speaking_only: None,
                 filter: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -473,6 +714,7 @@ mod tests {
                 cursor: None,
                 speaking_only: None,
                 filter: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -529,6 +771,7 @@ mod tests {
                 visibility: None,
                 image_id: None,
                 version: 1,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -626,6 +869,7 @@ mod tests {
                 cursor: None,
                 speaking_only: None,
                 filter: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -660,6 +904,7 @@ mod tests {
                 cursor: Some("SECRET_CURSOR".to_string()),
                 speaking_only: None,
                 filter: None,
+                ..Default::default()
             }))
             .await
             .unwrap(); // must NOT be Err — MCP contract
@@ -1333,10 +1578,552 @@ mod tests {
                     cursor: None,
                     speaking_only: None,
                     filter,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap();
             assert_eq!(r.is_error, Some(false), "{filter:?}");
         }
+    }
+
+    // ── Catalog filters: list_catalogs + get_catalog_filter_options ───────────
+
+    fn opt_strs(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|x| (*x).to_owned()).collect())
+    }
+
+    fn empty_list_page() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"data": [], "nextCursor": null}))
+    }
+
+    /// A server that must never be called: proves a local error sent no request.
+    async fn no_request_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(empty_list_page())
+            .expect(0)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_filters_reach_api_in_wire_form() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param("learn", "lang:es,medicine"))
+            .and(query_param("speak", "en,zxx"))
+            .and(query_param("levels", "A1,A2,C1"))
+            .and(query_param("tags", "anatomy,exam"))
+            .and(query_param("q", "heart"))
+            .and(query_param("filter", "public"))
+            .respond_with(empty_list_page())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                query: Some("  heart ".into()),
+                filter: Some(CatalogFilter::Public),
+                front_languages: opt_strs(&["ES"]),
+                back_languages: opt_strs(&["en-US", "ZXX"]),
+                topics: opt_strs(&["Medicine"]),
+                levels: Some(vec![LevelParam::Beginner, LevelParam::A1, LevelParam::C1]),
+                tags: opt_strs(&[" Anatomy", "exam", "ANATOMY"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_blank_query_and_empty_lists_are_not_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param_is_missing("q"))
+            .and(query_param_is_missing("learn"))
+            .and(query_param_is_missing("speak"))
+            .and(query_param_is_missing("levels"))
+            .and(query_param_is_missing("tags"))
+            .respond_with(empty_list_page())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                query: Some("   ".into()),
+                front_languages: Some(vec![]),
+                tags: Some(vec![]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_cursor_and_filters_together() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .and(query_param("cursor", "abc"))
+            .and(query_param("limit", "5"))
+            .and(query_param("learn", "lang:es"))
+            .and(query_param("speakingOnly", "true"))
+            .respond_with(empty_list_page())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                limit: Some(5),
+                cursor: Some("abc".into()),
+                speaking_only: Some(true),
+                front_languages: opt_strs(&["es"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+    }
+
+    fn list_params_cases() -> Vec<(&'static str, ListCatalogsParams, &'static str)> {
+        vec![
+            (
+                "too many front+topics",
+                ListCatalogsParams {
+                    front_languages: opt_strs(&["en", "es", "fr", "de", "it"]),
+                    topics: opt_strs(&["math", "law", "arts", "history"]),
+                    ..Default::default()
+                },
+                "front_languages and topics together",
+            ),
+            (
+                "too many back",
+                ListCatalogsParams {
+                    back_languages: opt_strs(&["en", "es", "fr"]),
+                    ..Default::default()
+                },
+                "back_languages: at most",
+            ),
+            (
+                "too many tags",
+                ListCatalogsParams {
+                    tags: opt_strs(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]),
+                    ..Default::default()
+                },
+                "tags: at most",
+            ),
+            (
+                "long query",
+                ListCatalogsParams {
+                    query: Some("x".repeat(201)),
+                    ..Default::default()
+                },
+                "query is too long",
+            ),
+            (
+                "zxx in front",
+                ListCatalogsParams {
+                    front_languages: opt_strs(&["zxx"]),
+                    ..Default::default()
+                },
+                "only valid in back_languages",
+            ),
+            (
+                "lang: in topics",
+                ListCatalogsParams {
+                    topics: opt_strs(&["lang:es"]),
+                    ..Default::default()
+                },
+                "is a language",
+            ),
+            (
+                "comma in tag",
+                ListCatalogsParams {
+                    tags: opt_strs(&["a,b"]),
+                    ..Default::default()
+                },
+                "must not contain a comma",
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_local_validation_errors_send_no_request() {
+        let server = no_request_server().await;
+        for (name, params, expect) in list_params_cases() {
+            let result = make_server(&server.uri())
+                .list_catalogs(Parameters(params))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "{name}: {result:?}");
+            assert!(
+                tool_text(&result).contains(expect),
+                "{name}: {}",
+                tool_text(&result)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_local_validation_errors_send_no_request() {
+        let server = no_request_server().await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                front_languages: opt_strs(&["zxx"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_api_400_with_filters_gets_hint_without_filters_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": "unknown subject 'foo'", "code": "FILTER_UNKNOWN_SUBJECT"}),
+            ))
+            .mount(&server)
+            .await;
+        let with = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                topics: opt_strs(&["foo"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(with.is_error, Some(true));
+        let text = tool_text(&with);
+        assert!(text.contains("unknown subject 'foo'"), "{text}");
+        assert!(text.contains("get_catalog_filter_options"), "{text}");
+
+        let without = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(without.is_error, Some(true));
+        assert!(
+            !tool_text(&without).contains("get_catalog_filter_options"),
+            "{}",
+            tool_text(&without)
+        );
+    }
+
+    #[test]
+    fn test_list_catalogs_params_deserialize_new_fields() {
+        let p: ListCatalogsParams = serde_json::from_value(json!({
+            "filter": "public", "query": "q", "front_languages": ["es"],
+            "back_languages": ["en"], "topics": ["math"],
+            "levels": ["A1", "beginner"], "tags": ["t"]
+        }))
+        .unwrap();
+        assert_eq!(p.filter, Some(CatalogFilter::Public));
+        assert_eq!(p.levels.unwrap().len(), 2);
+        assert!(serde_json::from_value::<ListCatalogsParams>(json!({"levels": ["Z9"]})).is_err());
+        // null == omitted
+        let p: ListCatalogsParams = serde_json::from_value(json!({"topics": null})).unwrap();
+        assert!(p.topics.is_none());
+    }
+
+    const SCHEMA_JSON: &str = r#"{"schemaVersion":2,
+        "languages":[{"key":"en","label":"English"},{"key":"es","label":"Spanish"}],
+        "subjects":[{"key":"medicine","label":"Medicine"},{"key":"math","label":"Math"}],
+        "levels":[{"key":"A1","label":"A1","bucket":"beginner"}],
+        "buckets":[{"key":"beginner","label":"Beginner","levels":["A1","A2"]}],
+        "limits":{"speak":2,"learn":3,"tagsPerCatalog":20,"searchSpeak":2,"searchLearn":8}}"#;
+
+    async fn mount_schema(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(SCHEMA_JSON, "application/json"))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_facets_503_with_filters_still_degrades() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                front_languages: opt_strs(&["es"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert!(v.get("facets").is_none());
+        assert_eq!(v["notes"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_facets_400_with_only_source_filter_degrades() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad"})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                filter: Some(CatalogFilter::Public),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert!(v.get("facets").is_none());
+        assert_eq!(v["notes"].as_array().unwrap().len(), 4);
+        assert!(!tool_text(&result).contains("for valid topics"));
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_401_with_filters_has_no_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                topics: opt_strs(&["math"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            !tool_text(&result).contains("get_catalog_filter_options"),
+            "{}",
+            tool_text(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_400_on_cursor_page_has_no_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad cursor"})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                topics: opt_strs(&["math"]),
+                cursor: Some("abc".to_owned()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(!tool_text(&result).contains("get_catalog_filter_options"));
+    }
+
+    #[test]
+    fn test_oversized_raw_lists_are_rejected_before_normalization() {
+        let many: Vec<String> = (0..1000).map(|i| format!("t{i}")).collect();
+        assert!(normalize_topics(&many).is_err());
+        assert!(normalize_langs(&many, "front_languages", false, 3).is_err());
+        assert!(normalize_search_tags(&many).is_err());
+    }
+
+    #[test]
+    fn test_classification_write_learn_arms_and_flags() {
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = ClassificationWrite::new(None, None, None, None).unwrap();
+        assert!(!c.any() && !c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), None);
+        let c = ClassificationWrite::new(Some(&v(&["ES"])), None, None, None).unwrap();
+        assert!(c.any() && c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), Some(v(&["lang:es"])));
+        let c = ClassificationWrite::new(None, None, Some(&v(&["Math"])), None).unwrap();
+        assert!(c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), Some(v(&["math"])));
+        let cur = CatalogClassification {
+            front_languages: v(&["es"]),
+            ..Default::default()
+        };
+        assert_eq!(c.learn_with(&cur).unwrap(), Some(v(&["lang:es", "math"])));
+        let c =
+            ClassificationWrite::new(Some(&v(&["es"])), None, Some(&v(&["math"])), None).unwrap();
+        assert!(!c.needs_current());
+        let c = ClassificationWrite::new(None, Some(&[]), None, None).unwrap();
+        assert!(c.any() && !c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_returns_schema_and_facets() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .and(query_param("learn", "lang:es"))
+            .and(query_param("filter", "public"))
+            .and(query_param_is_missing("limit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 3,
+                "speak": [{"key": "en", "count": 3}],
+                "learn": [{"key": "lang:es", "count": 3}, {"key": "medicine", "count": 2}],
+                "levels": [{"key": "A1", "count": 1}],
+                "buckets": [{"key": "beginner", "count": 1}],
+                "tags": [{"key": "anatomy", "count": 2}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                filter: Some(CatalogFilter::Public),
+                front_languages: opt_strs(&["ES"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert_eq!(v["topics"][0]["key"], "medicine");
+        assert_eq!(v["topics"][0]["count"], 2);
+        assert_eq!(v["topics"][1]["count"], 0);
+        assert_eq!(v["languages"]["es"], "Spanish");
+        assert_eq!(v["no_language_code"], "zxx");
+        assert_eq!(v["level_groups"]["beginner"], json!(["A1", "A2"]));
+        assert_eq!(v["facets"]["total"], 3);
+        assert_eq!(v["facets"]["front_languages"][0]["key"], "es");
+        assert_eq!(v["facets"]["top_tags"][0]["key"], "anatomy");
+        assert_eq!(v["notes"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_facets_failure_degrades_to_schema_with_note() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert!(v.get("facets").is_none());
+        assert!(v["topics"][0].get("count").is_none());
+        let notes = v["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 4);
+        assert!(notes[3].as_str().unwrap().contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_facets_400_without_filters_degrades() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad"})))
+            .mount(&server)
+            .await;
+        // `filter` alone is not a filter param for the hint/err decision.
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                filter: Some(CatalogFilter::Public),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert!(v.get("facets").is_none());
+        assert_eq!(v["notes"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_facets_400_is_reported_with_hint() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": "unknown subject 'foo'", "code": "FILTER_UNKNOWN_SUBJECT"}),
+            ))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                topics: opt_strs(&["foo"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(tool_text(&result).contains("unknown subject"));
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_schema_503_is_tool_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(
+                json!({"error": "topics unavailable", "code": "SUBJECTS_UNAVAILABLE"}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"total": 0})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+    }
+
+    #[test]
+    fn test_build_catalog_query_char_cap_blank_tags_and_query_only_has_filters() {
+        fn inputs<'a>(query: Option<&'a str>, tags: Option<&'a [String]>) -> FilterInputs<'a> {
+            FilterInputs {
+                query,
+                filter: None,
+                front_languages: None,
+                back_languages: None,
+                topics: None,
+                levels: None,
+                tags,
+            }
+        }
+        let q200 = "я".repeat(200);
+        let (_, has) = build_catalog_query(inputs(Some(&q200), None))
+            .expect("200 chars accepted even at 400 bytes");
+        assert!(has, "query alone counts as a filter");
+        let q201 = "я".repeat(201);
+        assert!(build_catalog_query(inputs(Some(&q201), None)).is_err());
+        // 200 chars of 3-byte text exceed the client's 512-byte bound: refused locally.
+        let wide = "界".repeat(200);
+        let err = build_catalog_query(inputs(Some(&wide), None)).unwrap_err();
+        assert!(err.contains("query is too long"), "{err}");
+        let tags = vec!["  ".to_string(), "A".to_string()];
+        let (q, _) = build_catalog_query(inputs(None, Some(tags.as_slice()))).unwrap();
+        assert_eq!(q.tags, vec!["a"]);
     }
 }

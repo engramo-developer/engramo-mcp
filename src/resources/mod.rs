@@ -10,6 +10,8 @@
 //!   engramo://learning/stats        — learning stats (due_count, total_count)
 //!   engramo://learning-paths        — all learning paths (id, name)
 //!   engramo://subscription          — userId, plan, limits and usage (= get_subscription_usage)
+//!   engramo://catalog-filters       — allowed topics, levels, language codes and limits for
+//!                                     catalog front/back languages (static view, no counts)
 
 use rmcp::model::{
     ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
@@ -19,7 +21,8 @@ use std::time::Duration;
 
 use crate::client::{EngramoClient, MAX_PAGE_LIMIT};
 use crate::dto::{
-    CatalogSummary, DueCardSummary, LearningPathSummary, LearningStats, PagedResponse,
+    CatalogFilter, CatalogSummary, DueCardSummary, LearningPathSummary, LearningStats,
+    PagedResponse,
 };
 use crate::error::ApiError;
 
@@ -31,6 +34,7 @@ pub const URI_DUE: &str = "engramo://learning/due";
 pub const URI_STATS: &str = "engramo://learning/stats";
 pub const URI_LEARNING_PATHS: &str = "engramo://learning-paths";
 pub const URI_SUBSCRIPTION: &str = "engramo://subscription";
+pub const URI_CATALOG_FILTERS: &str = "engramo://catalog-filters";
 
 // ── Card schema document ──────────────────────────────────────────────────────
 
@@ -136,9 +140,6 @@ The user already recorded their own voice for this card's face and gave you the 
 `upload_media` first (content_base64 of the recording, content_type=\"audio/mpeg\") and got back
 media_id \"3fa85f64-5717-4562-b3fc-2c963f66afa6\" — use that value for `audioId` below. Never
 invent a UUID; only use one actually returned by `upload_media`.
-(A face's `audioId` can also be set this same way by the generate_card_audio tool, when it's
-available — it synthesizes speech locally with the user's own TTS key, uploads it, and attaches it
-for you, so you don't need to call upload_media yourself in that case.)
 
 {
   \"face\": {
@@ -198,6 +199,14 @@ pub fn list_all() -> ListResourcesResult {
              (same view as the get_subscription_usage tool).",
             "application/json",
         ),
+        make_resource(
+            URI_CATALOG_FILTERS,
+            "Catalog Filter Options",
+            "Allowed values for catalog front_languages, back_languages, topics and levels, plus the \
+             per-catalog and search limits. Static: no counts (call get_catalog_filter_options for \
+             live counts).",
+            "application/json",
+        ),
     ])
 }
 
@@ -214,6 +223,7 @@ pub async fn read(
         URI_STATS => fetch_as_result(read_stats(client).await, params.uri),
         URI_LEARNING_PATHS => fetch_as_result(read_learning_paths(client).await, params.uri),
         URI_SUBSCRIPTION => fetch_as_result(read_subscription(client).await, params.uri),
+        URI_CATALOG_FILTERS => fetch_as_result(read_catalog_filters(client).await, params.uri),
         other => Err(rmcp::model::ErrorData::invalid_params(
             format!("Unknown resource URI: {other}"),
             None,
@@ -245,61 +255,103 @@ const RESOURCE_READ_DEADLINE: Duration = Duration::from_secs(60);
 /// Stops (and logs a warning) when the page cap, the item cap or a non-advancing cursor is
 /// hit, and fails the whole read if the overall deadline passes or any page errors — a later
 /// page's error must not be papered over by returning a partial result as if complete.
-async fn collect_pages<D, S, F, Fut>(mut fetch: F) -> Result<Vec<S>, ApiError>
+async fn collect_pages<D, S, F, Fut>(fetch: F) -> Result<Vec<S>, ApiError>
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<PagedResponse<D>, ApiError>>,
     S: From<D>,
 {
-    tokio::time::timeout(RESOURCE_READ_DEADLINE, async {
-        let mut out: Vec<S> = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..RESOURCE_MAX_PAGES {
-            let resp = fetch(cursor.clone()).await?;
-            let room = RESOURCE_MAX_ITEMS.saturating_sub(out.len());
-            let over_item_cap = resp.data.len() > room;
-            out.extend(resp.data.into_iter().take(room).map(S::from));
-            if over_item_cap || out.len() >= RESOURCE_MAX_ITEMS {
-                if resp.cursor.is_some() || over_item_cap {
-                    tracing::warn!(
-                        max_items = RESOURCE_MAX_ITEMS,
-                        "resource item cap reached; result truncated"
-                    );
-                }
-                return Ok(out);
+    with_read_deadline(collect_pages_capped(
+        RESOURCE_MAX_ITEMS,
+        RESOURCE_MAX_PAGES,
+        fetch,
+    ))
+    .await?
+    .map(|(out, _)| out)
+}
+
+/// Applies [`RESOURCE_READ_DEADLINE`] to a paginated read.
+async fn with_read_deadline<T>(fut: impl std::future::Future<Output = T>) -> Result<T, ApiError> {
+    tokio::time::timeout(RESOURCE_READ_DEADLINE, fut)
+        .await
+        .map_err(|_| {
+            tracing::error!(
+                deadline_secs = RESOURCE_READ_DEADLINE.as_secs(),
+                "resource read deadline exceeded"
+            );
+            ApiError::Timeout("resource read; use the list tools with a cursor instead")
+        })
+}
+
+/// [`collect_pages`] without its own deadline, bounded by the caller's remaining `max_items`
+/// and `max_pages`. Returns the items and the number of pages fetched.
+async fn collect_pages_capped<D, S, F, Fut>(
+    max_items: usize,
+    max_pages: usize,
+    mut fetch: F,
+) -> Result<(Vec<S>, usize), ApiError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<PagedResponse<D>, ApiError>>,
+    S: From<D>,
+{
+    let mut out: Vec<S> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for pages in 1..=max_pages {
+        let resp = fetch(cursor.clone()).await?;
+        let room = max_items.saturating_sub(out.len());
+        let over_item_cap = resp.data.len() > room;
+        out.extend(resp.data.into_iter().take(room).map(S::from));
+        if over_item_cap || out.len() >= max_items {
+            if resp.cursor.is_some() || over_item_cap {
+                tracing::warn!(max_items, "resource item cap reached; result truncated");
             }
-            let Some(next) = resp.cursor else {
-                return Ok(out);
-            };
-            if cursor.as_deref() == Some(next.as_str()) {
-                tracing::warn!("upstream returned a non-advancing cursor; result truncated");
-                return Ok(out);
-            }
-            cursor = Some(next);
+            return Ok((out, pages));
         }
-        tracing::warn!(
-            max_pages = RESOURCE_MAX_PAGES,
-            "resource pagination cap reached; result truncated"
-        );
-        Ok(out)
-    })
-    .await
-    .map_err(|_| {
-        tracing::error!(
-            deadline_secs = RESOURCE_READ_DEADLINE.as_secs(),
-            "resource read deadline exceeded"
-        );
-        ApiError::Timeout("resource read; use the list tools with a cursor instead")
-    })?
+        let Some(next) = resp.cursor else {
+            return Ok((out, pages));
+        };
+        if cursor.as_deref() == Some(next.as_str()) {
+            tracing::warn!("upstream returned a non-advancing cursor; result truncated");
+            return Ok((out, pages));
+        }
+        cursor = Some(next);
+    }
+    tracing::warn!(
+        max_pages,
+        "resource pagination cap reached; result truncated"
+    );
+    Ok((out, max_pages))
 }
 
 async fn read_catalogs(client: &EngramoClient) -> Result<String, ApiError> {
-    let summaries: Vec<CatalogSummary> = collect_pages(|c| async move {
-        client
-            .list_catalogs(Some(MAX_PAGE_LIMIT), c.as_deref(), false)
-            .await
+    // Own + shared only: an unfiltered listing also returns every public catalog, whose
+    // names are other users' text and don't belong in "my catalogs". One deadline, item
+    // budget and page budget cover both passes.
+    let summaries = with_read_deadline(async {
+        let mut summaries: Vec<CatalogSummary> = Vec::new();
+        let mut pages_left = RESOURCE_MAX_PAGES;
+        for filter in [CatalogFilter::Own, CatalogFilter::Shared] {
+            let room = RESOURCE_MAX_ITEMS.saturating_sub(summaries.len());
+            if room == 0 || pages_left == 0 {
+                tracing::warn!(
+                    ?filter,
+                    "resource budget exhausted; remaining catalog filters skipped"
+                );
+                break;
+            }
+            let (items, used) = collect_pages_capped(room, pages_left, |c| async move {
+                client
+                    .list_catalogs_filtered(Some(MAX_PAGE_LIMIT), c.as_deref(), false, Some(filter))
+                    .await
+            })
+            .await?;
+            summaries.extend(items);
+            pages_left = pages_left.saturating_sub(used);
+        }
+        Ok::<_, ApiError>(summaries)
     })
-    .await?;
+    .await??;
     Ok(serde_json::to_string(&summaries).unwrap_or_default())
 }
 
@@ -334,6 +386,12 @@ async fn read_subscription(client: &EngramoClient) -> Result<String, ApiError> {
     Ok(serde_json::to_string(&view).unwrap_or_default())
 }
 
+async fn read_catalog_filters(client: &EngramoClient) -> Result<String, ApiError> {
+    let schema = client.get_catalog_filter_schema().await?;
+    let view = crate::catalog_filters::filter_options_view(schema);
+    Ok(serde_json::to_string(&view).unwrap_or_default())
+}
+
 fn read_card_schema() -> ReadResourceResult {
     ReadResourceResult::new(vec![ResourceContents::text(
         CARD_SCHEMA_DOC,
@@ -360,9 +418,15 @@ mod tests {
     }
 
     #[test]
-    fn test_list_all_returns_six_resources() {
+    fn test_list_all_returns_seven_resources() {
         let result = list_all();
-        assert_eq!(result.resources.len(), 6);
+        assert_eq!(result.resources.len(), 7);
+        assert!(
+            result
+                .resources
+                .iter()
+                .any(|r| r.uri == URI_CATALOG_FILTERS)
+        );
         let uris: Vec<&str> = result.resources.iter().map(|r| r.uri.as_str()).collect();
         assert!(uris.contains(&URI_CARD_SCHEMA));
         assert!(uris.contains(&URI_CATALOGS));
@@ -406,6 +470,8 @@ mod tests {
             assert!(text.contains("visualId"), "{text}");
             assert!(!text.contains("audio_id"), "{text}");
             assert!(!text.contains("rich_text"), "{text}");
+            assert!(!text.contains("generate_card_audio"), "{text}");
+            assert!(!text.contains("prompt-examples"), "{text}");
         } else {
             panic!("expected text resource contents");
         }
@@ -438,6 +504,63 @@ mod tests {
         }
     }
 
+    const FILTER_SCHEMA_JSON: &str = r#"{"schemaVersion":2,
+        "languages":[{"key":"en","label":"English"},{"key":"es","label":"Spanish"}],
+        "subjects":[{"key":"medicine","label":"Medicine"}],
+        "levels":[{"key":"A1","label":"A1","bucket":"beginner"}],
+        "buckets":[{"key":"beginner","label":"Beginner","levels":["A1","A2"]}],
+        "limits":{"speak":2,"learn":3,"tagsPerCatalog":20,"searchSpeak":2,"searchLearn":8}}"#;
+
+    #[tokio::test]
+    async fn test_read_catalog_filters_returns_static_view_without_counts() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(FILTER_SCHEMA_JSON, "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CATALOG_FILTERS))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(resource_text(&result)).unwrap();
+        assert_eq!(v["topics"][0]["key"], "medicine");
+        assert!(v["topics"][0].get("count").is_none(), "{v}");
+        assert!(v.get("facets").is_none(), "{v}");
+        assert_eq!(v["languages"]["es"], "Spanish");
+        assert_eq!(v["no_language_code"], "zxx");
+        assert_eq!(
+            v["level_groups"]["beginner"],
+            serde_json::json!(["A1", "A2"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_catalog_filters_api_error_returns_internal_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let err = read(&client, ReadResourceRequestParams::new(URI_CATALOG_FILTERS))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+    }
+
     #[tokio::test]
     async fn test_read_unknown_uri_returns_invalid_params() {
         let client = EngramoClient::new("http://localhost:9999", "tok");
@@ -460,7 +583,7 @@ mod tests {
                 "data": [{"id": "00000000-0000-0000-0000-000000000001", "name": "Rust", "version": 1}],
                 "nextCursor": null
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -473,6 +596,40 @@ mod tests {
         } else {
             panic!("expected text resource contents");
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_catalogs_requests_only_own_and_shared() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [], "nextCursor": null
+            })))
+            .mount(&server)
+            .await;
+        let client = EngramoClient::new(server.uri(), "tok");
+        read(&client, ReadResourceRequestParams::new(URI_CATALOGS))
+            .await
+            .unwrap();
+        let mut filters: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "filter")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .collect();
+        filters.sort();
+        assert_eq!(filters, ["own", "shared"]);
     }
 
     #[tokio::test]
@@ -626,6 +783,7 @@ mod tests {
             .unwrap();
         assert_eq!(resource_text(&result), "[]");
         let requests = server.received_requests().await.unwrap_or_default();
+        // The page budget is shared: `own` exhausts it, so `shared` is never requested.
         assert_eq!(requests.len(), RESOURCE_MAX_PAGES);
     }
 
@@ -649,9 +807,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resource_text(&result), "[]");
-        // Page 1 (no cursor) yields "again"; page 2 sends it and gets "again" back -> stop.
+        // Per filter (own, shared): page 1 (no cursor) yields "again"; page 2 sends it and gets
+        // "again" back -> stop.
         let requests = server.received_requests().await.unwrap_or_default();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 4);
     }
 
     #[tokio::test]

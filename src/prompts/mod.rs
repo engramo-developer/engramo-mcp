@@ -205,9 +205,14 @@ fn create_language_deck(
         Some(id) => {
             format!("Add all cards to the existing catalog `{id}` (call `generate_cards`).")
         }
-        None => "Create a new catalog for this deck (call `generate_catalog_with_cards`); pick a \
-                 short, descriptive name from the topic."
-            .to_string(),
+        None => format!(
+            "Create a new catalog for this deck (call `generate_catalog_with_cards`); pick a \
+             short, descriptive name from the topic. Set `front_languages` to the ISO 639-1 code \
+             of {source_lang} and `back_languages` to that of {target_lang}; set `topics` and \
+             `levels` too when they fit (e.g. a CEFR level the user gave) — read the \
+             `engramo://catalog-filters` resource (or call `get_catalog_filter_options`) for the \
+             valid values."
+        ),
     };
 
     GetPromptResult::new(vec![user_msg(format!(
@@ -241,12 +246,7 @@ fn create_language_deck(
              `audio_id`/`visual_id` (cards) or `image_id` (catalog) to the returned `media_id` \
              before your final generate call — never fabricate a UUID. If they don't have media \
              yet, create the deck now and offer to add it afterward once they do (via `update_card` \
-             for audio/images on existing cards). If generate_card_audio is available (the user has \
-             configured their own TTS key), you can instead voice the face side of the newly \
-             created cards after the deck exists, by calling generate_card_audio with their ids — \
-             still no paid AI, since that spends only the user's own Gemini quota. More worked \
-             examples, including a full deck walkthrough, are in `docs/prompt-examples.md` in the \
-             engramo-mcp repo."
+             for audio/images on existing cards)."
     ))])
 }
 
@@ -389,6 +389,47 @@ mod tests {
     }
 
     #[test]
+    fn test_create_language_deck_new_catalog_sets_languages_topics_levels() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "ordering coffee"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+            ]));
+        let result = get(params).unwrap();
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
+            for f in [
+                "front_languages",
+                "back_languages",
+                "topics",
+                "levels",
+                "engramo://catalog-filters",
+            ] {
+                assert!(text.contains(f), "{f} missing: {text}");
+            }
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_existing_catalog_omits_filter_fields() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "t"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+                ("catalog_id", "00000000-0000-0000-0000-000000000001"),
+            ]));
+        let result = get(params).unwrap();
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
+            assert!(!text.contains("front_languages"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
     fn test_create_language_deck_default_count() {
         let params =
             GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
@@ -488,7 +529,8 @@ mod tests {
         if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
             assert!(text.contains("upload_media"), "{text}");
             assert!(text.contains("No paid AI"), "{text}");
-            assert!(text.contains("generate_card_audio"), "{text}");
+            assert!(!text.contains("generate_card_audio"), "{text}");
+            assert!(!text.contains("prompt-examples"), "{text}");
             assert!(
                 !text.to_lowercase().contains("generate_tts_for_cards"),
                 "{text}"
