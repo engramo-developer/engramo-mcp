@@ -7302,4 +7302,62 @@ mod tests {
         let instructions = server.get_info().instructions.unwrap_or_default();
         assert!(instructions.contains("update_catalog and generate_catalog_with_cards set them"));
     }
+
+    /// Every id-taking handler below must turn both an upstream failure and a malformed id
+    /// into an `is_error` result — the latter without calling the API.
+    #[tokio::test]
+    async fn test_id_handlers_return_tool_errors_for_api_failure_and_bad_id() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+
+        for id in [TEST_ID, "bad"] {
+            let before = mock_server.received_requests().await.unwrap().len();
+            let results = [
+                server
+                    .list_cards(Parameters(ListCardsParams {
+                        catalog_id: id.to_string(),
+                        limit: None,
+                        cursor: None,
+                    }))
+                    .await
+                    .unwrap(),
+                server
+                    .add_card_to_learning(Parameters(AddCardToLearningParams {
+                        card_id: id.to_string(),
+                    }))
+                    .await
+                    .unwrap(),
+                server
+                    .add_catalog_to_learning(Parameters(AddCatalogToLearningParams {
+                        catalog_id: id.to_string(),
+                    }))
+                    .await
+                    .unwrap(),
+                server
+                    .get_learning_path(Parameters(GetLearningPathParams {
+                        path_id: id.to_string(),
+                    }))
+                    .await
+                    .unwrap(),
+                server
+                    .activate_learning_path(Parameters(ActivateLearningPathParams {
+                        path_id: id.to_string(),
+                    }))
+                    .await
+                    .unwrap(),
+            ];
+            for (i, r) in results.iter().enumerate() {
+                assert_eq!(r.is_error, Some(true), "handler #{i}, id {id}: {r:?}");
+            }
+            let sent = mock_server.received_requests().await.unwrap().len() - before;
+            assert_eq!(sent, if id == TEST_ID { 5 } else { 0 }, "id {id}");
+        }
+    }
 }

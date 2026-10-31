@@ -1369,10 +1369,12 @@ mod tests {
             .unwrap();
         assert_eq!(r.is_error, Some(true));
 
-        let server = MockServer::start().await;
-        let uri = server.uri();
-        drop(server);
-        let r = make_server(&uri).list_catalog_shares(p()).await.unwrap();
+        // A closed port, not a dropped `MockServer`: wiremock pools servers, so a dropped
+        // one's URI can belong to another test's live server by the time this request runs.
+        let r = make_server("http://127.0.0.1:1")
+            .list_catalog_shares(p())
+            .await
+            .unwrap();
         assert_eq!(r.is_error, Some(true));
     }
 
