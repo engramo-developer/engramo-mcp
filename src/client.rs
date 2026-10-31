@@ -35,7 +35,7 @@ pub(crate) const MAX_PAGE_LIMIT: i64 = 50;
 /// Real cursors, search queries and media-type filters are short; anything longer is a
 /// malformed or abusive value that would only produce an oversized upstream URL (and a noisy
 /// 414/431 error log).
-const MAX_QUERY_PARAM_LEN: usize = 512;
+pub(crate) const MAX_QUERY_PARAM_LEN: usize = 512;
 
 /// Validates one free-form, LLM-supplied query value and returns it as a query pair. Rejects
 /// an over-long value before any request is sent, so there is a single limit for `cursor`,

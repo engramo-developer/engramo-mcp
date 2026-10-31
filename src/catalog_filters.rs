@@ -95,6 +95,21 @@ pub fn normalize_lang(raw: &str, field: &'static str, allow_zxx: bool) -> Result
     Ok(code)
 }
 
+/// Hard ceiling on a raw list's length before normalization. Generous over the API caps so
+/// duplicates and case variants still fold, but bounds the work an untrusted caller can force.
+pub const MAX_RAW_LIST: usize = 64;
+
+/// Rejects an oversized raw list before any per-item work.
+pub fn check_raw_len(field: &str, raw: &[String]) -> Result<(), String> {
+    if raw.len() > MAX_RAW_LIST {
+        return Err(format!(
+            "{field}: too many values ({}; at most {MAX_RAW_LIST})",
+            raw.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Normalizes each code, deduplicates (first occurrence wins), then enforces `max`.
 pub fn normalize_langs(
     raw: &[String],
@@ -102,6 +117,7 @@ pub fn normalize_langs(
     allow_zxx: bool,
     max: usize,
 ) -> Result<Vec<String>, String> {
+    check_raw_len(field, raw)?;
     let mut out: Vec<String> = Vec::new();
     for r in raw {
         let code = normalize_lang(r, field, allow_zxx)?;
@@ -118,6 +134,7 @@ pub fn normalize_langs(
 /// Topic keys: trimmed + lowercased; rejects empty, a `lang:` prefix, the reserved `language`
 /// key, and anything not matching `^[a-z][a-z_]{0,31}$` (the API's key shape).
 pub fn normalize_topics(raw: &[String]) -> Result<Vec<String>, String> {
+    check_raw_len("topics", raw)?;
     let mut out: Vec<String> = Vec::new();
     for r in raw {
         let key = r.trim().to_ascii_lowercase();
@@ -288,6 +305,12 @@ pub fn filter_options_view(schema: FilterSchemaDto) -> FilterOptionsView {
     }
 }
 
+/// Defense in depth: tag facet keys come from other users' public catalogs, so drop any that
+/// is overlong or holds control characters before it reaches the model.
+fn plausible_tag(k: &str) -> bool {
+    k.chars().count() <= 40 && !k.chars().any(char::is_control)
+}
+
 impl FilterOptionsView {
     /// Merges facet counts: topics gain a `count` (topics with no matches get 0) and a
     /// `facets` section is added. `learn` keys split into front languages (`lang:`) and topics.
@@ -311,6 +334,11 @@ impl FilterOptionsView {
                     .map_or(0, |c| c.count),
             );
         }
+        let top_tags = counts
+            .tags
+            .into_iter()
+            .filter(|c| plausible_tag(&c.key))
+            .collect();
         self.facets = Some(FacetsView {
             total: counts.total,
             front_languages,
@@ -318,7 +346,7 @@ impl FilterOptionsView {
             topics: topic_counts,
             levels: counts.levels,
             level_groups: counts.buckets,
-            top_tags: counts.tags,
+            top_tags,
         });
         self
     }

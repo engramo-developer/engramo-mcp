@@ -4,8 +4,9 @@ use uuid::Uuid;
 
 use crate::catalog_filters::{
     LevelParam, MAX_SEARCH_BACK, MAX_SEARCH_LEARN, MAX_SEARCH_TAGS, MAX_WRITE_BACK,
-    MAX_WRITE_LEARN, expand_levels, join_learn, normalize_langs, normalize_topics,
+    MAX_WRITE_LEARN, check_raw_len, expand_levels, join_learn, normalize_langs, normalize_topics,
 };
+use crate::client::MAX_QUERY_PARAM_LEN as MAX_QUERY_BYTES; // the client's `q` wire bound
 use crate::dto::{AccessLevel, CatalogClassification, CatalogFilter, CatalogListQuery};
 use crate::error::{ApiError, preview};
 
@@ -97,9 +98,6 @@ pub(crate) struct FilterInputs<'a> {
 /// Max length of the free-text `query` (the API's `MAX_Q_CHARS`).
 const MAX_QUERY_CHARS: usize = 200;
 
-/// Byte bound the HTTP client enforces on the `q` wire param (`MAX_QUERY_PARAM_LEN`).
-const MAX_QUERY_BYTES: usize = 512;
-
 /// Normalizes the filter inputs into a wire query (search caps) with no request made. Returns
 /// the query and whether any filter param beyond `filter` was given (decides the 400 hint).
 /// A blank `query` is not sent.
@@ -147,8 +145,12 @@ pub(crate) fn build_catalog_query(f: FilterInputs<'_>) -> Result<(CatalogListQue
 /// Trims and lowercases search tags (the API stores them that way), drops blanks and
 /// duplicates, rejects a tag with a comma (the list goes out comma-joined) and caps the count.
 fn normalize_search_tags(raw: &[String]) -> Result<Vec<String>, String> {
+    check_raw_len("tags", raw)?;
     let mut out: Vec<String> = Vec::new();
     for tag in raw {
+        if tag.len() > MAX_QUERY_BYTES {
+            return Err("tags: a tag is too long.".to_owned());
+        }
         let tag = tag.trim().to_lowercase();
         if tag.is_empty() {
             continue;
@@ -266,24 +268,22 @@ impl ClassificationWrite {
         self.front.is_some() != self.topics.is_some()
     }
 
-    /// The `learn` value to send. `current` is required only when [`Self::needs_current`].
-    pub fn learn(
+    /// The `learn` value for a new catalog: the half that was not given is empty.
+    pub fn learn_for_new(&self) -> Result<Option<Vec<String>>, String> {
+        self.learn_with(&CatalogClassification::default())
+    }
+
+    /// The `learn` value for an update. `current` is the stored classification; call this with
+    /// the catalog read from the API whenever [`Self::needs_current`].
+    pub fn learn_with(
         &self,
-        current: Option<&CatalogClassification>,
+        current: &CatalogClassification,
     ) -> Result<Option<Vec<String>>, String> {
         match (&self.front, &self.topics) {
             (None, None) => Ok(None),
             (Some(f), Some(t)) => join_learn(f, t, MAX_WRITE_LEARN).map(Some),
-            (Some(f), None) => {
-                let t = current.map(|c| c.topics.as_slice()).unwrap_or_default();
-                join_learn(f, t, MAX_WRITE_LEARN).map(Some)
-            }
-            (None, Some(t)) => {
-                let f = current
-                    .map(|c| c.front_languages.as_slice())
-                    .unwrap_or_default();
-                join_learn(f, t, MAX_WRITE_LEARN).map(Some)
-            }
+            (Some(f), None) => join_learn(f, &current.topics, MAX_WRITE_LEARN).map(Some),
+            (None, Some(t)) => join_learn(&current.front_languages, t, MAX_WRITE_LEARN).map(Some),
         }
     }
 }
@@ -1845,6 +1845,127 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_raw(SCHEMA_JSON, "application/json"))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_facets_503_with_filters_still_degrades() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                front_languages: opt_strs(&["es"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert!(v.get("facets").is_none());
+        assert_eq!(v["notes"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_get_catalog_filter_options_facets_400_with_only_source_filter_degrades() {
+        let server = MockServer::start().await;
+        mount_schema(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad"})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .get_catalog_filter_options(Parameters(CatalogFilterOptionsParams {
+                filter: Some(CatalogFilter::Public),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let v: serde_json::Value = serde_json::from_str(tool_text(&result)).unwrap();
+        assert!(v.get("facets").is_none());
+        assert_eq!(v["notes"].as_array().unwrap().len(), 4);
+        assert!(!tool_text(&result).contains("for valid topics"));
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_401_with_filters_has_no_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                topics: opt_strs(&["math"]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            !tool_text(&result).contains("get_catalog_filter_options"),
+            "{}",
+            tool_text(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_400_on_cursor_page_has_no_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad cursor"})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .list_catalogs(Parameters(ListCatalogsParams {
+                topics: opt_strs(&["math"]),
+                cursor: Some("abc".to_owned()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(!tool_text(&result).contains("get_catalog_filter_options"));
+    }
+
+    #[test]
+    fn test_oversized_raw_lists_are_rejected_before_normalization() {
+        let many: Vec<String> = (0..1000).map(|i| format!("t{i}")).collect();
+        assert!(normalize_topics(&many).is_err());
+        assert!(normalize_langs(&many, "front_languages", false, 3).is_err());
+        assert!(normalize_search_tags(&many).is_err());
+    }
+
+    #[test]
+    fn test_classification_write_learn_arms_and_flags() {
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = ClassificationWrite::new(None, None, None, None).unwrap();
+        assert!(!c.any() && !c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), None);
+        let c = ClassificationWrite::new(Some(&v(&["ES"])), None, None, None).unwrap();
+        assert!(c.any() && c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), Some(v(&["lang:es"])));
+        let c = ClassificationWrite::new(None, None, Some(&v(&["Math"])), None).unwrap();
+        assert!(c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), Some(v(&["math"])));
+        let cur = CatalogClassification {
+            front_languages: v(&["es"]),
+            ..Default::default()
+        };
+        assert_eq!(c.learn_with(&cur).unwrap(), Some(v(&["lang:es", "math"])));
+        let c =
+            ClassificationWrite::new(Some(&v(&["es"])), None, Some(&v(&["math"])), None).unwrap();
+        assert!(!c.needs_current());
+        let c = ClassificationWrite::new(None, Some(&[]), None, None).unwrap();
+        assert!(c.any() && !c.needs_current());
+        assert_eq!(c.learn_for_new().unwrap(), None);
     }
 
     #[tokio::test]

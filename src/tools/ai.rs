@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::catalog_filters::{normalize_lang, with_filter_hint};
 use crate::dto::{AiChatRequest, CardAiRequest, CreateCatalogRequest};
+use crate::error::ApiError;
 use crate::server::EngramoMcpServer;
 use crate::tools::catalogs::{ClassificationWrite, err_result, ok_json, parse_uuid};
 use crate::tools::media::MAX_UPLOAD_BASE64_LEN;
@@ -268,7 +269,7 @@ impl EngramoMcpServer {
             Ok(c) => c,
             Err(e) => return Ok(err_result(e)),
         };
-        let learn = match class.learn(None) {
+        let learn = match class.learn_for_new() {
             Ok(l) => l,
             Err(e) => return Ok(err_result(e)),
         };
@@ -276,18 +277,20 @@ impl EngramoMcpServer {
         let has_filters = class.any();
         // An explicit back_languages (even []) wins; otherwise the translation language is the
         // back language. A target_lang that is not a 2-letter ISO 639-1 code (e.g. 'zxx', 'fil') is skipped.
+        let mut defaulted_back: Option<String> = None;
         if p.back_languages.is_none()
             && let Ok(code) = normalize_lang(&p.target_lang, "back_languages", false)
             && code.len() == 2
         {
-            class.speak_langs = Some(vec![code]);
+            class.speak_langs = Some(vec![code.clone()]);
+            defaulted_back = Some(code);
         }
-        let content_file =
+        let mut content_file =
             match base64::engine::general_purpose::STANDARD.decode(&p.content_file_base64) {
                 Ok(bytes) => bytes,
                 Err(e) => return Ok(err_result(format!("Invalid base64 content_file: {e}"))),
             };
-        let metadata = CreateCatalogRequest {
+        let mut metadata = CreateCatalogRequest {
             name: p.name,
             description: p.description,
             tags: p.tags,
@@ -299,17 +302,35 @@ impl EngramoMcpServer {
         let file_name = p
             .content_file_name
             .unwrap_or_else(|| "import.zip".to_string());
-        Ok(
-            match self
+        // Clone only when a retry is possible.
+        let first = if defaulted_back.is_some() {
+            content_file.clone()
+        } else {
+            std::mem::take(&mut content_file)
+        };
+        let mut result = self
+            .client
+            .translate_batch_import(&p.target_lang, &metadata, &file_name, first)
+            .await;
+        // The implicit back language may not be in the API's filter schema; the API rejects
+        // that before translating, so retrying without it costs no quota. Retry only when the
+        // 400 names the defaulted language (the API says `invalid language '<code>'`), so
+        // unrelated 400s don't resend the file to the paid endpoint.
+        let retry_marker = defaulted_back.map(|c| format!("invalid language '{c}'"));
+        if let Some(marker) = &retry_marker
+            && matches!(&result, Err(ApiError::BadRequest(m)) if m.contains(marker.as_str()))
+        {
+            metadata.speak_langs = None;
+            result = self
                 .client
                 .translate_batch_import(&p.target_lang, &metadata, &file_name, content_file)
-                .await
-            {
-                Ok(catalog) => ok_json(&catalog),
-                Err(e) if has_filters => err_result(with_filter_hint(e)),
-                Err(e) => err_result(e),
-            },
-        )
+                .await;
+        }
+        Ok(match result {
+            Ok(catalog) => ok_json(&catalog),
+            Err(e) if has_filters => err_result(with_filter_hint(e)),
+            Err(e) => err_result(e),
+        })
     }
 }
 
@@ -732,6 +753,91 @@ mod tests {
             !body.contains(r#""learn""#) && !body.contains(r#""levels""#),
             "{body}"
         );
+    }
+
+    /// First POST (carrying `speakLangs`) gets a 400, the retry without it succeeds.
+    async fn run_import_rejecting_speak_langs(
+        p: TranslateBatchImportParams,
+    ) -> (CallToolResult, Vec<String>) {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("speakLangs"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": "invalid language 'es'", "code": "FILTER_INVALID_LANGUAGE"}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": mock_id(), "name": "D", "version": 1
+            })))
+            .mount(&server)
+            .await;
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(p))
+            .await
+            .unwrap();
+        let bodies = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        (r, bodies)
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_retries_without_defaulted_back_language_on_400() {
+        let (r, bodies) = run_import_rejecting_speak_langs(import_params("es")).await;
+        assert!(!r.is_error.unwrap_or(false), "{r:?}");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("speakLangs"));
+        assert!(!bodies[1].contains("speakLangs"));
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_does_not_retry_400_naming_other_language() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": "invalid language 'xx'", "code": "FILTER_INVALID_LANGUAGE"}),
+            ))
+            .mount(&server)
+            .await;
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(import_params("es")))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_does_not_retry_unrelated_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad archive"})))
+            .mount(&server)
+            .await;
+        let r = make_server(&server.uri())
+            .translate_batch_import(Parameters(import_params("es")))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_translate_batch_import_does_not_retry_explicit_back_languages() {
+        let (r, bodies) = run_import_rejecting_speak_langs(TranslateBatchImportParams {
+            back_languages: svec(&["en"]),
+            ..import_params("es")
+        })
+        .await;
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert_eq!(bodies.len(), 1);
     }
 
     #[tokio::test]
