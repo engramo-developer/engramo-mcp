@@ -21,7 +21,7 @@
       "interface": {
         "displayName": "EngrAmo",
         "shortDescription": "Flashcards you actually review",
-        "longDescription": "EngrAmo is a spaced-repetition flashcard app. This plugin lets ChatGPT work directly with your EngrAmo account, so whatever you are learning in a conversation can become a deck you review on your phone.\n\nWhat you can do:\n- Create flashcards from anything. Ask ChatGPT to build a deck from a topic, an article, or your notes. ChatGPT writes the cards itself, including bold or highlighted key phrases and word-by-word dictionaries for language cards.\n- See what's due. Ask which cards are due today, or quiz yourself on them in the chat.\n- Organise your learning. Search catalogs and cards, add catalogs to learning, and group them into learning paths you can activate or pause.\n- Edit and clean up. Fix a card's wording, move cards between catalogs, or delete what you no longer need. Destructive actions are marked so ChatGPT asks before running them.\n\nThe plugin talks only to EngrAmo's own API. You sign in with your EngrAmo account through OAuth, and you can disconnect at any time from Settings → Connected apps in the EngrAmo app. ChatGPT writes the cards itself; the plugin makes no AI calls of its own.",
+        "longDescription": "EngrAmo is a spaced-repetition flashcard app. This plugin lets ChatGPT work directly with your EngrAmo account, so whatever you are learning in a conversation can become a deck you review on your phone.\n\nWhat you can do:\n- Create flashcards from anything. Ask ChatGPT to build a deck from a topic, an article, or your notes. ChatGPT writes the cards itself, including bold or highlighted key phrases and word-by-word dictionaries for language cards.\n- See what's due. Ask which cards are due today, or quiz yourself on them in the chat.\n- Organise your learning. Search catalogs and cards, add catalogs to learning, and group them into learning paths you can activate or pause.\n- Share and discover. Share a deck with other EngrAmo users by their user id, and find public decks by language, topic and level.\n- Edit and clean up. Fix a card's wording, move cards between catalogs, or delete what you no longer need. Destructive actions are marked so ChatGPT asks before running them.\n\nThe plugin talks only to EngrAmo's own API. You sign in with your EngrAmo account through OAuth, and you can disconnect at any time from Settings → Connected apps in the EngrAmo app. ChatGPT writes the cards itself; the plugin makes no AI calls of its own.",
         "developerName": "EngrAmo",
         "category": "Productivity",
         "capabilities": [
@@ -39,7 +39,12 @@
           "Add a deck to your learning queue",
           "Create learning paths",
           "Activate or pause a learning path",
-          "Add or remove decks in a learning path"
+          "Add or remove decks in a learning path",
+          "Find decks by language, topic and level",
+          "Share a deck with other EngrAmo users",
+          "Show your plan limits and usage",
+          "Turn on shadowing (speaking practice) for a deck",
+          "Set a deck's cover image"
         ],
         "websiteURL": "https://engramo.app",
         "supportURL": "https://github.com/engramo-developer/engramo-mcp/issues",
