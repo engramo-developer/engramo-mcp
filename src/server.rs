@@ -2331,11 +2331,10 @@ mod tests {
 
     #[test]
     fn test_upload_media_is_registered_on_the_real_server() {
-        // Regression guard: `tools/media.rs`'s `MediaTools` struct is a separate, unused
-        // scaffold (like every other `tools/*.rs` XxxTools struct in this codebase) — the
-        // tool actually served to clients is the one registered directly on
-        // `EngramoMcpServer` below. A tool added only to `MediaTools` would pass its own
-        // tests while being completely unreachable from a real MCP client.
+        // Regression guard: `tools/*.rs` holds only tool parameter types; a tool reaches
+        // clients only if it is registered on `EngramoMcpServer`. (The files once also had
+        // standalone, never-registered `XxxTools` duplicates — a fix made only there passed
+        // its own tests while the served tool stayed broken; they were removed.)
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, false);
         let names = tool_names(&server);
@@ -2345,10 +2344,7 @@ mod tests {
 
     #[test]
     fn test_learning_path_catalog_tools_are_registered_on_the_real_server() {
-        // Same regression class as `test_upload_media_is_registered_on_the_real_server`:
-        // `tools/learning_paths.rs`'s `LearningPathTools` struct is a separate, unused
-        // scaffold — the tools actually served to clients are the ones registered directly on
-        // `EngramoMcpServer` below.
+        // Same regression class as `test_upload_media_is_registered_on_the_real_server`.
         for flag in [false, true] {
             let server =
                 EngramoMcpServer::new(EngramoClient::new("http://localhost", "engramo_test"), flag);
@@ -2395,9 +2391,8 @@ mod tests {
     #[test]
     fn test_update_card_and_list_media_descriptions_document_catalogs_and_get_card_on_the_real_server()
      {
-        // Regression guard for F1/F2: `update_card`'s and `list_media`'s docs must reach the
-        // real, registered tool — not just their `tools/*.rs` scaffold — so the wording can't
-        // silently drift back to the undocumented scaffold text.
+        // Regression guard for F1/F2: `update_card`'s and `list_media`'s docs must be on the
+        // real, registered tool, so the wording can't silently drift back.
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, false);
         let tools = server.tool_router.list_all();
@@ -2575,9 +2570,8 @@ mod tests {
         assert_eq!(v["cursor"], "def");
     }
 
-    /// Regression for F2 (issue #38 follow-up): `tools/media.rs`'s `MediaTools` is a
-    /// separate, unused scaffold — assert the `name`/`length` mapping reaches the tool
-    /// output through the real, registered `list_media` handler, not just the scaffold.
+    /// Regression for F2 (issue #38 follow-up): the `name`/`length` mapping reaches the tool
+    /// output through the real, registered `list_media` handler.
     #[tokio::test]
     async fn test_list_media_output_includes_name_and_length_on_real_server() {
         use wiremock::matchers::{method, path};
@@ -2617,8 +2611,7 @@ mod tests {
         assert_eq!(item["length"], 2048, "{v}");
     }
 
-    /// Regression for F1 (issue #39 follow-up): `tools/cards.rs`'s `CardTools` is a
-    /// separate, unused scaffold — assert `catalogs` memberships reach the tool output
+    /// Regression for F1 (issue #39 follow-up): `catalogs` memberships reach the tool output
     /// through the real, registered `list_cards`/`get_card`/`update_card` handlers.
     #[tokio::test]
     async fn test_list_cards_catalogs_reach_tool_output_on_real_server() {
@@ -7359,5 +7352,118 @@ mod tests {
             let sent = mock_server.received_requests().await.unwrap().len() - before;
             assert_eq!(sent, if id == TEST_ID { 5 } else { 0 }, "id {id}");
         }
+    }
+
+    /// The API's `nextCursor` (and `total`, where the endpoint has one) reaches the
+    /// output of the paginated card and learning handlers as `cursor` / `total_count`.
+    #[tokio::test]
+    async fn test_paginated_card_and_learning_handlers_surface_cursor() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/catalogs/{TEST_ID}/cards")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "nextCursor": "cards-next"
+            })))
+            .mount(&ms)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "nextCursor": "due-next",
+                "total": 0
+            })))
+            .mount(&ms)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/learning/cards/all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "nextCursor": "all-next",
+                "total": 3
+            })))
+            .mount(&ms)
+            .await;
+        let server = mock_server_for(&ms.uri());
+        let page = || DueCardsParams {
+            limit: None,
+            cursor: None,
+        };
+        let json = |r: &CallToolResult| -> serde_json::Value {
+            assert_ne!(r.is_error, Some(true), "{r:?}");
+            serde_json::from_str(first_text(r)).unwrap()
+        };
+
+        let cards = server
+            .list_cards(Parameters(ListCardsParams {
+                catalog_id: TEST_ID.to_string(),
+                limit: None,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(json(&cards)["cursor"], "cards-next");
+
+        let due = json(&server.get_due_cards(Parameters(page())).await.unwrap());
+        assert_eq!(due["cursor"], "due-next", "{due}");
+        assert_eq!(due["total_count"], 0, "{due}");
+
+        let all = json(
+            &server
+                .get_all_learning_cards(Parameters(page()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(all["cursor"], "all-next", "{all}");
+        assert_eq!(all["total_count"], 3, "{all}");
+    }
+
+    #[tokio::test]
+    async fn test_activate_learning_path_not_found_is_tool_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ms = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/learning-paths/{TEST_ID}/activate")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .activate_learning_path(Parameters(ActivateLearningPathParams {
+                path_id: TEST_ID.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert!(first_text(&r).starts_with("Not found"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn test_list_media_oversized_cursor_is_tool_error_without_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&ms)
+            .await;
+        let r = mock_server_for(&ms.uri())
+            .list_media(Parameters(ListMediaParams {
+                media_type: None,
+                limit: None,
+                cursor: Some("a".repeat(513)),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        assert!(first_text(&r).contains("cursor is too long"), "{r:?}");
     }
 }
