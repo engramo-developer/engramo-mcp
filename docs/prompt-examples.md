@@ -19,7 +19,8 @@ so it doesn't use your EngrAmo plan's AI quotas. Card audio uses your own Gemini
   [your own recordings](#9-attach-your-own-recordings)
 - [Study](#study): [start learning](#10-start-learning-a-deck) · [learning path](#11-build-a-learning-path) ·
   [search](#12-find-cards-across-all-your-decks) · [shadowing](#13-speaking-practice-shadowing)
-- [Account](#account): [plan and usage](#14-check-your-plan-and-usage) · [share a deck](#15-share-a-deck)
+- [Account](#account): [plan and usage](#14-check-your-plan-and-usage) · [share a deck](#15-share-a-deck) ·
+  [find and classify decks](#16-find-and-classify-decks)
 
 ## 1. Check your setup
 
@@ -209,3 +210,14 @@ Tools: `share_catalog`. Users are identified by user id (a UUID, not an email): 
 asking their own assistant "What's my EngrAmo user id?". Say "editor" to let them change cards too.
 Later: "Who has access to this catalog?" (`list_catalog_shares`), "Stop sharing it with that user"
 (`unshare_catalog`), "Show catalogs shared with me" (`list_catalogs` with `filter: "shared"`).
+
+### 16. Find and classify decks
+
+```text
+Find public Spanish catalogs for beginners about medicine. Then take my "Pharmacy phrases" catalog and
+set its languages, topic and level so it shows up in that search too.
+```
+
+The model calls `get_catalog_filter_options` for the valid topics and language codes, then `list_catalogs`
+with `front_languages`, `levels`, `topics` and `filter: public`. To classify your own deck it calls
+`update_catalog` with `front_languages`, `back_languages`, `topics` and `levels`.

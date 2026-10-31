@@ -1,3 +1,4 @@
+pub mod catalog_filters;
 pub mod client;
 pub mod config;
 pub mod dto;

@@ -10,6 +10,8 @@
 //!   engramo://learning/stats        — learning stats (due_count, total_count)
 //!   engramo://learning-paths        — all learning paths (id, name)
 //!   engramo://subscription          — userId, plan, limits and usage (= get_subscription_usage)
+//!   engramo://catalog-filters       — allowed topics, levels, language codes and limits for
+//!                                     catalog front/back languages (static view, no counts)
 
 use rmcp::model::{
     ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
@@ -31,6 +33,7 @@ pub const URI_DUE: &str = "engramo://learning/due";
 pub const URI_STATS: &str = "engramo://learning/stats";
 pub const URI_LEARNING_PATHS: &str = "engramo://learning-paths";
 pub const URI_SUBSCRIPTION: &str = "engramo://subscription";
+pub const URI_CATALOG_FILTERS: &str = "engramo://catalog-filters";
 
 // ── Card schema document ──────────────────────────────────────────────────────
 
@@ -198,6 +201,14 @@ pub fn list_all() -> ListResourcesResult {
              (same view as the get_subscription_usage tool).",
             "application/json",
         ),
+        make_resource(
+            URI_CATALOG_FILTERS,
+            "Catalog Filter Options",
+            "Allowed values for catalog front_languages, back_languages, topics and levels, plus the \
+             per-catalog and search limits. Static: no counts (call get_catalog_filter_options for \
+             live counts).",
+            "application/json",
+        ),
     ])
 }
 
@@ -214,6 +225,7 @@ pub async fn read(
         URI_STATS => fetch_as_result(read_stats(client).await, params.uri),
         URI_LEARNING_PATHS => fetch_as_result(read_learning_paths(client).await, params.uri),
         URI_SUBSCRIPTION => fetch_as_result(read_subscription(client).await, params.uri),
+        URI_CATALOG_FILTERS => fetch_as_result(read_catalog_filters(client).await, params.uri),
         other => Err(rmcp::model::ErrorData::invalid_params(
             format!("Unknown resource URI: {other}"),
             None,
@@ -334,6 +346,12 @@ async fn read_subscription(client: &EngramoClient) -> Result<String, ApiError> {
     Ok(serde_json::to_string(&view).unwrap_or_default())
 }
 
+async fn read_catalog_filters(client: &EngramoClient) -> Result<String, ApiError> {
+    let schema = client.get_catalog_filter_schema().await?;
+    let view = crate::catalog_filters::filter_options_view(schema);
+    Ok(serde_json::to_string(&view).unwrap_or_default())
+}
+
 fn read_card_schema() -> ReadResourceResult {
     ReadResourceResult::new(vec![ResourceContents::text(
         CARD_SCHEMA_DOC,
@@ -360,9 +378,15 @@ mod tests {
     }
 
     #[test]
-    fn test_list_all_returns_six_resources() {
+    fn test_list_all_returns_seven_resources() {
         let result = list_all();
-        assert_eq!(result.resources.len(), 6);
+        assert_eq!(result.resources.len(), 7);
+        assert!(
+            result
+                .resources
+                .iter()
+                .any(|r| r.uri == URI_CATALOG_FILTERS)
+        );
         let uris: Vec<&str> = result.resources.iter().map(|r| r.uri.as_str()).collect();
         assert!(uris.contains(&URI_CARD_SCHEMA));
         assert!(uris.contains(&URI_CATALOGS));
@@ -436,6 +460,63 @@ mod tests {
         } else {
             panic!("expected text resource contents");
         }
+    }
+
+    const FILTER_SCHEMA_JSON: &str = r#"{"schemaVersion":2,
+        "languages":[{"key":"en","label":"English"},{"key":"es","label":"Spanish"}],
+        "subjects":[{"key":"medicine","label":"Medicine"}],
+        "levels":[{"key":"A1","label":"A1","bucket":"beginner"}],
+        "buckets":[{"key":"beginner","label":"Beginner","levels":["A1","A2"]}],
+        "limits":{"speak":2,"learn":3,"tagsPerCatalog":20,"searchSpeak":2,"searchLearn":8}}"#;
+
+    #[tokio::test]
+    async fn test_read_catalog_filters_returns_static_view_without_counts() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(FILTER_SCHEMA_JSON, "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CATALOG_FILTERS))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(resource_text(&result)).unwrap();
+        assert_eq!(v["topics"][0]["key"], "medicine");
+        assert!(v["topics"][0].get("count").is_none(), "{v}");
+        assert!(v.get("facets").is_none(), "{v}");
+        assert_eq!(v["languages"]["es"], "Spanish");
+        assert_eq!(v["no_language_code"], "zxx");
+        assert_eq!(
+            v["level_groups"]["beginner"],
+            serde_json::json!(["A1", "A2"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_catalog_filters_api_error_returns_internal_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalogs/facets/schema"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = EngramoClient::new(server.uri(), "tok");
+        let err = read(&client, ReadResourceRequestParams::new(URI_CATALOG_FILTERS))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
     }
 
     #[tokio::test]

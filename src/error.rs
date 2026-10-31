@@ -22,6 +22,10 @@ pub struct QuotaExceededBody {
     pub window: Option<String>,
 }
 
+/// Text of a 409 Conflict, shared by the HTTP mapping and the pre-write version check.
+pub const CONFLICT_MESSAGE: &str =
+    "resource was modified by another client. Fetch the latest version and retry.";
+
 /// `code` of the API's 403 body when the caller's plan doesn't unlock a feature.
 const FEATURE_NOT_ENTITLED_CODE: &str = "FEATURE_NOT_ENTITLED";
 
@@ -307,10 +311,7 @@ impl ApiError {
                 ))),
             },
             404 => Self::NotFound(dedup_or_raw("Not found", extract_error_message(&body))),
-            409 => Self::Conflict(
-                "resource was modified by another client. Fetch the latest version and retry."
-                    .to_string(),
-            ),
+            409 => Self::Conflict(CONFLICT_MESSAGE.to_string()),
             402 | 429 => {
                 let q = serde_json::from_str::<QuotaExceededBody>(&body).ok();
                 let q = q.as_ref();

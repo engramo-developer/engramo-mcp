@@ -547,7 +547,7 @@ storage quotas, and needs no paid EngrAmo plan.
 
 ## Available tools
 
-34 tools are always available, and two more appear with [text-to-speech](#text-to-speech-bring-your-own-key)
+35 tools are always available, and two more appear with [text-to-speech](#text-to-speech-bring-your-own-key)
 (local `stdio` only).
 For ready-to-paste prompts that use them, see [docs/prompt-examples.md](docs/prompt-examples.md).
 
@@ -560,9 +560,10 @@ For ready-to-paste prompts that use them, see [docs/prompt-examples.md](docs/pro
 ### Catalogs
 | Tool | Description |
 |---|---|
-| `list_catalogs` | List your catalogs with id, name, description, tags, card count, visibility and version; `filter` (`own` or `shared`) limits it to catalogs you own or that others shared with you, and `speaking_only` to catalogs with shadowing on |
+| `list_catalogs` | List your catalogs with id, name, description, tags, card count, visibility and version; `filter` (`own` or `shared`) limits it to catalogs you own or that others shared with you, and `speaking_only` to catalogs with shadowing on. Also filters by `front_languages` (language of the card fronts), `back_languages` (language of the backs; `zxx` = none), `topics`, `levels` (`A1`–`C2` or `beginner`/`intermediate`/`advanced`) and `tags`, together with free text `q` |
+| `get_catalog_filter_options` | The allowed topics, levels, level groups and language codes (plus limits), and live counts of how many catalogs match each value under the same filters as `list_catalogs`. Call it before filtering or classifying a catalog |
 | `get_catalog` | Get a single catalog by ID, including its description, tags and shadowing settings |
-| `update_catalog` | Update a catalog's name, description, tags, visibility or cover image (`image_id`, from `upload_media`); needs the current `version` |
+| `update_catalog` | Update a catalog's name, description, tags, visibility, cover image (`image_id`, from `upload_media`) or classification (`front_languages`, `back_languages`, `topics`, `levels`; each replaces the previous list); needs the current `version` |
 | `set_catalog_shadowing` | Turn shadowing (speaking practice) on or off for a catalog, or change its language |
 | `share_catalog` | Share a catalog you own with other users by user id (UUID, not email) as `viewer` (default) or `editor`; re-sharing changes their level. Returns the full collaborator list. Ask people for their user id; they can get it from `get_subscription_usage` |
 | `unshare_catalog` | Remove users' access to a catalog you own. Returns the remaining collaborators |
@@ -616,7 +617,7 @@ Reviews are graded in the EngrAmo app; there is no tool for submitting a review.
 | Tool | Description |
 |---|---|
 | `generate_card` | Create a flashcard — the calling model does any translation/wording itself |
-| `generate_catalog_with_cards` | Create a catalog with cards in one call, optionally with a cover image (`image_id`) — same bring-your-own-AI model. To add or replace the cover of an existing catalog, use `update_catalog` |
+| `generate_catalog_with_cards` | Create a catalog with cards in one call, optionally with a cover image (`image_id`) and classification (`front_languages`, `back_languages`, `topics`, `levels`) — same bring-your-own-AI model. To add or replace the cover of an existing catalog, use `update_catalog` |
 | `generate_cards` | Add multiple cards to an existing catalog — same bring-your-own-AI model |
 
 ### Text-to-speech (stdio, opt-in)
@@ -722,6 +723,7 @@ The server also exposes **MCP Resources** (live data readable as context):
 | `engramo://learning/stats` | Learning stats (due_count, total_count) |
 | `engramo://learning-paths` | All learning paths (id, name) |
 | `engramo://subscription` | Your userId, plan, limits and usage (same view as `get_subscription_usage`) |
+| `engramo://catalog-filters` | Allowed catalog topics, levels and language codes, plus limits (static, no counts; `get_catalog_filter_options` adds live counts) |
 
 And **MCP Prompts** (guided workflows):
 

@@ -78,7 +78,7 @@ pub struct CardInputParams {
 }
 
 /// Params for `generate_catalog_with_cards`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct GenerateCatalogWithCardsParams {
     #[schemars(description = "Catalog name")]
     pub name: String,
@@ -95,6 +95,22 @@ pub struct GenerateCatalogWithCardsParams {
         description = "Visibility: 'public', 'private', or 'unlisted' (hidden from listings/search, but reachable by anyone who has its exact short_id) (default: 'private'). Setting 'public' or 'unlisted' may require publish permission — non-moderators can get a permission error."
     )]
     pub visibility: Option<String>,
+    #[schemars(
+        description = "Optional. Languages the card FRONTS are in (the language being learned), as ISO 639-1 codes, e.g. ['es']. front_languages and topics together: at most 3 values."
+    )]
+    pub front_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional. Languages of the card BACKS (translations/definitions), as ISO 639-1 codes, at most 2; 'zxx' = no language needed (flags, symbols)."
+    )]
+    pub back_languages: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional. Topic keys from get_catalog_filter_options (the list changes over time; don't guess). More specific subjects belong in tags."
+    )]
+    pub topics: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional. CEFR levels A1-C2, or 'beginner' (A1,A2), 'intermediate' (B1,B2), 'advanced' (C1,C2)."
+    )]
+    pub levels: Option<Vec<crate::catalog_filters::LevelParam>>,
     /// All cards to create. Each card must follow the same rich-text rules as `generate_card`:
     /// always set `text`; span concatenation must equal `text`.
     /// For language-learning cards, set `face.dictionary` (word → translation map) and
@@ -315,6 +331,7 @@ mod tests {
                     face: CardContent::plain("Ellos \testán"),
                     back: CardContent::plain("They\tare"),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -355,6 +372,7 @@ mod tests {
                     face: CardContent::plain("Face"),
                     back: CardContent::plain("Back"),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -398,6 +416,7 @@ mod tests {
                     face: CardContent::plain("a"),
                     back: CardContent::plain("b"),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -427,6 +446,7 @@ mod tests {
                     face: CardContent::plain("Face"),
                     back: CardContent::plain("Back"),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -624,6 +644,7 @@ mod tests {
                         back: CardContent::plain("Temporary access without ownership."),
                     },
                 ],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -659,6 +680,7 @@ mod tests {
                         back: CardContent::plain(format!("A{i}")),
                     })
                     .collect(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -736,6 +758,7 @@ mod tests {
                     face: CardContent::plain("Q"),
                     back: CardContent::plain("A"),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap() // must NOT be Err — MCP contract
@@ -811,6 +834,7 @@ mod tests {
                 tags: None,
                 visibility: None,
                 cards: n_cards(MAX_BATCH_CARDS + 1),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -865,6 +889,7 @@ mod tests {
                     face: CardContent::plain("Q"),
                     back: CardContent::plain("A"),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -901,6 +926,7 @@ mod tests {
                 tags: None,
                 visibility: None,
                 cards: vec![],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -968,6 +994,7 @@ mod tests {
                     face,
                     back: CardContent::plain("to run"),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -2278,6 +2305,7 @@ mod tests {
                 tags: None,
                 visibility: None,
                 cards: n_cards(1),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -2332,6 +2360,7 @@ mod tests {
                     face: CardContent::plain("a"),
                     back: bad.clone(),
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -2412,5 +2441,172 @@ mod tests {
             assert_eq!(body["face"]["visualId"].as_str(), expect_id, "{body}");
             assert_eq!(body["face"]["visualType"].as_str(), expect_type, "{body}");
         }
+    }
+
+    fn svec(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|x| x.to_string()).collect())
+    }
+
+    fn one_card() -> Vec<CardInputParams> {
+        vec![CardInputParams {
+            face: CardContent::plain("a"),
+            back: CardContent::plain("b"),
+        }]
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_sends_classification_on_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "speakLangs": ["en", "zxx"],
+                "learn": ["lang:es", "medicine"],
+                "levels": ["A1", "A2", "C2"]
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Deck".to_string(),
+                front_languages: svec(&["ES"]),
+                back_languages: svec(&["en", "zxx"]),
+                topics: svec(&["medicine"]),
+                levels: Some(vec![
+                    crate::catalog_filters::LevelParam::Beginner,
+                    crate::catalog_filters::LevelParam::C2,
+                ]),
+                cards: one_card(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_omits_classification_keys_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .mount(&server)
+            .await;
+        make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Deck".to_string(),
+                cards: one_card(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        for key in ["learn", "speakLangs", "levels"] {
+            assert!(body.get(key).is_none(), "{key}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_local_classification_errors_make_no_request() {
+        for (params, expect) in [
+            (
+                GenerateCatalogWithCardsParams {
+                    front_languages: svec(&["es", "fr"]),
+                    topics: svec(&["math", "law"]),
+                    ..Default::default()
+                },
+                "front_languages and topics together",
+            ),
+            (
+                GenerateCatalogWithCardsParams {
+                    back_languages: svec(&["en", "fr", "de"]),
+                    ..Default::default()
+                },
+                "back_languages: at most",
+            ),
+            (
+                GenerateCatalogWithCardsParams {
+                    front_languages: svec(&["zxx"]),
+                    ..Default::default()
+                },
+                "only valid in back_languages",
+            ),
+            (
+                GenerateCatalogWithCardsParams {
+                    topics: svec(&["lang:es"]),
+                    ..Default::default()
+                },
+                "is a language",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let result = make_server(&server.uri())
+                .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                    name: "Deck".to_string(),
+                    cards: one_card(),
+                    ..params
+                }))
+                .await
+                .unwrap();
+            assert!(result.is_error.unwrap_or(false), "{result:?}");
+            assert!(
+                result_text(&result).contains(expect),
+                "{}",
+                result_text(&result)
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_api_400_gets_filter_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": "unknown subject 'foo'", "code": "FILTER_UNKNOWN_SUBJECT"}),
+            ))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Deck".to_string(),
+                topics: svec(&["foo"]),
+                cards: one_card(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert!(result_text(&result).contains("get_catalog_filter_options"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_api_400_without_classification_has_no_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad card"})))
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Deck".to_string(),
+                cards: one_card(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert!(!result_text(&result).contains("get_catalog_filter_options"));
     }
 }

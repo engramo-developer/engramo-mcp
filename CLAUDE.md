@@ -31,6 +31,9 @@ src/
 │                       task-local, and SessionTokens (binds each MCP session to the token that
 │                       opened it — rmcp authorizes later requests on the session id alone)
 ├── dto.rs           — lightweight DTOs mirroring API JSON shapes
+├── catalog_filters.rs — pure helpers for catalog front/back languages, topics, levels (normalize, join/split
+│                       `learn`, level groups, filter hint) + `filter_options_view` shared by the
+│                       `get_catalog_filter_options` tool and `engramo://catalog-filters`
 ├── subscription.rs  — the caller's userId/plan/limits/usage as one normalized view (shared by the
 │                       `get_subscription_usage` tool and `engramo://subscription`), plus the resource /
 │                       feature labels and UTC reset rules `error.rs` uses for quota / plan-feature messages
@@ -61,7 +64,7 @@ src/
 │   └── mp3.rs       — AudioEncoder seam + pcm16_mono_to_mp3 (statically linked LAME, LGPL-2.0 —
 │                       see THIRD_PARTY_LICENSES)
 ├── resources/
-│   └── mod.rs       — MCP Resources: engramo://catalogs, due, stats, learning-paths, subscription, card-schema
+│   └── mod.rs       — MCP Resources: engramo://catalogs, due, stats, learning-paths, subscription, card-schema, catalog-filters
 └── prompts/
     └── mod.rs       — MCP Prompts: review_session, create_flashcard, explain_card, study_plan
 ```

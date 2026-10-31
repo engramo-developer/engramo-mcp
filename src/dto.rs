@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::catalog_filters::split_learn;
+
 // ── Pagination ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +69,64 @@ pub struct CatalogDto {
         skip_serializing_if = "speaking_settings_is_empty"
     )]
     pub speaking_settings: Option<SpeakingSettings>,
+    /// Front/back languages, topics and levels (see [`CatalogClassification`]).
+    #[serde(flatten)]
+    pub classification: CatalogClassification,
+}
+
+/// How a catalog is found in search: the API's `speakLangs` / `learn` / `levels` fields under the
+/// MCP naming scheme, so the LLM sees one vocabulary (`front_languages`, `back_languages`,
+/// `topics`, `levels`) that it can pass straight back to the tools. `learn` holds `lang:<iso>`
+/// keys plus topic keys; [`split_learn`] separates them. Only non-empty fields are serialized,
+/// so a catalog without metadata (or an older API that omits the fields) keeps its old output.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "CatalogClassificationWire")]
+pub struct CatalogClassification {
+    pub front_languages: Vec<String>,
+    pub back_languages: Vec<String>,
+    pub topics: Vec<String>,
+    pub levels: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CatalogClassificationWire {
+    #[serde(rename = "speakLangs", default)]
+    speak_langs: Vec<String>,
+    #[serde(default)]
+    learn: Vec<String>,
+    #[serde(default)]
+    levels: Vec<String>,
+}
+
+impl From<CatalogClassificationWire> for CatalogClassification {
+    fn from(w: CatalogClassificationWire) -> Self {
+        let (front_languages, topics) = split_learn(&w.learn);
+        Self {
+            front_languages,
+            back_languages: w.speak_langs,
+            topics,
+            levels: w.levels,
+        }
+    }
+}
+
+impl Serialize for CatalogClassification {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let fields = [
+            ("front_languages", &self.front_languages),
+            ("back_languages", &self.back_languages),
+            ("topics", &self.topics),
+            ("levels", &self.levels),
+        ];
+        let mut map = serializer.serialize_map(None)?;
+        for (key, values) in fields {
+            if !values.is_empty() {
+                map.serialize_entry(key, values)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// Shadowing settings of a catalog as returned by the API. `{}` and a missing key both mean
@@ -129,6 +189,7 @@ pub struct ShareCatalogRequest {
 pub enum CatalogFilter {
     Own,
     Shared,
+    Public,
 }
 
 impl CatalogFilter {
@@ -136,8 +197,100 @@ impl CatalogFilter {
         match self {
             Self::Own => "own",
             Self::Shared => "shared",
+            Self::Public => "public",
         }
     }
+}
+
+/// Parameters of `GET /catalogs` (and, minus paging, `GET /catalogs/facets`). Values are
+/// already normalized wire values: `learn` holds `lang:<iso>` keys plus topics, `levels` CEFR
+/// strings. Empty / `None` fields are not sent.
+#[derive(Debug, Default, Clone)]
+pub struct CatalogListQuery {
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+    pub speaking_only: bool,
+    pub filter: Option<CatalogFilter>,
+    pub q: Option<String>,
+    pub speak: Vec<String>,
+    pub learn: Vec<String>,
+    pub levels: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+/// Response of `GET /catalogs/facets/schema`: the values the filter params accept. Unknown keys
+/// are ignored; `searchSpeak` / `searchLearn` were added later, hence optional.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterSchemaDto {
+    #[serde(default)]
+    pub languages: Vec<KeyLabelDto>,
+    #[serde(default)]
+    pub subjects: Vec<KeyLabelDto>,
+    #[serde(default)]
+    pub levels: Vec<FilterLevelDto>,
+    #[serde(default)]
+    pub buckets: Vec<FilterBucketDto>,
+    #[serde(default)]
+    pub limits: FilterLimitsDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeyLabelDto {
+    pub key: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterLevelDto {
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterBucketDto {
+    pub key: String,
+    #[serde(default)]
+    pub levels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FilterLimitsDto {
+    #[serde(default)]
+    pub speak: Option<usize>,
+    #[serde(default)]
+    pub learn: Option<usize>,
+    #[serde(rename = "tagsPerCatalog", default)]
+    pub tags_per_catalog: Option<usize>,
+    #[serde(rename = "searchSpeak", default)]
+    pub search_speak: Option<usize>,
+    #[serde(rename = "searchLearn", default)]
+    pub search_learn: Option<usize>,
+}
+
+/// One `{key, count}` entry of a facet group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FacetCountDto {
+    pub key: String,
+    pub count: i64,
+}
+
+/// Response of `GET /catalogs/facets`: live counts over the catalogs visible to the caller
+/// under the given filters. `learn` mixes `lang:<iso>` and topic keys; `speak` is the back
+/// language. Each group ignores its own selection.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FacetCountsDto {
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub speak: Vec<FacetCountDto>,
+    #[serde(default)]
+    pub learn: Vec<FacetCountDto>,
+    #[serde(default)]
+    pub levels: Vec<FacetCountDto>,
+    #[serde(default)]
+    pub buckets: Vec<FacetCountDto>,
+    #[serde(default)]
+    pub tags: Vec<FacetCountDto>,
 }
 
 /// Request-side shadowing settings. `language: None` serializes as `null`, which turns
@@ -166,7 +319,7 @@ impl From<CatalogDto> for CatalogSummary {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct CreateCatalogRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,9 +328,18 @@ pub struct CreateCatalogRequest {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
+    /// Back languages (batch import only; `create_catalog` leaves these unset).
+    #[serde(rename = "speakLangs", skip_serializing_if = "Option::is_none")]
+    pub speak_langs: Option<Vec<String>>,
+    /// `lang:<iso>` keys plus topic keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub learn: Option<Vec<String>>,
+    /// CEFR levels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub levels: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct UpdateCatalogRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -193,6 +355,15 @@ pub struct UpdateCatalogRequest {
     pub version: i32,
     #[serde(rename = "speakingSettings", skip_serializing_if = "Option::is_none")]
     pub speaking_settings: Option<SpeakingSettingsUpdate>,
+    /// Back languages. `None` = unchanged, `Some(vec![])` = clear, otherwise replaces.
+    #[serde(rename = "speakLangs", skip_serializing_if = "Option::is_none")]
+    pub speak_langs: Option<Vec<String>>,
+    /// `lang:<iso>` keys plus topic keys; same `None` / `[]` / replace semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub learn: Option<Vec<String>>,
+    /// CEFR levels; same `None` / `[]` / replace semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub levels: Option<Vec<String>>,
 }
 
 // ── Card Content ──────────────────────────────────────────────────────────────
@@ -499,7 +670,7 @@ pub struct CardInput {
 }
 
 /// Request body for `POST /catalogs/with-cards`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct CreateCatalogWithCardsApiRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -512,6 +683,12 @@ pub struct CreateCatalogWithCardsApiRequest {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
+    #[serde(rename = "speakLangs", skip_serializing_if = "Option::is_none")]
+    pub speak_langs: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub learn: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub levels: Option<Vec<String>>,
     pub cards: Vec<CardInput>,
 }
 
@@ -818,7 +995,7 @@ mod tests {
             visibility: None,
             image_id: None,
             version: 1,
-            speaking_settings: None,
+            ..Default::default()
         };
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("imageId").is_none(), "{v}");
@@ -919,6 +1096,7 @@ mod tests {
             version: 1,
             image_id: None,
             speaking_settings: None,
+            classification: CatalogClassification::default(),
         };
         let summary: CatalogSummary = dto.into();
         assert_eq!(summary.name, "Rust");
@@ -999,6 +1177,7 @@ mod tests {
             description: None,
             tags: None,
             visibility: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&req).unwrap();
         // None fields should be omitted
@@ -1584,6 +1763,7 @@ mod tests {
             image_id: None,
             version: 3,
             speaking_settings: s,
+            ..Default::default()
         })
         .unwrap()
     }
@@ -1610,5 +1790,75 @@ mod tests {
             v["speakingSettings"],
             serde_json::json!({"language": "es-ES"})
         );
+    }
+
+    #[test]
+    fn test_catalog_dto_classification_round_trip() {
+        let raw = r#"{"id":"00000000-0000-0000-0000-000000000001","name":"X","version":1,
+            "speakLangs":["en"],"learn":["lang:es","medicine"],"levels":["A1","A2"]}"#;
+        let dto: CatalogDto = serde_json::from_str(raw).unwrap();
+        assert_eq!(dto.classification.front_languages, vec!["es"]);
+        let v = serde_json::to_value(&dto).unwrap();
+        assert_eq!(v["front_languages"], serde_json::json!(["es"]));
+        assert_eq!(v["topics"], serde_json::json!(["medicine"]));
+        assert_eq!(v["back_languages"], serde_json::json!(["en"]));
+        assert_eq!(v["levels"], serde_json::json!(["A1", "A2"]));
+        assert!(
+            v.get("learn").is_none() && v.get("speakLangs").is_none(),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn test_catalog_dto_without_classification_emits_no_keys() {
+        for raw in [
+            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"X","version":1}"#,
+            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"X","version":1,
+                "speakLangs":[],"learn":[],"levels":[]}"#,
+        ] {
+            let v = serde_json::to_value(serde_json::from_str::<CatalogDto>(raw).unwrap()).unwrap();
+            for k in ["front_languages", "back_languages", "topics", "levels"] {
+                assert!(v.get(k).is_none(), "{k} in {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_update_catalog_request_filter_fields() {
+        let none = serde_json::to_value(UpdateCatalogRequest::default()).unwrap();
+        for k in ["speakLangs", "learn", "levels"] {
+            assert!(none.get(k).is_none(), "{k}");
+        }
+        let cleared = serde_json::to_value(UpdateCatalogRequest {
+            speak_langs: Some(vec![]),
+            learn: Some(vec![]),
+            levels: Some(vec!["C1".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(cleared["learn"], serde_json::json!([]));
+        assert_eq!(cleared["speakLangs"], serde_json::json!([]));
+        assert_eq!(cleared["levels"], serde_json::json!(["C1"]));
+    }
+
+    #[test]
+    fn test_create_with_cards_request_filter_fields() {
+        let none = serde_json::to_value(CreateCatalogWithCardsApiRequest::default()).unwrap();
+        for k in ["speakLangs", "learn", "levels"] {
+            assert!(none.get(k).is_none(), "{k}");
+        }
+        let v = serde_json::to_value(CreateCatalogWithCardsApiRequest {
+            learn: Some(vec!["lang:es".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v["learn"], serde_json::json!(["lang:es"]));
+    }
+
+    #[test]
+    fn test_catalog_filter_public() {
+        assert_eq!(CatalogFilter::Public.as_str(), "public");
+        let f: CatalogFilter = serde_json::from_str("\"public\"").unwrap();
+        assert_eq!(f, CatalogFilter::Public);
     }
 }

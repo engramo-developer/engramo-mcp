@@ -205,9 +205,14 @@ fn create_language_deck(
         Some(id) => {
             format!("Add all cards to the existing catalog `{id}` (call `generate_cards`).")
         }
-        None => "Create a new catalog for this deck (call `generate_catalog_with_cards`); pick a \
-                 short, descriptive name from the topic."
-            .to_string(),
+        None => format!(
+            "Create a new catalog for this deck (call `generate_catalog_with_cards`); pick a \
+             short, descriptive name from the topic. Set `front_languages` to the ISO 639-1 code \
+             of {source_lang} and `back_languages` to that of {target_lang}; set `topics` and \
+             `levels` too when they fit (e.g. a CEFR level the user gave) — read the \
+             `engramo://catalog-filters` resource (or call `get_catalog_filter_options`) for the \
+             valid values."
+        ),
     };
 
     GetPromptResult::new(vec![user_msg(format!(
@@ -383,6 +388,47 @@ mod tests {
             assert!(text.contains("ordering coffee"), "{text}");
             assert!(text.contains("Spanish"), "{text}");
             assert!(text.contains("English"), "{text}");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_new_catalog_sets_languages_topics_levels() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "ordering coffee"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+            ]));
+        let result = get(params).unwrap();
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
+            for f in [
+                "front_languages",
+                "back_languages",
+                "topics",
+                "levels",
+                "engramo://catalog-filters",
+            ] {
+                assert!(text.contains(f), "{f} missing: {text}");
+            }
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn test_create_language_deck_existing_catalog_omits_filter_fields() {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_LANGUAGE_DECK).with_arguments(args(&[
+                ("topic", "t"),
+                ("source_lang", "Spanish"),
+                ("target_lang", "English"),
+                ("catalog_id", "00000000-0000-0000-0000-000000000001"),
+            ]));
+        let result = get(params).unwrap();
+        if let ContentBlock::Text(TextContent { text, .. }) = &result.messages[0].content {
+            assert!(!text.contains("front_languages"), "{text}");
         } else {
             panic!("expected text content");
         }
