@@ -545,15 +545,17 @@ jobs:
           MCP_REGISTRY_PRIVATE_KEY: ${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          ./mcp-publisher login dns --domain engramo.app --private-key "$MCP_REGISTRY_PRIVATE_KEY"
           # The registry verifies mcpName against the npm version published
-          # moments ago, which can lag behind the registry's own view.
-          for attempt in 1 2 3 4 5; do
+          # moments ago, which can lag behind the registry's own view by
+          # several minutes (v1.3.0: ~5 min). The registry JWT expires after
+          # ~5 min, so log in again before every attempt.
+          for attempt in 1 2 3 4 5 6 7 8; do
+            ./mcp-publisher login dns --domain engramo.app --private-key "$MCP_REGISTRY_PRIVATE_KEY"
             if ./mcp-publisher publish server.staged.json; then
               exit 0
             fi
             echo "publish attempt $attempt failed; retrying in $((attempt * 30))s"
             sleep $((attempt * 30))
           done
-          echo "::error::mcp-publisher publish failed after 5 attempts"
+          echo "::error::mcp-publisher publish failed after 8 attempts"
           exit 1
