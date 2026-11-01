@@ -7312,6 +7312,11 @@ mod tests {
 
         for id in [TEST_ID, "bad"] {
             let before = mock_server.received_requests().await.unwrap().len();
+            let expected = if id == TEST_ID {
+                "Server error"
+            } else {
+                "Invalid UUID"
+            };
             let results = [
                 server
                     .list_cards(Parameters(ListCardsParams {
@@ -7348,6 +7353,10 @@ mod tests {
             ];
             for (i, r) in results.iter().enumerate() {
                 assert_eq!(r.is_error, Some(true), "handler #{i}, id {id}: {r:?}");
+                assert!(
+                    first_text(r).starts_with(expected),
+                    "handler #{i}, id {id}: {r:?}"
+                );
             }
             let sent = mock_server.received_requests().await.unwrap().len() - before;
             assert_eq!(sent, if id == TEST_ID { 5 } else { 0 }, "id {id}");
@@ -7420,6 +7429,121 @@ mod tests {
         );
         assert_eq!(all["cursor"], "all-next", "{all}");
         assert_eq!(all["total_count"], 3, "{all}");
+    }
+
+    #[tokio::test]
+    async fn test_paginated_handlers_forward_limit_cursor_and_media_type() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ms = MockServer::start().await;
+        for (route, body) in [
+            (
+                format!("/catalogs/{TEST_ID}/cards"),
+                serde_json::json!({"data": [], "nextCursor": "c2"}),
+            ),
+            (
+                "/learning/cards".to_string(),
+                serde_json::json!({"data": [], "nextCursor": "c2", "total": 0}),
+            ),
+            (
+                "/learning/cards/all".to_string(),
+                serde_json::json!({"data": [], "nextCursor": "c2", "total": 0}),
+            ),
+            (
+                "/learning-paths".to_string(),
+                serde_json::json!({"data": [], "nextCursor": "c2"}),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(query_param("limit", "7"))
+                .and(query_param("cursor", "c1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&ms)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/media"))
+            .and(query_param("limit", "7"))
+            .and(query_param("cursor", "c1"))
+            .and(query_param("media_type", "audio"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": [], "nextCursor": "c2"})),
+            )
+            .expect(1)
+            .mount(&ms)
+            .await;
+
+        let s = mock_server_for(&ms.uri());
+        let due = || DueCardsParams {
+            limit: Some(7),
+            cursor: Some("c1".into()),
+        };
+        let results = [
+            s.list_cards(Parameters(ListCardsParams {
+                catalog_id: TEST_ID.into(),
+                limit: Some(7),
+                cursor: Some("c1".into()),
+            }))
+            .await
+            .unwrap(),
+            s.get_due_cards(Parameters(due())).await.unwrap(),
+            s.get_all_learning_cards(Parameters(due())).await.unwrap(),
+            s.list_learning_paths(Parameters(ListLearningPathsParams {
+                limit: Some(7),
+                cursor: Some("c1".into()),
+            }))
+            .await
+            .unwrap(),
+            s.list_media(Parameters(ListMediaParams {
+                media_type: Some("audio".into()),
+                limit: Some(7),
+                cursor: Some("c1".into()),
+            }))
+            .await
+            .unwrap(),
+        ];
+        for (i, r) in results.iter().enumerate() {
+            assert_ne!(r.is_error, Some(true), "handler #{i}: {r:?}");
+            let v: serde_json::Value = serde_json::from_str(first_text(r)).unwrap();
+            assert_eq!(v["cursor"], "c2", "handler #{i}: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_media_sends_default_or_given_filename_and_returns_media_id() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (filename, expected) in [
+            (None, r#"filename="upload""#),
+            (Some("card1_face.mp3"), r#"filename="card1_face.mp3""#),
+        ] {
+            let ms = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/media"))
+                .and(body_string_contains(expected))
+                .and(body_string_contains("audio/mpeg"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "media_ids": {"ids": ["00000000-0000-0000-0000-000000000001"]}
+                })))
+                .expect(1)
+                .mount(&ms)
+                .await;
+            let r = mock_server_for(&ms.uri())
+                .upload_media(Parameters(UploadMediaParams {
+                    content_base64: base64::engine::general_purpose::STANDARD.encode(b"x"),
+                    content_type: "audio/mpeg".to_string(),
+                    filename: filename.map(str::to_string),
+                }))
+                .await
+                .unwrap();
+            assert_ne!(r.is_error, Some(true), "{filename:?}: {r:?}");
+            let v: serde_json::Value = serde_json::from_str(first_text(&r)).unwrap();
+            assert_eq!(v["media_id"], "00000000-0000-0000-0000-000000000001", "{v}");
+        }
     }
 
     #[tokio::test]

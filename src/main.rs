@@ -1,3 +1,4 @@
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -225,8 +226,8 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     // no-redirect policy that keeps a session's bearer token from following a 3xx to
     // another host can't be dropped by a future edit to this function.
     let http = EngramoClient::build_http_client();
-    let sessions = CancellationToken::new();
-    let app = build_app(&cfg, &public_url, http, sessions.clone())?;
+    let sse_shutdown = CancellationToken::new();
+    let app = build_app(&cfg, &public_url, http, sse_shutdown.clone())?;
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -246,22 +247,43 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
             draining.cancel();
             // Open SSE streams never end on their own, so axum's graceful shutdown would
             // wait for them until the platform SIGKILLs us. Give in-flight tool calls the
-            // grace period, then terminate every rmcp session, which closes those streams.
+            // grace period, then end every open SSE stream. This does NOT close rmcp
+            // sessions (stateful sessions run without this token); it is only safe because
+            // the listener is already closed. Never reuse it as a session kill switch.
             tokio::time::sleep(SHUTDOWN_GRACE).await;
-            sessions.cancel();
+            sse_shutdown.cancel();
         }
     });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(draining.cancelled_owned())
-        .await?;
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(draining.clone().cancelled_owned())
+        .into_future();
+    tokio::select! {
+        res = serve => res?,
+        () = async {
+            draining.cancelled().await;
+            tokio::time::sleep(SHUTDOWN_GRACE + SHUTDOWN_FORCE_AFTER).await;
+        } => tracing::warn!("connections still open after the shutdown deadline; exiting anyway"),
+    }
     tracing::info!("Engramo MCP server stopped");
     Ok(())
 }
 
-/// How long in-flight requests may run after a shutdown signal before every MCP session is
-/// terminated. Below Cloud Run's 10 s SIGTERM-to-SIGKILL window.
+/// How long in-flight requests may run after a shutdown signal before every open SSE stream
+/// is ended. Below Cloud Run's 10 s SIGTERM-to-SIGKILL window.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Extra time after `SHUTDOWN_GRACE` for connections to close once open SSE streams are ended;
+/// the total stays under Cloud Run's 10 s SIGTERM-to-SIGKILL window.
+const SHUTDOWN_FORCE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Cloud Run SIGKILLs this long after SIGTERM; the hard shutdown deadline must fire first.
+const PLATFORM_SIGKILL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+const _: () = assert!(
+    SHUTDOWN_GRACE.as_secs() + SHUTDOWN_FORCE_AFTER.as_secs() < PLATFORM_SIGKILL_AFTER.as_secs(),
+    "shutdown deadline must fire before the platform SIGKILL"
+);
 
 /// Resolves on Ctrl-C, or on SIGTERM (what Cloud Run and container runtimes send) on Unix.
 async fn shutdown_signal() {
@@ -309,13 +331,14 @@ fn session_manager() -> LocalSessionManager {
 /// `tower::ServiceExt::oneshot` instead of binding a real listener.
 ///
 /// `public_url` is the validated `MCP_PUBLIC_URL` (`McpConfig::require_public_url`). Fails
-/// when it cannot be embedded in a `WWW-Authenticate` challenge. Cancelling `sessions`
-/// terminates every MCP session (used on shutdown).
+/// when it cannot be embedded in a `WWW-Authenticate` challenge. Cancelling `sse_shutdown` ends
+/// every open SSE response stream (used on shutdown); it does not close MCP sessions, which
+/// stay in the `LocalSessionManager` until exit.
 fn build_app(
     cfg: &McpConfig,
     public_url: &str,
     http: HardenedClient,
-    sessions: CancellationToken,
+    sse_shutdown: CancellationToken,
 ) -> Result<axum::Router, String> {
     let public_url = public_url.to_string();
     let resource_metadata_url = format!(
@@ -369,7 +392,7 @@ fn build_app(
             // and the standalone GET stream; post-initialize request streams are primed
             // by the session layer, disabled in `session_manager()`.
             .with_sse_retry(None)
-            .with_cancellation_token(sessions),
+            .with_cancellation_token(sse_shutdown),
     );
 
     // Bearer auth applies only to the MCP endpoint itself (served at root, `/`) —
@@ -680,6 +703,48 @@ mod tests {
             }
             Ok(other) => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_sse_shutdown_token_ends_open_streams() {
+        use http_body_util::BodyExt;
+        let api = mock_me().await;
+        let cfg = McpConfig::new(api.uri(), None, false)
+            .unwrap()
+            .with_public_url("http://localhost:8080");
+        let sse_shutdown = CancellationToken::new();
+        let app = build_app(
+            &cfg,
+            "http://localhost:8080",
+            EngramoClient::build_http_client(),
+            sse_shutdown.clone(),
+        )
+        .unwrap();
+        let sid = open_session(&app).await;
+        let resp = app
+            .oneshot(
+                Request::get("/")
+                    .header("authorization", "Bearer engramo_t")
+                    .header("mcp-session-id", sid)
+                    .header("accept", "text/event-stream")
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+
+        sse_shutdown.cancel();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(Ok(_)) = body.frame().await {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "standalone SSE stream stayed open after the sse_shutdown token was cancelled"
+        );
     }
 
     #[tokio::test]
