@@ -2625,6 +2625,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            result_text(&result)
+                .contains("front_languages and topics together allow at most 3, got 4"),
+            "{}",
+            result_text(&result)
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
