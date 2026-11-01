@@ -2609,4 +2609,182 @@ mod tests {
         assert!(result.is_error.unwrap_or(false));
         assert!(!result_text(&result).contains("get_catalog_filter_options"));
     }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_topics_over_learn_cap_rejected_without_request() {
+        // `ClassificationWrite::new` only checks front + topics together when both are set;
+        // topics alone over the cap is caught by `learn_for_new`.
+        let server = MockServer::start().await;
+        let result = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Topics".to_string(),
+                topics: svec(&["grammar", "travel", "food", "business"]),
+                cards: one_card(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_cards_partial_failure_adds_period_after_undotted_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "gone"})))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let result = make_server(&server.uri())
+            .generate_cards(Parameters(GenerateCardsParams {
+                catalog_id: mock_id().to_string(),
+                cards: n_cards(3),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = result_text(&result);
+        assert!(
+            text.starts_with("Not found: gone. 1 of 3 cards were created"),
+            "{text}"
+        );
+    }
+
+    /// The `debug!` lines in the card-writing tools log only counts and flags, never card
+    /// text (user content). Runs each tool's happy path with DEBUG capture on.
+    #[tokio::test]
+    async fn test_card_tools_debug_logs_carry_no_card_text() {
+        use crate::error::test_support::{BufWriter, TRACING_CAPTURE_LOCK};
+        use crate::tools::cards::UpdateCardParams;
+
+        const SECRET: &str = "zzsecretcardtextzz";
+        let server = MockServer::start().await;
+        let card_id = mock_id();
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(make_existing_card_json(
+                    "audio-uuid",
+                    json!({ SECRET: "dictionary entry" }),
+                )),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+        let secret_cards = || {
+            vec![CardInputParams {
+                face: CardContent::plain(SECRET),
+                back: CardContent::plain(SECRET),
+            }]
+        };
+
+        // See `TRACING_CAPTURE_LOCK`: held for the subscriber's whole lifetime.
+        let _lock = TRACING_CAPTURE_LOCK.lock().await;
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let tools = make_server(&server.uri());
+        // Two passes: a callsite another test thread was still registering when the
+        // subscriber went in can keep a stale "never" interest past the rebuild above
+        // (see `TRACING_CAPTURE_LOCK`). After the first pass every callsite here is
+        // registered, so a second rebuild sticks; only the second pass is asserted on.
+        for pass in 0..2 {
+            if pass == 1 {
+                tracing::callsite::rebuild_interest_cache();
+                buf.0.lock().unwrap().clear();
+            }
+            let results = [
+                tools
+                    .generate_card(Parameters(GenerateCardParams {
+                        catalog_id: None,
+                        face: CardContent::plain(SECRET),
+                        back: CardContent::plain(SECRET),
+                    }))
+                    .await
+                    .unwrap(),
+                tools
+                    .generate_cards(Parameters(GenerateCardsParams {
+                        catalog_id: mock_id().to_string(),
+                        cards: secret_cards(),
+                    }))
+                    .await
+                    .unwrap(),
+                tools
+                    .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                        name: "Debug".to_string(),
+                        cards: secret_cards(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap(),
+                tools
+                    .update_card(Parameters(UpdateCardParams {
+                        card_id: card_id.to_string(),
+                        face: Some(CardContent::plain(SECRET)),
+                        back: None,
+                        catalog_ids: vec![mock_id().to_string()],
+                        order_number: 1,
+                        version: 1,
+                    }))
+                    .await
+                    .unwrap(),
+            ];
+            for r in &results {
+                assert_ne!(r.is_error, Some(true), "{r:?}");
+            }
+        }
+
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        for line in [
+            "generate_card: after normalization",
+            "generate_cards: after normalization",
+            "generate_catalog_with_cards: after normalization",
+            "update_card: normalized",
+            "update_card: fetched existing card for merge",
+            "update_card: merged face.dictionary from existing",
+            // The counts and flags themselves are logged.
+            "face_chars=",
+            "updating_face=true",
+            "existing_face_dict_entries=1",
+            "card_count=1",
+        ] {
+            assert!(logs.contains(line), "missing {line:?} in:\n{logs}");
+        }
+        assert!(
+            !logs.contains(SECRET),
+            "card text leaked into debug logs:\n{logs}"
+        );
+    }
 }
