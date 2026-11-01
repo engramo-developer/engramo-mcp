@@ -30,10 +30,22 @@ use wiremock::{
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}"#;
 const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 
-/// A running `engramo-mcp http` child process. Killed on drop.
+/// A running `engramo-mcp http` child process. Stopped on drop: with SIGTERM on Unix, so
+/// the binary exits through its graceful-shutdown path (and an instrumented build writes
+/// its coverage profile), with a hard kill elsewhere.
 struct McpServer {
     base: String,
-    _child: Child,
+    child: Child,
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.sigterm() {
+            return;
+        }
+        let _ = self.child.start_kill();
+    }
 }
 
 impl McpServer {
@@ -78,11 +90,15 @@ impl McpServer {
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+            .stderr(Stdio::inherit());
         if let Ok(root) = std::env::var("SystemRoot") {
             // Windows needs it for socket initialization.
             cmd.env("SystemRoot", root);
+        }
+        if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+            // Lets a coverage run (cargo-llvm-cov) collect the child's profile, which it
+            // writes on the graceful exit SIGTERM triggers.
+            cmd.env("LLVM_PROFILE_FILE", profile);
         }
         for (k, v) in extra_env {
             cmd.env(k, v);
@@ -99,10 +115,7 @@ impl McpServer {
                 && let Ok(meta) = r.json::<serde_json::Value>().await
                 && meta["authorization_servers"][0] == api.uri()
             {
-                return Some(Self {
-                    base,
-                    _child: child,
-                });
+                return Some(Self { base, child });
             }
             if let Ok(Some(_)) = child.try_wait() {
                 return None;
@@ -113,6 +126,28 @@ impl McpServer {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Sends SIGTERM to the child; `false` if it could not be delivered.
+    #[cfg(unix)]
+    fn sigterm(&self) -> bool {
+        let Some(pid) = self.child.id() else {
+            return false;
+        };
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Sends SIGTERM and waits for the child to exit, returning its status.
+    #[cfg(unix)]
+    async fn terminate(&mut self, within: Duration) -> std::process::ExitStatus {
+        assert!(self.sigterm(), "failed to send SIGTERM");
+        tokio::time::timeout(within, self.child.wait())
+            .await
+            .expect("engramo-mcp did not exit after SIGTERM")
+            .unwrap()
     }
 
     /// Opens an MCP session with rmcp's client, authenticated as `token`.
@@ -427,4 +462,32 @@ async fn unauthenticated_routes_are_served_without_a_token() {
     let meta: serde_json::Value = meta.json().await.unwrap();
     assert_eq!(meta["resource"], server.base, "{meta}");
     assert_eq!(meta["authorization_servers"][0], api.uri(), "{meta}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_exits_cleanly_when_idle() {
+    let api = MockServer::start().await;
+    let mut mcp = McpServer::start(&api).await;
+
+    let status = mcp.terminate(Duration::from_secs(3)).await;
+    assert!(status.success(), "exit status after SIGTERM: {status}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_exits_cleanly_with_an_open_session() {
+    let api = MockServer::start().await;
+    mock_me(&api, 200).await;
+    let mut mcp = McpServer::start(&api).await;
+
+    // A connected client holds a standalone SSE stream open, which never ends on its own:
+    // shutdown has to terminate the session after the grace period rather than wait for
+    // the platform's SIGKILL.
+    let client = mcp.connect("engramo_alice").await.unwrap();
+    client.list_all_tools().await.unwrap();
+
+    let status = mcp.terminate(Duration::from_secs(9)).await;
+    assert!(status.success(), "exit status after SIGTERM: {status}");
+    drop(client);
 }

@@ -132,6 +132,9 @@ Spans must satisfy all five rules or `rich_text` is discarded:
   different one — otherwise a leaked session id would let anyone act as that session's owner. Requests are
   capped at 16 MiB (`RequestBodyLimitLayer`): rmcp buffers the whole body before parsing, and axum's
   `DefaultBodyLimit` does not reach a `fallback_service`.
+- **Graceful shutdown:** on SIGTERM (Unix) or Ctrl-C, `run_http` stops accepting connections and lets in-flight
+  requests finish for `SHUTDOWN_GRACE` (5 s, under Cloud Run's 10 s SIGKILL window), then cancels the rmcp
+  `cancellation_token` to end open SSE streams, which never close on their own.
 - **Never log a session id.** It is credential-equivalent; the default `RUST_LOG` filter silences rmcp's
   session manager and `error_reporting` redacts `session_id` fields.
 - **Local TTS is stdio-only (security):** `tts::from_env()` is called only from `run_stdio`;

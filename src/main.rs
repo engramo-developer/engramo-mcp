@@ -21,6 +21,7 @@ use rmcp::{
         },
     },
 };
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -224,7 +225,8 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
     // no-redirect policy that keeps a session's bearer token from following a 3xx to
     // another host can't be dropped by a future edit to this function.
     let http = EngramoClient::build_http_client();
-    let app = build_app(&cfg, &public_url, http)?;
+    let sessions = CancellationToken::new();
+    let app = build_app(&cfg, &public_url, http, sessions.clone())?;
 
     let bind_addr = std::env::var("MCP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -235,8 +237,58 @@ async fn run_http() -> Result<(), Box<dyn std::error::Error>> {
          Cloud Run) sits in front of this listener"
     );
 
-    axum::serve(listener, app).await?;
+    let draining = CancellationToken::new();
+    tokio::spawn({
+        let draining = draining.clone();
+        async move {
+            shutdown_signal().await;
+            tracing::info!("Shutdown signal received; draining in-flight requests");
+            draining.cancel();
+            // Open SSE streams never end on their own, so axum's graceful shutdown would
+            // wait for them until the platform SIGKILLs us. Give in-flight tool calls the
+            // grace period, then terminate every rmcp session, which closes those streams.
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            sessions.cancel();
+        }
+    });
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(draining.cancelled_owned())
+        .await?;
+    tracing::info!("Engramo MCP server stopped");
     Ok(())
+}
+
+/// How long in-flight requests may run after a shutdown signal before every MCP session is
+/// terminated. Below Cloud Run's 10 s SIGTERM-to-SIGKILL window.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolves on Ctrl-C, or on SIGTERM (what Cloud Run and container runtimes send) on Unix.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to listen for Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
 
 /// rmcp's session manager with its idle timeout pinned to [`SESSION_KEEP_ALIVE`], the
@@ -257,11 +309,13 @@ fn session_manager() -> LocalSessionManager {
 /// `tower::ServiceExt::oneshot` instead of binding a real listener.
 ///
 /// `public_url` is the validated `MCP_PUBLIC_URL` (`McpConfig::require_public_url`). Fails
-/// when it cannot be embedded in a `WWW-Authenticate` challenge.
+/// when it cannot be embedded in a `WWW-Authenticate` challenge. Cancelling `sessions`
+/// terminates every MCP session (used on shutdown).
 fn build_app(
     cfg: &McpConfig,
     public_url: &str,
     http: HardenedClient,
+    sessions: CancellationToken,
 ) -> Result<axum::Router, String> {
     let public_url = public_url.to_string();
     let resource_metadata_url = format!(
@@ -314,7 +368,8 @@ fn build_app(
             // event enables no resumption anyway. This covers the `initialize` response
             // and the standalone GET stream; post-initialize request streams are primed
             // by the session layer, disabled in `session_manager()`.
-            .with_sse_retry(None),
+            .with_sse_retry(None)
+            .with_cancellation_token(sessions),
     );
 
     // Bearer auth applies only to the MCP endpoint itself (served at root, `/`) —
@@ -383,7 +438,13 @@ mod tests {
 
     fn test_app(cfg: &McpConfig) -> axum::Router {
         let url = cfg.require_public_url().unwrap().to_string();
-        build_app(cfg, &url, EngramoClient::build_http_client()).unwrap()
+        build_app(
+            cfg,
+            &url,
+            EngramoClient::build_http_client(),
+            CancellationToken::new(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -396,6 +457,7 @@ mod tests {
             &unset,
             "https://x.example/\"bad",
             EngramoClient::build_http_client(),
+            CancellationToken::new(),
         )
         .unwrap_err();
         assert!(err.contains("quote"), "{err}");
