@@ -289,7 +289,7 @@ Reasons:
 
 | # | Prompt | Expected tools | Expected result |
 |---|---|---|---|
-| P7 (keep, after B3) | "Find public Spanish catalogs for beginners about medicine." | `get_catalog_filter_options`, `list_catalogs` | `list_catalogs` with `front_languages:["es"]`, `levels:["beginner"]`, `topics:["medicine"]`, `filter:"public"` returns ≥1 seeded public catalog |
+| P7 (keep, after B3) | "Find public Spanish catalogs for beginners with English translations." | `get_catalog_filter_options`, `list_catalogs` | `list_catalogs` with `front_languages:["es"]`, `back_languages:["en"]`, `levels:["beginner"]`, `filter:"public"` returns ≥1 public catalog |
 | P8 | "Which of my decks are B1 level?" | `list_catalogs` (`filter:"own"`, `levels:["B1"]`) | Returns **Spanish: Health & Daily Life (A2–B1)** only |
 | P9 | "Tag my travel deck as Spanish to English, topic travel, level A1." | `get_catalog`/`list_catalogs`, `update_catalog` (`front_languages:["es"]`, `back_languages:["en"]`, `topics:["travel"]`, `levels:["A1"]`, `version`) | Catalog shows the new fields. Destructive hint, so the client may confirm first |
 | P10 | "What plan am I on and how many catalogs can I still create?" | `get_subscription_usage` | Plan name, the catalogs limit as used / remaining, reset rule. No purchase or upgrade link |
@@ -324,7 +324,10 @@ Do the same on both `mcp-review@engramo.app` (ChatGPT) and `mcp-review-claude@en
    - Health: `front ["es"]`, `back ["en"]`, a health/medicine topic, levels `A2, B1`.
 
    First confirm the topic keys exist on prod (`get_catalog_filter_options` or `/catalogs/facets/schema`).
-2. **Public catalogs (about 50).** Make sure a subset is classified, including at least one `es`→`en` / `medicine` / `A1|A2` catalog so P7 returns results, and a few other languages so the counts in `get_catalog_filter_options` look meaningful. If no `medicine` topic exists, change P7 to a topic that does.
+
+   **Checked 2026-11-02:** prod has no travel topic, so Travel has no topic (it keeps the `travel` tag); `medicine`
+   exists. Done on `mcp-review@engramo.app`.
+2. **Public catalogs.** **Checked 2026-11-02:** prod has 282 public catalogs, mostly classified by language and level, but no public catalog has the `medicine` topic (only 2 have any topic). P7 was therefore changed to drop the topic: public `es`→`en` beginner catalogs exist (more than 5). The topic filter is covered by the reviewer's own Health catalog (`medicine`).
 3. **Sharing.**
    - Create a **share-target account** and record its userId in the portal test instructions (not in this repo, if you consider the id sensitive).
    - Entitle both reviewer accounts: `catalog_share` feature on, `shared_catalogs` ≥ 1, `collaborators_per_catalog` ≥ 1. Verify with `get_subscription_usage`.
