@@ -91,7 +91,7 @@ account also has an empty **My Catalog** (Default) that the app creates on first
 
 - **Display name (≤30):** EngrAmo
 - **Subtitle (≤30):** Flashcards you actually review *(30 chars)*
-- **Category:** Productivity *(the portal rejected Education as "not a valid category")*
+- **Category:** Education & Research *(the portal rejected "Education" alone as not a valid category; "Productivity" was rejected by review on 2026-11-02 as not reflecting the primary purpose)*
 - **Long description (≤4000):** reuse §2.2's description, replacing "Claude" with "ChatGPT". Drop the
   "no extra AI charges" sentence: the portal flags pricing wording. The submitted text ends with "ChatGPT
   writes the cards itself; the plugin makes no AI calls of its own."
@@ -122,54 +122,51 @@ account also has an empty **My Catalog** (Default) that the app creates on first
 
 ## 3. Tool annotations and justifications
 
-The 35 tools served by v1.2.15 (prod runs 1.2.13 until the release is deployed). Every tool acts only inside EngrAmo, through its first-party API, never the wider internet. Reads can include other users' public catalogs and catalogs shared with the user. Writes go to the user's own catalogs, or to catalogs another user shared with them as editor. 31 have `openWorldHint: false`. Four have `openWorldHint: true`: `generate_catalog_with_cards`, `update_catalog`, `update_learning_path` and `share_catalog`. The first three accept `visibility: public` (or `unlisted` for catalogs), which makes the content visible to other EngrAmo users; `share_catalog` gives chosen users access to one of your catalogs. *(Flagged by the ChatGPT scan on 2026-10-17; fixed in v1.2.12 (engramo-mcp #106).)*
+The 35 tools served over http. All four hints are explicitly set (true or false, never null) on every tool. Every tool acts only inside EngrAmo, through its first-party API, never the wider internet.
 
-**openWorldHint decision (S8, 2026-10-31): stays `false` on every tool except the four above; no annotation changes.**
-Rationale, for a reviewer who asks why `list_catalogs` is `false` although it can return public content:
-- MCP spec: open world means "an open world of external entities", like web search. These tools read one bounded corpus inside EngrAmo's own first-party API, not the public internet or arbitrary destinations.
-- OpenAI guidance: `true` is for public or open-ended entities; "a tool confined to a bounded private account, workspace, or catalog may use false, even when externally hosted". EngrAmo's public catalogs are a bounded catalog inside the service.
-- Precedent: the same read tools returned public catalogs with `false` in v1.2.12, which passed the ChatGPT scan, and Claude approved v1.2.13 with the same hints.
-- One rule for writes: `true` only where a tool **publishes** content or grants others access (`visibility` public/unlisted, `share_catalog`). `generate_card`, `generate_cards` and `update_card` stay `false` even when they write into an already-public catalog (the user made the publish decision through the open-world tool); `unshare_catalog` stays `false` because it only reduces exposure.
-- Prompt injection is handled in descriptions: `list_catalogs`, `get_catalog` and `get_catalog_filter_options` tell the model to treat public names, descriptions and tags as untrusted data, and so do the server instructions.
-- Fallback if a reviewer flags it: flip the whole set of public-reading tools (`list_catalogs`, `get_catalog_filter_options`, `get_catalog`, `search_global`, `search_catalogs`, `search_learning_paths`, `list_cards`, `get_card`) to `true` together and update the pinning tests in `src/server.rs`.
+**openWorldHint rule (applied 2026-11-02, after OpenAI rejected the earlier set):** `true` when a tool reads content authored by other EngrAmo users (public, unlisted or shared catalogs, public learning paths) or creates, changes or removes content or access that other users can see. `false` when it only touches the caller's own private data. 19 tools are `true`; the other 16 are `false`.
 
-### 3.1 Read-only (`readOnlyHint: true`, `destructiveHint: false`)
+History: the ChatGPT scan of 2026-10-17 flagged the tools that publish content (fixed in v1.2.12, engramo-mcp #106). On 2026-10-31 the read tools were kept `false` on the "bounded catalog" argument, and OpenAI's 2026-11-02 review rejected the annotations as not matching behavior, so the fallback was applied.
 
-| Tool | Justification |
-|---|---|
-| `get_server_version` | Returns the server's name and version. |
-| `get_subscription_usage` | Reads the user's own plan, limits and usage. |
-| `list_catalogs`, `get_catalog` | Read the user's own, shared and public catalogs. `list_catalogs` filters by front/back language, topic, level and tags. |
-| `get_catalog_filter_options` | Reads the allowed filter values and catalog counts per value (the user's own and public catalogs). |
-| `list_catalog_shares` | Lists who a catalog is shared with (owner or editors only). |
-| `list_cards`, `get_card` | Read cards. |
-| `get_due_cards`, `get_all_learning_cards` | Read the review schedule; grading happens in the app, not here. |
-| `list_learning_paths`, `get_learning_path` | Read learning paths. |
-| `search_global`, `search_catalogs`, `search_learning_paths` | Search the user's and public content. |
-| `list_media` | List the user's uploaded media. |
+| Tool | readOnly | destructive | idempotent | openWorld | Justification |
+|---|---|---|---|---|---|
+| `get_server_version` | true | false | true | false | Returns the server name and version. |
+| `get_subscription_usage` | true | false | true | false | Reads the caller's own plan, limits and usage. |
+| `list_catalogs` | true | false | true | true | Lists the caller's own, shared and other users' public catalogs. |
+| `get_catalog_filter_options` | true | false | true | true | Lists filter values and counts across the caller's and other users' public catalogs. |
+| `get_catalog` | true | false | true | true | Reads one catalog, possibly authored by another user (public, unlisted or shared). |
+| `update_catalog` | false | true | true | true | Overwrites catalog fields; can set visibility public/unlisted, exposing it to other users. |
+| `set_catalog_shadowing` | false | true | true | false | Changes the caller's own shadowing setting for a catalog; no other user sees it. |
+| `share_catalog` | false | true | true | true | Grants other users viewer/editor access to the caller's catalog. |
+| `unshare_catalog` | false | true | true | true | Removes other users' access to the caller's catalog. |
+| `list_catalog_shares` | true | false | true | false | Lists who the caller's own catalog is shared with (owner/editor only). |
+| `delete_catalog` | false | true | true | true | Removes a catalog, which may be public or shared, from other users' view. |
+| `list_cards` | true | false | true | true | Reads cards of a catalog that may be authored by another user. |
+| `get_card` | true | false | true | true | Reads one card that may belong to another user's catalog. |
+| `update_card` | false | true | true | true | Overwrites a card, which may sit in a public or shared catalog others see. |
+| `delete_card` | false | true | true | true | Removes a card, which may sit in a public or shared catalog others see. |
+| `get_due_cards` | true | false | true | false | Reads the caller's own review schedule. |
+| `get_all_learning_cards` | true | false | true | false | Reads the caller's own cards in learning. |
+| `add_card_to_learning` | false | false | true | false | Adds a card to the caller's own review queue. |
+| `add_catalog_to_learning` | false | false | true | false | Adds a catalog to the caller's own review queue. |
+| `list_learning_paths` | true | false | true | false | Lists the caller's own learning paths. |
+| `get_learning_path` | true | false | true | true | Reads a path by id; the API also returns other users' public paths. |
+| `create_learning_path` | false | false | false | false | Creates a new private path for the caller (not idempotent: each call makes one). |
+| `activate_learning_path` | false | false | true | false | Marks a path active for the caller only. |
+| `deactivate_learning_path` | false | true | true | false | Stops scheduling a path for the caller only. |
+| `add_catalog_to_learning_path` | false | false | true | false | Adds a membership to the caller's own path. |
+| `remove_catalog_from_learning_path` | false | true | true | false | Removes a membership from the caller's own path. |
+| `update_learning_path` | false | true | true | true | Overwrites a path; can set visibility public, exposing it to other users. |
+| `search_global` | true | false | true | true | Searches the caller's and other users' public content. |
+| `search_catalogs` | true | false | true | true | Searches the caller's and other users' public catalogs. |
+| `search_learning_paths` | true | false | true | true | Searches the caller's and other users' public learning paths. |
+| `list_media` | true | false | true | false | Lists the caller's own uploaded media. |
+| `upload_media` | false | false | false | false | Adds a new media file to the caller's own library. |
+| `generate_card` | false | false | false | true | Creates a card, possibly in a public or shared catalog others see. |
+| `generate_catalog_with_cards` | false | false | false | true | Creates a catalog with cards; can set visibility public/unlisted. |
+| `generate_cards` | false | false | false | true | Creates cards, possibly in a public or shared catalog others see. |
 
-### 3.2 Additive writes (`readOnlyHint: false`, `destructiveHint: false`)
-
-| Tool | Justification |
-|---|---|
-| `generate_card`, `generate_cards`, `generate_catalog_with_cards` | Create new cards/catalogs; never modify or remove existing data. Card text is written by the model, not by a server-side AI. |
-| `upload_media` | Adds a new media asset. |
-| `add_card_to_learning`, `add_catalog_to_learning` | Adds items to the review queue; idempotent. |
-| `create_learning_path` | Creates a new, empty path. |
-| `add_catalog_to_learning_path` | Adds a membership; idempotent. |
-| `activate_learning_path` | Marks a path active so its catalogs are scheduled; other active paths are unaffected and no data is removed. |
-
-### 3.3 Destructive (`readOnlyHint: false`, `destructiveHint: true`)
-
-| Tool | Justification |
-|---|---|
-| `update_card`, `update_catalog`, `update_learning_path` | Overwrite existing content; the previous values are not kept. |
-| `delete_card`, `delete_catalog` | Remove content (archived when it has learning history, otherwise hard-deleted). No restore tool. |
-| `set_catalog_shadowing` | Turns shadowing on or off for a catalog, or changes its language; overwrites the previous setting, and repeating the same call changes nothing. |
-| `share_catalog` | Gives the named users viewer or editor access to a catalog the user owns, or changes their level; repeating the call changes nothing. Marked destructive and open-world because it exposes content to other users. |
-| `unshare_catalog` | Removes the named users' access to a catalog the user owns; repeating the call changes nothing. |
-| `remove_catalog_from_learning_path` | Removes a membership. |
-| `deactivate_learning_path` | Stops the path's catalogs from being scheduled. Marked destructive on purpose because it changes what the user reviews. |
+Prompt injection: card, catalog and path text from other users is untrusted data; the server instructions and the read-tool descriptions say so.
 
 ---
 
