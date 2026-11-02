@@ -124,7 +124,7 @@ account also has an empty **My Catalog** (Default) that the app creates on first
 
 The 35 tools served over http. All four hints are explicitly set (true or false, never null) on every tool. Every tool acts only inside EngrAmo, through its first-party API, never the wider internet.
 
-**openWorldHint rule (applied 2026-11-02, after OpenAI rejected the earlier set):** `true` when a tool reads content authored by other EngrAmo users (public, unlisted or shared catalogs, public learning paths) or creates, changes or removes content or access that other users can see. `false` when it only touches the caller's own private data. 19 tools are `true`; the other 16 are `false`.
+**openWorldHint rule (applied 2026-11-02, after OpenAI rejected the earlier set):** `true` when a tool reads content authored by other EngrAmo users (public, unlisted or shared catalogs, public learning paths) or creates, changes or removes content or access that other users can see. `false` when it only touches the caller's own private data. 24 tools are `true`; the other 11 are `false`.
 
 History: the ChatGPT scan of 2026-10-17 flagged the tools that publish content (fixed in v1.2.12, engramo-mcp #106). On 2026-10-31 the read tools were kept `false` on the "bounded catalog" argument, and OpenAI's 2026-11-02 review rejected the annotations as not matching behavior, so the fallback was applied.
 
@@ -136,7 +136,7 @@ History: the ChatGPT scan of 2026-10-17 flagged the tools that publish content (
 | `get_catalog_filter_options` | true | false | true | true | Lists filter values and counts across the caller's and other users' public catalogs. |
 | `get_catalog` | true | false | true | true | Reads one catalog, possibly authored by another user (public, unlisted or shared). |
 | `update_catalog` | false | true | true | true | Overwrites catalog fields; can set visibility public/unlisted, exposing it to other users. |
-| `set_catalog_shadowing` | false | true | true | false | Changes the caller's own shadowing setting for a catalog; no other user sees it. |
+| `set_catalog_shadowing` | false | true | true | true | Changes the catalog's shadowing language and Shadowing-tab listing, which other users see on public or shared catalogs. |
 | `share_catalog` | false | true | true | true | Grants other users viewer/editor access to the caller's catalog. |
 | `unshare_catalog` | false | true | true | true | Removes other users' access to the caller's catalog. |
 | `list_catalog_shares` | true | false | true | false | Lists who the caller's own catalog is shared with (owner/editor only). |
@@ -145,8 +145,8 @@ History: the ChatGPT scan of 2026-10-17 flagged the tools that publish content (
 | `get_card` | true | false | true | true | Reads one card that may belong to another user's catalog. |
 | `update_card` | false | true | true | true | Overwrites a card, which may sit in a public or shared catalog others see. |
 | `delete_card` | false | true | true | true | Removes a card, which may sit in a public or shared catalog others see. |
-| `get_due_cards` | true | false | true | false | Reads the caller's own review schedule. |
-| `get_all_learning_cards` | true | false | true | false | Reads the caller's own cards in learning. |
+| `get_due_cards` | true | false | true | true | Reads cards in the caller's queue, which may come from other users' shared or public catalogs. |
+| `get_all_learning_cards` | true | false | true | true | Reads cards in the caller's learning queue, which may come from other users' shared or public catalogs. |
 | `add_card_to_learning` | false | false | true | false | Adds a card to the caller's own review queue. |
 | `add_catalog_to_learning` | false | false | true | false | Adds a catalog to the caller's own review queue. |
 | `list_learning_paths` | true | false | true | false | Lists the caller's own learning paths. |
@@ -154,8 +154,8 @@ History: the ChatGPT scan of 2026-10-17 flagged the tools that publish content (
 | `create_learning_path` | false | false | false | false | Creates a new private path for the caller (not idempotent: each call makes one). |
 | `activate_learning_path` | false | false | true | false | Marks a path active for the caller only. |
 | `deactivate_learning_path` | false | true | true | false | Stops scheduling a path for the caller only. |
-| `add_catalog_to_learning_path` | false | false | true | false | Adds a membership to the caller's own path. |
-| `remove_catalog_from_learning_path` | false | true | true | false | Removes a membership from the caller's own path. |
+| `add_catalog_to_learning_path` | false | false | true | true | Adds a catalog to a path that may be public, changing what other users see. |
+| `remove_catalog_from_learning_path` | false | true | true | true | Removes a catalog from a path that may be public, changing what other users see. |
 | `update_learning_path` | false | true | true | true | Overwrites a path; can set visibility public, exposing it to other users. |
 | `search_global` | true | false | true | true | Searches the caller's and other users' public content. |
 | `search_catalogs` | true | false | true | true | Searches the caller's and other users' public catalogs. |

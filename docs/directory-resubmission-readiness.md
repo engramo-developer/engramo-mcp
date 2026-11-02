@@ -66,7 +66,7 @@ Counts: **4 Blocker · 8 Should · 5 Nice**.
   - **16 read-only:** `get_server_version`, `get_subscription_usage`, `list_catalogs`, `get_catalog_filter_options`, `get_catalog`, `list_catalog_shares`, `list_cards`, `get_card`, `get_due_cards`, `get_all_learning_cards`, `list_learning_paths`, `get_learning_path`, `search_global`, `search_catalogs`, `search_learning_paths`, `list_media`.
   - **9 additive writes:** `generate_card`, `generate_cards`, `generate_catalog_with_cards`, `upload_media`, `add_card_to_learning`, `add_catalog_to_learning`, `create_learning_path`, `add_catalog_to_learning_path`, `activate_learning_path`.
   - **10 destructive:** `update_card`, `update_catalog`, `update_learning_path`, `delete_card`, `delete_catalog`, `set_catalog_shadowing`, `share_catalog`, `unshare_catalog`, `remove_catalog_from_learning_path`, `deactivate_learning_path`.
-  - **19 have `openWorldHint: true`** (updated 2026-11-02 after the OpenAI rejection; was 4): the original four (`generate_catalog_with_cards`, `update_catalog`, `update_learning_path`, `share_catalog`) plus `list_catalogs`, `get_catalog_filter_options`, `get_catalog`, `list_cards`, `get_card`, `get_learning_path`, `search_global`, `search_catalogs`, `search_learning_paths`, `generate_card`, `generate_cards`, `update_card`, `delete_card`, `delete_catalog`, `unshare_catalog`.
+  - **24 have `openWorldHint: true`** (updated 2026-11-02 after the OpenAI rejection; was 4): the original four (`generate_catalog_with_cards`, `update_catalog`, `update_learning_path`, `share_catalog`) plus `list_catalogs`, `get_catalog_filter_options`, `get_catalog`, `list_cards`, `get_card`, `get_learning_path`, `search_global`, `search_catalogs`, `search_learning_paths`, `generate_card`, `generate_cards`, `update_card`, `delete_card`, `delete_catalog`, `unshare_catalog`, `set_catalog_shadowing`, `get_due_cards`, `get_all_learning_cards`, `add_catalog_to_learning_path`, `remove_catalog_from_learning_path`.
   - These counts match the §3 tables (`docs/directory-submission.md:117-159`). Every tool is listed in the right group, and no listed tool is stale.
 - **7 resources.** `engramo://catalog-filters` is new. The Claude scan recorded 6 (`docs/directory-submission.md:261`).
 - **5 prompts.** Unchanged.
@@ -258,7 +258,7 @@ Counts: **4 Blocker · 8 Should · 5 Nice**.
 
 ## openWorldHint recommendation
 
-> **Superseded 2026-11-02:** OpenAI rejected the ChatGPT app because the annotations did not match tool behavior. The fallback below was applied and extended: `openWorldHint` is now `true` for every tool that reads other users' content or changes content/access they can see (19 tools; see `docs/directory-submission.md` §3). The recommendation text that follows is kept as history only.
+> **Superseded 2026-11-02:** OpenAI rejected the ChatGPT app because the annotations did not match tool behavior. The fallback below was applied and extended: `openWorldHint` is now `true` for every tool that reads other users' content or changes content/access they can see (24 tools; see `docs/directory-submission.md` §3). The recommendation text that follows is kept as history only.
 
 **Keep `openWorldHint: false` on `list_catalogs` and `get_catalog_filter_options`, and on the other read tools that can return other users' public or shared content.** Those are `get_catalog`, `search_global`, `search_catalogs`, `search_learning_paths`, `list_cards` and `get_card` (all false today: `src/server.rs:224-231`, `261-268`, `311-318`, `597-604`, `625-632`, `1289-1296`, `1323-1330`, `1348-1355`). Do not change them.
 
