@@ -46,8 +46,8 @@ pub struct UpdateCardParams {
     pub card_id: String,
     #[schemars(
         description = "Face patch (optional). Omitted keys keep the stored value; send null to \
-        clear audio_id, visual_id+visual_type (together), dictionary, rich_text, or style. \
-        Changing `text` without `rich_text` drops the stored formatting. rich_text styling goes \
+        clear audioId, visualId+visualType (together), dictionary, richText, or style. \
+        Changing `text` without `richText` drops the stored formatting. richText styling goes \
         under a nested `style` object, e.g. {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
     pub face: Option<CardContentPatch>,

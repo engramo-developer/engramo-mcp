@@ -663,16 +663,16 @@ impl EngramoMcpServer {
         description = "Update an existing flashcard's face, back, or catalog memberships. \
         Requires the current version for optimistic locking — fetch the card first. \
         Each of `face`/`back` is a per-key patch: omitted fields keep their stored value, \
-        `null` clears a field (audio_id, visual_id+visual_type, dictionary, rich_text, style), \
-        and a value replaces it. Changing `text` without `rich_text` drops the stored \
-        formatting. visual_id and visual_type must be sent together (both set, or both null). \
+        `null` clears a field (audioId, visualId+visualType, dictionary, richText, style), \
+        and a value replaces it. Changing `text` without `richText` drops the stored \
+        formatting. visualId and visualType must be sent together (both set, or both null). \
         `catalog_ids` REPLACES the memberships you can see, so build it from the \
         `catalogs[].id` values in `get_card` or `list_cards`'s response (which lists only \
         catalogs visible to you) plus/minus any intended changes. Must contain at least one \
         UUID — an empty list is rejected, since the API would otherwise silently move the card \
         to the user's default catalog. If the card JSON has no `catalogs` key, its memberships \
         are unknown — call `get_card` first. If you get a Conflict error, re-fetch and retry. \
-        rich_text styling goes under a nested `style` object, e.g. \
+        richText styling goes under a nested `style` object, e.g. \
         {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}. \
         A card_id that doesn't exist is reported as \"Not found\"; one that belongs to another user is reported as a permission error (the API may also report a missing id that way). \
         A card that was archived (e.g. deleted after learning started) is reported as Not found even if it still appears in get_due_cards — do not retry."
@@ -1702,28 +1702,47 @@ const MAX_CONTENT_CHARS: usize = 20_000;
 /// Validates and normalizes a per-key card-side patch. Only the keys the caller sent are
 /// touched; omitted keys stay omitted so the API keeps the stored values.
 fn prepare_card_patch(patch: &mut crate::dto::CardContentPatch) -> Result<(), String> {
+    const SNAKE: [&str; 4] = ["rich_text", "audio_id", "visual_id", "visual_type"];
+    if let Some(k) = patch.unknown.keys().find(|k| SNAKE.contains(&k.as_str())) {
+        return Err(format!(
+            "Unknown key `{k}`: use the camelCase name (richText, audioId, visualId, visualType)"
+        ));
+    }
+    // Unmodeled keys (stale client copies, model-invented fields) are never forwarded upstream.
+    patch.unknown.clear();
     patch.check_visual_pair()?;
-    let spans = patch.rich_text.clone().flatten();
-    let style = patch.style.clone().flatten();
+    let spans_sent = matches!(patch.rich_text, Some(Some(_)));
+    let spans_sent_empty = matches!(&patch.rich_text, Some(Some(v)) if v.is_empty());
+    let style_sent = matches!(patch.style, Some(Some(_)));
     let mut content = crate::dto::CardContent {
         text: patch.text.clone().unwrap_or_default(),
-        rich_text: spans.clone(),
-        style: style.clone(),
+        rich_text: patch.rich_text.clone().flatten(),
+        style: patch.style.clone().flatten(),
         dictionary: None,
         audio_id: patch.audio_id.clone().flatten(),
         visual_id: patch.visual_id.clone().flatten(),
         visual_type: None,
-        extra: serde_json::Map::new(),
     };
     check_card_content(&content)?;
     normalize_card_content(&mut content);
-    if patch.text.is_some() || spans.is_some() {
+    let spans_survived = content.rich_text.is_some();
+    // Never write `text` back unless the caller sent it or valid spans survived: empty spans
+    // alone must not blank the stored text.
+    if patch.text.is_some() || spans_survived {
         patch.text = Some(content.text);
     }
-    if spans.is_some() {
-        patch.rich_text = content.rich_text.map(Some);
+    if spans_sent {
+        patch.rich_text = if spans_survived {
+            Some(content.rich_text)
+        } else if patch.text.is_none() || spans_sent_empty {
+            // Empty spans: an explicit "clear formatting".
+            Some(None)
+        } else {
+            // Text sent and spans discarded as invalid: omit; the API drops formatting on a text change.
+            None
+        };
     }
-    if style.is_some() {
+    if style_sent {
         patch.style = Some(content.style);
     }
     Ok(())
@@ -2382,7 +2401,7 @@ mod tests {
             update_card_description.contains("REPLACES the memberships")
                 && update_card_description.contains("omitted")
                 && update_card_description.contains("null")
-                && update_card_description.contains("visual_type"),
+                && update_card_description.contains("visualType"),
             "{update_card_description}"
         );
         assert!(
@@ -2717,7 +2736,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-        let card_id = "00000000-0000-0000-0000-000000000001";
+        let card_id = CARD_ID;
         Mock::given(method("PATCH"))
             .and(path(format!("/cards/{card_id}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2737,6 +2756,110 @@ mod tests {
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .unwrap_or(serde_json::Value::Null);
         (body, is_err, reqs.len())
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_forwards_set_media_and_dictionary_unchanged() {
+        let media = "00000000-0000-0000-0000-0000000000aa";
+        let (body, is_err, n) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {
+                "audioId": media,
+                "visualId": media, "visualType": "image",
+                "dictionary": {"hola": "hello"}
+            },
+            "back": {"visualId": media, "visualType": "video"},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(n, 1);
+        assert_eq!(
+            body["face"],
+            serde_json::json!({
+                "audioId": media, "visualId": media, "visualType": "image",
+                "dictionary": {"hola": "hello"}
+            }),
+            "{body}"
+        );
+        assert_eq!(
+            body["back"],
+            serde_json::json!({"visualId": media, "visualType": "video"}),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_snake_case_key_is_tool_error_without_http_call() {
+        for bad in [
+            serde_json::json!({"audio_id": null}),
+            serde_json::json!({"rich_text": []}),
+            serde_json::json!({"visual_id": null, "visual_type": null}),
+        ] {
+            let mock_server = wiremock::MockServer::start().await;
+            let server = mock_server_for(&mock_server.uri());
+            let p: UpdateCardParams = serde_json::from_value(serde_json::json!({
+                "card_id": CARD_ID, "face": bad,
+                "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+            }))
+            .unwrap();
+            let result = server.update_card(Parameters(p)).await.unwrap();
+            assert_eq!(result.is_error, Some(true), "{bad}");
+            let msg = first_text(&result);
+            assert!(msg.contains("camelCase"), "{bad}: {msg}");
+            assert_eq!(mock_server.received_requests().await.unwrap().len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_drops_unknown_keys() {
+        let (body, is_err, n) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {"text": "x", "extraMedia": [1], "math": {"a": 1}},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(n, 1);
+        assert_eq!(body["face"], serde_json::json!({"text": "x"}), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_text_and_valid_spans_both_forwarded() {
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {
+                "text": "Hola amigo",
+                "richText": [{"text": "Hola "}, {"text": "amigo", "style": {"bold": true}}]
+            },
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(body["face"]["text"], "Hola amigo");
+        assert_eq!(
+            body["face"]["richText"].as_array().unwrap().len(),
+            2,
+            "{body}"
+        );
+        assert_eq!(body["face"]["richText"][1]["style"]["bold"], true, "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_text_with_empty_spans_sends_null_rich_text() {
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {"text": "Hola", "richText": []},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(body["face"]["text"], "Hola");
+        assert!(body["face"]["richText"].is_null(), "{body}");
+        assert!(
+            body["face"].as_object().unwrap().contains_key("richText"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -2780,17 +2903,109 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_card_visual_pair_mismatch_rejected_without_http_call() {
-        let (body, is_err, n) = patch_body_for(serde_json::json!({
+        let mock_server = wiremock::MockServer::start().await;
+        let server = mock_server_for(&mock_server.uri());
+        let p: UpdateCardParams = serde_json::from_value(serde_json::json!({
             "card_id": CARD_ID,
             "back": {"visualId": CARD_ID},
             "catalog_ids": [CARD_ID],
             "order_number": 1,
             "version": 3
         }))
+        .unwrap();
+        let result = server.update_card(Parameters(p)).await.unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert!(first_text(&result).contains("INVALID_VISUAL"), "{result:?}");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_empty_rich_text_keeps_text_and_clears_formatting() {
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {"richText": []},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert!(body["face"].get("text").is_none(), "{body}");
+        assert!(body["face"]["richText"].is_null(), "{body}");
+        assert!(body["face"].as_object().unwrap().contains_key("richText"));
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_sanitizes_unsafe_card_and_span_styles() {
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {
+                "richText": [
+                    {"text": "a "},
+                    {"text": "b", "style": {"fontColor": "red;background:url(x)"}}
+                ],
+                "style": {"fontColor": "javascript:alert(1)", "fontFamily": "Arial;}{x", "textAlign": "center"}
+            },
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert!(body["face"]["style"].get("fontColor").is_none(), "{body}");
+        assert!(body["face"]["style"].get("fontFamily").is_none(), "{body}");
+        assert_eq!(body["face"]["style"]["textAlign"], "center");
+        assert!(
+            body["face"]["richText"][1]["style"]
+                .get("fontColor")
+                .is_none(),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_mismatched_spans_drops_rich_text_keeps_text() {
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {"text": "Hola amigo", "richText": [{"text": "Hola"}, {"text": " enemigo"}]},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(body["face"]["text"], "Hola amigo");
+        assert!(
+            body["face"].get("richText").is_none(),
+            "invalid spans must be omitted, not null: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_text_only_is_sanitized() {
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {"text": "Hola\t\u{0}amigo"},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        let t = body["face"]["text"].as_str().unwrap();
+        assert!(!t.contains('\t') && !t.contains('\u{0}'), "{t}");
+        assert!(body["face"].get("richText").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_invalid_audio_id_and_oversized_text_rejected_without_http() {
+        let (_, is_err, n) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID, "face": {"audioId": "nope"},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
         .await;
         assert!(is_err);
         assert_eq!(n, 0);
-        assert!(body.is_null());
+        let big = "a".repeat(20_001);
+        let (_, is_err, n) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID, "back": {"text": big},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(is_err);
+        assert_eq!(n, 0);
     }
 
     /// Regression for issue #64: `update_card` with `catalog_ids: []` must be rejected with a
@@ -2811,8 +3026,8 @@ mod tests {
             "back": {"text": "A."},
             "orderNumber": 1
         });
-        // Mounted but must receive zero requests: neither the GET merge fetch nor the PATCH
-        // may fire once `catalog_ids` fails validation.
+        // Mounted but must receive zero requests: the PATCH must not be sent
+        // once `catalog_ids` fails validation.
         Mock::given(method("GET"))
             .and(path(format!("/cards/{card_id}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(card_json.clone()))
@@ -2846,8 +3061,8 @@ mod tests {
         );
     }
 
-    /// `update_card` with an invalid catalog UUID and `face` set must fail validation before the
-    /// `get_card` merge fetch, so the model sees the actionable UUID error.
+    /// `update_card` with an invalid catalog UUID and `face` set must fail validation before
+    /// any HTTP call, so the model sees the actionable UUID error.
     #[tokio::test]
     async fn test_update_card_invalid_catalog_uuid_rejected_without_http_call() {
         use wiremock::matchers::{method, path};
@@ -6069,7 +6284,6 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
-            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me estoy muriendo de ganas de verte pronto.");
@@ -6099,7 +6313,6 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
-            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -6123,7 +6336,6 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
-            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -6141,7 +6353,6 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
-            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me gusta el café.");

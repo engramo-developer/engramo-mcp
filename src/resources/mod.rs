@@ -483,6 +483,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_card_schema_documents_update_patch_semantics() {
+        let client = EngramoClient::new("http://localhost:9999", "tok");
+        let result = read(&client, ReadResourceRequestParams::new(URI_CARD_SCHEMA))
+            .await
+            .unwrap();
+        if let ResourceContents::TextResourceContents { text, .. } = &result.contents[0] {
+            assert!(text.contains("update_card"), "{text}");
+            assert!(text.contains("Omitted keys keep"), "{text}");
+            assert!(text.contains("`null` clears"), "{text}");
+            assert!(
+                text.contains("visualId and visualType must be set together"),
+                "{text}"
+            );
+        } else {
+            panic!("expected text resource contents");
+        }
+    }
+
+    #[tokio::test]
     async fn test_read_card_schema_lists_all_span_style_fields() {
         let client = EngramoClient::new("http://localhost:9999", "tok");
         let result = read(&client, ReadResourceRequestParams::new(URI_CARD_SCHEMA))

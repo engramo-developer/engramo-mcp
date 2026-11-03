@@ -181,6 +181,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_card_unknown_face_keys_are_stripped() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+        let params: GenerateCardParams = serde_json::from_value(json!({
+            "catalog_id": null,
+            "face": {"text": "a", "extraMedia": [{"id": "x"}], "ownerId": "evil"},
+            "back": {"text": "b"}
+        }))
+        .unwrap();
+        make_server(&server.uri())
+            .generate_card(Parameters(params))
+            .await
+            .unwrap();
+        let body = card_request_body(&server).await;
+        assert_eq!(body["face"]["text"], "a");
+        assert!(body["face"].get("ownerId").is_none(), "{body}");
+        assert!(body["face"].get("extraMedia").is_none(), "{body}");
+    }
+
+    #[tokio::test]
     async fn test_generate_card_strips_tab_from_plain_text() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -236,7 +260,6 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
-            extra: Default::default(),
         };
 
         make_server(&server.uri())

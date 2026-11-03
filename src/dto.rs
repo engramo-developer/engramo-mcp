@@ -565,11 +565,6 @@ pub struct CardContent {
     /// Required alongside `visual_id` — whether that asset is an image or a video.
     #[serde(rename = "visualType", skip_serializing_if = "Option::is_none")]
     pub visual_type: Option<VisualType>,
-    /// Fields the API returns that MCP does not model; kept so a read-modify-write round trip
-    /// does not drop them.
-    #[serde(flatten)]
-    #[schemars(skip)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl CardContent {
@@ -582,7 +577,6 @@ impl CardContent {
             audio_id: None,
             visual_id: None,
             visual_type: None,
-            extra: serde_json::Map::new(),
         }
     }
 }
@@ -600,7 +594,7 @@ where
 /// `Some(Some(v))` = replace with `v`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CardContentPatch {
-    /// New plain text. Changing it without `rich_text` drops the stored formatting.
+    /// New plain text. Changing it without `richText` drops the stored formatting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// Styled spans; `null` clears them.
@@ -633,7 +627,7 @@ pub struct CardContentPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub audio_id: Option<Option<String>>,
-    /// Image/video media id; must be set or cleared together with `visual_type`.
+    /// Image/video media id; must be set or cleared together with `visualType`.
     #[serde(
         rename = "visualId",
         default,
@@ -641,7 +635,7 @@ pub struct CardContentPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub visual_id: Option<Option<String>>,
-    /// `image` or `video`; must be set or cleared together with `visual_id`.
+    /// `image` or `video`; must be set or cleared together with `visualId`.
     #[serde(
         rename = "visualType",
         default,
@@ -649,6 +643,11 @@ pub struct CardContentPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub visual_type: Option<Option<VisualType>>,
+    /// Unmodeled keys (e.g. stale or model-invented fields). Checked and cleared by
+    /// `prepare_card_patch`; never forwarded upstream.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schemars(skip)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 impl CardContentPatch {
@@ -669,7 +668,7 @@ impl CardContentPatch {
             Ok(())
         } else {
             Err(
-                "INVALID_VISUAL: visual_id and visual_type must be set together, cleared \
+                "INVALID_VISUAL: visualId and visualType must be set together, cleared \
                 together (both null), or both omitted"
                     .to_string(),
             )
@@ -742,7 +741,9 @@ pub struct CreateCardRequest {
 
 #[derive(Debug, Serialize)]
 pub struct UpdateCardRequest {
-    /// All catalog IDs the card should belong to (an empty list keeps the memberships).
+    /// All catalog IDs the card should belong to (replaces the memberships visible to the caller).
+    /// Never send an empty list: the API moves the card to the default catalog (engramo-mcp#64);
+    /// `tools::cards::parse_catalog_ids` rejects it before this request is built.
     #[serde(rename = "catalogIds")]
     pub catalog_ids: Vec<Uuid>,
     #[serde(rename = "orderNumber")]
@@ -1142,17 +1143,16 @@ mod tests {
     }
 
     #[test]
-    fn test_card_content_unknown_keys_round_trip() {
+    fn test_card_content_unknown_keys_dropped_on_output() {
         let raw = serde_json::json!({
             "text": "t",
             "extraMedia": [{"id": "x"}],
             "math": {"a": 1}
         });
         let c: CardContent = serde_json::from_value(raw).unwrap();
-        assert!(c.extra.contains_key("extraMedia"));
         let out = serde_json::to_value(&c).unwrap();
-        assert_eq!(out["extraMedia"], serde_json::json!([{"id": "x"}]));
-        assert_eq!(out["math"], serde_json::json!({"a": 1}));
+        assert!(out.get("extraMedia").is_none(), "{out}");
+        assert!(out.get("math").is_none(), "{out}");
         assert_eq!(out["text"], "t");
     }
 
@@ -1293,7 +1293,6 @@ mod tests {
                 audio_id: None,
                 visual_id: None,
                 visual_type: None,
-                extra: serde_json::Map::new(),
             },
             back: CardContent::plain("Every value has one owner."),
             order_number: Some(1),
