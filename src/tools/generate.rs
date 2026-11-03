@@ -2362,4 +2362,67 @@ mod tests {
             "card text leaked into debug logs:\n{logs}"
         );
     }
+
+    #[tokio::test]
+    async fn test_update_card_golden_matches_cross_repo_fixture() {
+        use crate::tools::cards::UpdateCardParams;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clients");
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("original_card.json")).unwrap())
+                .unwrap();
+        let card_id = original["id"].as_str().unwrap().to_string();
+        let catalog_ids: Vec<String> = original["catalogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&original))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&original))
+            .mount(&server)
+            .await;
+
+        let face: crate::dto::CardContentPatch =
+            serde_json::from_value(json!({"text": "hola amigo"})).unwrap();
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id,
+                face: Some(face),
+                back: None,
+                catalog_ids,
+                order_number: original["orderNumber"].as_i64().unwrap(),
+                version: original["version"].as_i64().unwrap() as i32,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::PATCH)
+            .expect("PATCH request not made");
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+
+        let golden_path = dir.join("mcp_update_card.json");
+        if std::env::var("UPDATE_GOLDENS").as_deref() == Ok("1") {
+            let mut out = serde_json::to_string_pretty(&body).unwrap();
+            out.push('\n');
+            std::fs::write(&golden_path, out).unwrap();
+            return;
+        }
+        let golden: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&golden_path).unwrap()).unwrap();
+        assert_eq!(body, golden);
+    }
 }
