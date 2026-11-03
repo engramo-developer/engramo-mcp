@@ -55,6 +55,11 @@ CardContent fields:
                           `visualType` alongside it. Never fabricate a UUID here.
   visualType   String     Required if `visualId` is set. \"image\" or \"video\".
 
+Updating a card (update_card): face/back are per-key patches. Omitted keys keep their stored
+value; `null` clears a key (audioId, visualId+visualType together, dictionary, richText, style);
+a value replaces it. Changing `text` without `richText` drops the stored formatting.
+visualId and visualType must be set together or cleared together.
+
 RichTextSpan fields:
   text         String     REQUIRED. A VERBATIM contiguous slice of the parent `text`.
                           Never insert extra characters, markers, or spaces not in the original.

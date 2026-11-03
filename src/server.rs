@@ -662,6 +662,10 @@ impl EngramoMcpServer {
         ),
         description = "Update an existing flashcard's face, back, or catalog memberships. \
         Requires the current version for optimistic locking — fetch the card first. \
+        Each of `face`/`back` is a per-key patch: omitted fields keep their stored value, \
+        `null` clears a field (audio_id, visual_id+visual_type, dictionary, rich_text, style), \
+        and a value replaces it. Changing `text` without `rich_text` drops the stored \
+        formatting. visual_id and visual_type must be sent together (both set, or both null). \
         `catalog_ids` REPLACES the memberships you can see, so build it from the \
         `catalogs[].id` values in `get_card` or `list_cards`'s response (which lists only \
         catalogs visible to you) plus/minus any intended changes. Must contain at least one \
@@ -685,75 +689,17 @@ impl EngramoMcpServer {
             Ok(ids) => ids,
             Err(e) => return Ok(err_result(e)),
         };
-        for content in [&p.face, &p.back].into_iter().flatten() {
-            if let Err(e) = check_card_content(content) {
+        for patch in [&mut p.face, &mut p.back].into_iter().flatten() {
+            if let Err(e) = prepare_card_patch(patch) {
                 return Ok(err_result(e));
             }
-        }
-        // Normalize richText spans so text is derived before any further processing.
-        if let Some(ref mut face) = p.face {
-            normalize_card_content(face);
-        }
-        if let Some(ref mut back) = p.back {
-            normalize_card_content(back);
         }
         debug!(
             card_id = %card_id,
             updating_face = p.face.is_some(),
             updating_back = p.back.is_some(),
-            "update_card: normalized"
+            "update_card: validated"
         );
-        // Preserve server-managed fields (audio_id, visual, dictionary) the LLM cannot know about.
-        // Fetch the current card and merge them into the update if not explicitly set.
-        if p.face.is_some() || p.back.is_some() {
-            match self.client.get_card(card_id).await {
-                Ok(existing) => {
-                    debug!(
-                        existing_face_audio = existing.face.audio_id.is_some(),
-                        existing_face_dict_entries = existing
-                            .face
-                            .dictionary
-                            .as_ref()
-                            .map(|d| d.len())
-                            .unwrap_or(0),
-                        existing_back_audio = existing.back.audio_id.is_some(),
-                        "update_card: fetched existing card for merge"
-                    );
-                    if let Some(ref mut face) = p.face {
-                        if face.audio_id.is_none() {
-                            face.audio_id = existing.face.audio_id;
-                            debug!(audio_id = ?face.audio_id, "update_card: merged face.audio_id from existing");
-                        }
-                        if face.visual_id.is_none() && face.visual_type.is_none() {
-                            face.visual_id = existing.face.visual_id;
-                            face.visual_type = existing.face.visual_type;
-                        }
-                        if face.dictionary.is_none() {
-                            face.dictionary = existing.face.dictionary;
-                            debug!(
-                                dict_entries =
-                                    face.dictionary.as_ref().map(|d| d.len()).unwrap_or(0),
-                                "update_card: merged face.dictionary from existing"
-                            );
-                        }
-                    }
-                    if let Some(ref mut back) = p.back {
-                        if back.audio_id.is_none() {
-                            back.audio_id = existing.back.audio_id;
-                            debug!(audio_id = ?back.audio_id, "update_card: merged back.audio_id from existing");
-                        }
-                        if back.visual_id.is_none() && back.visual_type.is_none() {
-                            back.visual_id = existing.back.visual_id;
-                            back.visual_type = existing.back.visual_type;
-                        }
-                        if back.dictionary.is_none() {
-                            back.dictionary = existing.back.dictionary;
-                        }
-                    }
-                }
-                Err(e) => return Ok(err_result(e)),
-            }
-        }
         let req = UpdateCardRequest {
             catalog_ids,
             order_number: p.order_number,
@@ -1753,6 +1699,36 @@ fn strip_span_boundary_markers(spans: &mut [crate::dto::RichTextSpan]) {
 const MAX_SPANS_PER_CONTENT: usize = 1_000;
 const MAX_CONTENT_CHARS: usize = 20_000;
 
+/// Validates and normalizes a per-key card-side patch. Only the keys the caller sent are
+/// touched; omitted keys stay omitted so the API keeps the stored values.
+fn prepare_card_patch(patch: &mut crate::dto::CardContentPatch) -> Result<(), String> {
+    patch.check_visual_pair()?;
+    let spans = patch.rich_text.clone().flatten();
+    let style = patch.style.clone().flatten();
+    let mut content = crate::dto::CardContent {
+        text: patch.text.clone().unwrap_or_default(),
+        rich_text: spans.clone(),
+        style: style.clone(),
+        dictionary: None,
+        audio_id: patch.audio_id.clone().flatten(),
+        visual_id: patch.visual_id.clone().flatten(),
+        visual_type: None,
+        extra: serde_json::Map::new(),
+    };
+    check_card_content(&content)?;
+    normalize_card_content(&mut content);
+    if patch.text.is_some() || spans.is_some() {
+        patch.text = Some(content.text);
+    }
+    if spans.is_some() {
+        patch.rich_text = content.rich_text.map(Some);
+    }
+    if style.is_some() {
+        patch.style = Some(content.style);
+    }
+    Ok(())
+}
+
 /// Reject oversized or malformed card content before `normalize_card_content` does any
 /// work on it (bounds the cost of normalization) and before untrusted media ids go upstream.
 fn check_card_content(content: &crate::dto::CardContent) -> Result<(), String> {
@@ -2403,7 +2379,14 @@ mod tests {
             .expect("update_card not registered");
         let update_card_description = update_card.description.clone().unwrap_or_default();
         assert!(
-            update_card_description.contains("REPLACES"),
+            update_card_description.contains("REPLACES the memberships")
+                && update_card_description.contains("omitted")
+                && update_card_description.contains("null")
+                && update_card_description.contains("visual_type"),
+            "{update_card_description}"
+        );
+        assert!(
+            !update_card_description.contains("side REPLACES"),
             "{update_card_description}"
         );
         assert!(
@@ -2727,6 +2710,89 @@ mod tests {
         assert_eq!(v["catalogs"][0]["name"], "Spanish", "{v}");
     }
 
+    const CARD_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    async fn patch_body_for(params: serde_json::Value) -> (serde_json::Value, bool, usize) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let card_id = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": card_id, "version": 2,
+                "face": {"text": "x"}, "back": {"text": "y"}
+            })))
+            .mount(&mock_server)
+            .await;
+        let server = mock_server_for(&mock_server.uri());
+        let p: UpdateCardParams = serde_json::from_value(params).unwrap();
+        let result = server.update_card(Parameters(p)).await.unwrap();
+        let is_err = result.is_error.unwrap_or(false);
+        let reqs = mock_server.received_requests().await.unwrap();
+        let body = reqs
+            .iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .unwrap_or(serde_json::Value::Null);
+        (body, is_err, reqs.len())
+    }
+
+    #[tokio::test]
+    async fn test_update_card_omitted_fields_absent_from_patch_body_and_no_prefetch() {
+        let (body, is_err, n) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {"text": "new"},
+            "catalog_ids": [CARD_ID],
+            "order_number": 1,
+            "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(n, 1, "only the PATCH may be sent");
+        assert_eq!(body["face"], serde_json::json!({"text": "new"}));
+        assert!(body.get("back").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_update_card_explicit_null_serialized_as_null() {
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {
+                "audioId": null, "visualId": null, "visualType": null,
+                "dictionary": null, "richText": null, "style": null
+            },
+            "catalog_ids": [CARD_ID],
+            "order_number": 1,
+            "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(
+            body["face"],
+            serde_json::json!({
+                "richText": null, "style": null, "dictionary": null,
+                "audioId": null, "visualId": null, "visualType": null
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_visual_pair_mismatch_rejected_without_http_call() {
+        let (body, is_err, n) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "back": {"visualId": CARD_ID},
+            "catalog_ids": [CARD_ID],
+            "order_number": 1,
+            "version": 3
+        }))
+        .await;
+        assert!(is_err);
+        assert_eq!(n, 0);
+        assert!(body.is_null());
+    }
+
     /// Regression for issue #64: `update_card` with `catalog_ids: []` must be rejected with a
     /// clear validation error and make NO HTTP call at all — not even the `get_card` merge
     /// fetch — because the API accepts an empty list silently and moves the card into the
@@ -2765,7 +2831,7 @@ mod tests {
         let result = server
             .update_card(Parameters(UpdateCardParams {
                 card_id: card_id.to_string(),
-                face: Some(CardContent::plain("x")),
+                face: Some(crate::dto::CardContentPatch::text("x")),
                 back: None,
                 catalog_ids: vec![],
                 order_number: 1,
@@ -2801,7 +2867,7 @@ mod tests {
         let result = server
             .update_card(Parameters(UpdateCardParams {
                 card_id: card_id.to_string(),
-                face: Some(CardContent::plain("x")),
+                face: Some(crate::dto::CardContentPatch::text("x")),
                 back: None,
                 catalog_ids: vec!["bad".into()],
                 order_number: 1,
@@ -5363,13 +5429,13 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(format!("/cards/{TEST_ID}")))
                 .respond_with(ResponseTemplate::new(status))
-                .expect(2..) // get_card + update_card's merge fetch
+                .expect(2) // get_card + delete_card's membership probe
                 .mount(&mock)
                 .await;
             Mock::given(method("PATCH"))
                 .and(path(format!("/cards/{TEST_ID}")))
                 .respond_with(ResponseTemplate::new(status))
-                .expect(1) // only the face-less update_card(patch) call reaches it
+                .expect(2) // both update_card calls reach it (no pre-fetch)
                 .mount(&mock)
                 .await;
             Mock::given(method("DELETE"))
@@ -5409,7 +5475,6 @@ mod tests {
                     server
                         .update_card(Parameters(UpdateCardParams {
                             card_id: TEST_ID.to_string(),
-                            // face set so the GET-before-PATCH merge fetch runs
                             face: Some(
                                 serde_json::from_value(serde_json::json!({"text": "hello"}))
                                     .unwrap(),
@@ -5427,7 +5492,6 @@ mod tests {
                     server
                         .update_card(Parameters(UpdateCardParams {
                             card_id: TEST_ID.to_string(),
-                            // no face/back: skips the merge fetch, PATCH runs
                             face: None,
                             back: None,
                             catalog_ids: vec![TEST_ID.to_string()],
@@ -6005,6 +6069,7 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me estoy muriendo de ganas de verte pronto.");
@@ -6034,6 +6099,7 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -6057,6 +6123,7 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -6074,6 +6141,7 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            extra: Default::default(),
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me gusta el café.");
