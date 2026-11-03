@@ -186,7 +186,7 @@ Seeded-account expectations assume the seeding in `docs/directory-resubmission-r
 | P4 | "What learning paths do I have, and what's in the active one?" | `list_learning_paths`, `get_learning_path` | Shows two paths, both active: **Spanish for Travellers** (custom) containing both Spanish catalogs, and **My Learning Path** (the auto-created default). |
 | P5 | "Add five cards about pharmacy vocabulary to my Spanish health catalog." | `search_catalogs` or `list_catalogs`, `generate_cards` | Five new cards appear in **Spanish: Health & Daily Life (A2–B1)** (12 → 17 cards). |
 | P6 | "Share my Spanish travel deck with user `<share-target userId>` as a viewer, then show who it's shared with." | `share_catalog`, `list_catalog_shares` | Collaborators list shows that id as `viewer`. The share-target account's user id is given in the portal test instructions. Clean up with `unshare_catalog`. |
-| P7 | "Find public Spanish catalogs for beginners about medicine." | `get_catalog_filter_options`, `list_catalogs` | `list_catalogs` with `front_languages: ["es"]`, `levels: ["beginner"]`, `topics: ["medicine"]`, `filter: "public"` returns at least one seeded public catalog. |
+| P7 | "Find public Spanish catalogs for beginners with English translations." | `get_catalog_filter_options`, `list_catalogs` | `list_catalogs` with `front_languages: ["es"]`, `back_languages: ["en"]`, `levels: ["beginner"]`, `filter: "public"` returns at least one public catalog. |
 | P8 | "Which of my decks are B1 level?" | `list_catalogs` (`filter: "own"`, `levels: ["B1"]`) | Returns **Spanish: Health & Daily Life (A2–B1)** only. |
 | P9 | "Tag my travel deck as Spanish to English, topic travel, level A1." | `get_catalog` or `list_catalogs`, `update_catalog` (`front_languages: ["es"]`, `back_languages: ["en"]`, `topics: ["travel"]`, `levels: ["A1"]`, `version`) | Catalog shows the new fields. Destructive hint, so the client may confirm first. |
 | P10 | "What plan am I on and how many catalogs can I still create?" | `get_subscription_usage` | Plan name, the catalogs limit as used / remaining, reset rule. No purchase or upgrade link. |
@@ -276,11 +276,12 @@ server v1.2.12. Status: **to be cancelled and resubmitted with the 35-tool set a
 **While in review (original submission; no longer applies once cancelled):** keep the reviewer account, its ChatGPT connection and the seeded data intact; don't
 ship tool name/annotation/description changes to prod; don't upload a new ZIP unless asked.
 
-**Policy gaps to close later (site source, not blocking):**
-- Terms licence covers display "solely to provide the Service to you"; add display to other users for
-  content marked public/unlisted.
-- Terms have no moderation/reporting/removal clause for user content.
-- Privacy policy doesn't mention that public/unlisted content is visible to other users.
+**Policy gaps — closed 2026-11-03** (engramo-landing PRs #40, #41; both pages "Last updated: November 3, 2026"):
+- Privacy §1.6 covers shared, public and unlisted catalogs (public/unlisted are EngrAmo-published only; user
+  catalogs are never published), what collaborators see (user ids, never emails), and that study progress is
+  never shared; §3 lists other EngrAmo users as a recipient category.
+- Terms §3 licence covers display to the users you share with; §3.1 shared catalogs; §4 permits AI apps
+  connected to your own account; §4.1 moderation and reporting; §6 AI apps' own terms.
 
 ---
 
