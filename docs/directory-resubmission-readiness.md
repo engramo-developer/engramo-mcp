@@ -17,7 +17,7 @@ Everything left after the in-repo fixes (2026-10-31) is yours. Do these in order
 4. Verify: `curl https://mcp.engramo.app/version` matches, `tools/list` returns **35** tools, then self-test the new tools in claude.ai as a custom connector (B1).
 5. Seed reviewer data on both reviewer accounts: classify the two catalogs, a classified public subset, one media image, shadowing left off on one catalog (B3, seeding section).
 6. Create the share-target account and entitle both reviewer accounts to share (`catalog_share` on, limits at least 1); verify with `get_subscription_usage`; put the target's userId in the portal test instructions (B4).
-7. Update the privacy policy and Terms for public, unlisted and shared content (S4).
+7. Update the privacy policy and Terms for public, unlisted and shared content (S4). Done 2026-11-03 (engramo-landing PRs #40, #41).
 8. Cancel the active ChatGPT review in the OpenAI portal (B2; decided).
 9. Resubmit ChatGPT: rebuild the ZIP (`chatgpt-plugin/build.sh`), 5 positive + 3 negative cases per `docs/directory-submission.md` §4 and §5a.
 10. Edit the Claude listing (tool names and description, `docs/directory-submission.md` §2.2) and re-scan the Tools tab (S6).
@@ -172,7 +172,7 @@ Counts: **4 Blocker · 8 Should · 5 Nice**.
 - **Where:** https://engramo.app/policy/privacy/ (last updated 2026-10-13). It doesn't mention public or unlisted catalogs being visible to other users, or catalog sharing (collaborators see the content, and user ids are exchanged). `docs/directory-submission.md:244-249` lists this as "not blocking".
 - **Why it matters now:** OpenAI requires the policy to state "the categories of recipients". With `share_catalog` live, other users are such a category.
 - **Fix:** add a section on public, unlisted and shared content (who can see it, and that user ids are shown to collaborators). Add the Terms licence and moderation clauses already queued at `:244-248`.
-- **Owner:** out-of-repo (site).
+- **Owner:** out-of-repo (site). **Status:** done 2026-11-03 — see `docs/directory-submission.md` "Policy gaps — closed".
 
 **S5. The hosted server mentions a stdio-only audio-generation tool and an outside doc.**
 - **Where:**

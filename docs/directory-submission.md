@@ -276,11 +276,12 @@ server v1.2.12. Status: **to be cancelled and resubmitted with the 35-tool set a
 **While in review (original submission; no longer applies once cancelled):** keep the reviewer account, its ChatGPT connection and the seeded data intact; don't
 ship tool name/annotation/description changes to prod; don't upload a new ZIP unless asked.
 
-**Policy gaps to close later (site source, not blocking):**
-- Terms licence covers display "solely to provide the Service to you"; add display to other users for
-  content marked public/unlisted.
-- Terms have no moderation/reporting/removal clause for user content.
-- Privacy policy doesn't mention that public/unlisted content is visible to other users.
+**Policy gaps — closed 2026-11-03** (engramo-landing PRs #40, #41; both pages "Last updated: November 3, 2026"):
+- Privacy §1.6 covers shared, public and unlisted catalogs (public/unlisted are EngrAmo-published only; user
+  catalogs are never published), what collaborators see (user ids, never emails), and that study progress is
+  never shared; §3 lists other EngrAmo users as a recipient category.
+- Terms §3 licence covers display to the users you share with; §3.1 shared catalogs; §4 permits AI apps
+  connected to your own account; §4.1 moderation and reporting; §6 AI apps' own terms.
 
 ---
 
