@@ -2363,8 +2363,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_update_card_golden_matches_cross_repo_fixture() {
+    /// Shared driver for the cross-repo `update_card` goldens: replays `face`/`back` through
+    /// the handler against a mock API, returns the PATCH body and the raw bytes, and either
+    /// regenerates (`UPDATE_GOLDENS=1`) or compares against `tests/fixtures/clients/<golden>`.
+    async fn run_update_card_golden(
+        face: serde_json::Value,
+        back: Option<serde_json::Value>,
+        golden: &str,
+    ) -> (serde_json::Value, String) {
         use crate::tools::cards::UpdateCardParams;
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clients");
         let original: serde_json::Value =
@@ -2379,27 +2385,31 @@ mod tests {
             .collect();
 
         let server = MockServer::start().await;
+        // update_card is a pure per-key patch: it must never fetch the stored card.
         Mock::given(method("GET"))
             .and(path(format!("/cards/{card_id}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(&original))
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
             .and(path(format!("/cards/{card_id}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(&original))
+            .expect(1)
             .mount(&server)
             .await;
 
-        let face: crate::dto::CardContentPatch =
-            serde_json::from_value(json!({"text": "hola amigo"})).unwrap();
+        let face: crate::dto::CardContentPatch = serde_json::from_value(face).unwrap();
+        let back: Option<crate::dto::CardContentPatch> =
+            back.map(|b| serde_json::from_value(b).unwrap());
         let result = make_server(&server.uri())
             .update_card(Parameters(UpdateCardParams {
                 card_id,
                 face: Some(face),
-                back: None,
+                back,
                 catalog_ids,
                 order_number: original["orderNumber"].as_i64().unwrap(),
-                version: original["version"].as_i64().unwrap() as i32,
+                version: i32::try_from(original["version"].as_i64().unwrap()).unwrap(),
             }))
             .await
             .unwrap();
@@ -2412,17 +2422,73 @@ mod tests {
             .into_iter()
             .find(|r| r.method == wiremock::http::Method::PATCH)
             .expect("PATCH request not made");
+        let raw = String::from_utf8_lossy(&patch.body).into_owned();
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
 
-        let golden_path = dir.join("mcp_update_card.json");
+        let golden_path = dir.join(golden);
         if std::env::var("UPDATE_GOLDENS").as_deref() == Ok("1") {
             let mut out = serde_json::to_string_pretty(&body).unwrap();
             out.push('\n');
             std::fs::write(&golden_path, out).unwrap();
-            return;
+            return (body, raw);
         }
-        let golden: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&golden_path).unwrap()).unwrap();
+        let golden_text = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} (regenerate with UPDATE_GOLDENS=1 cargo test)",
+                golden_path.display()
+            )
+        });
+        let golden: serde_json::Value = serde_json::from_str(&golden_text).unwrap();
         assert_eq!(body, golden);
+        (body, raw)
+    }
+
+    #[tokio::test]
+    async fn test_update_card_golden_matches_cross_repo_fixture() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clients");
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("original_card.json")).unwrap())
+                .unwrap();
+        // A model copying read-only fields from get_card into `face`.
+        let mut face_in = json!({"text": "hola amigo"});
+        for k in ["audioUrl", "visualUrl"] {
+            let v = &original["face"][k];
+            assert!(
+                v.as_str().is_some_and(|s| s.contains("X-Goog-Signature")),
+                "fixture lost face.{k}"
+            );
+            face_in[k] = v.clone();
+        }
+        let created = &original["created_at"];
+        assert!(created.is_string(), "fixture lost created_at");
+        face_in["created_at"] = created.clone();
+
+        let (_, raw) = run_update_card_golden(face_in, None, "mcp_update_card.json").await;
+        assert!(
+            !raw.contains("audioUrl")
+                && !raw.contains("visualUrl")
+                && !raw.contains("X-Goog-Signature")
+                && !raw.contains("created_at"),
+            "unmodelled/signed-URL fields echoed upstream: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_clear_golden_matches_cross_repo_fixture() {
+        let (body, _) = run_update_card_golden(
+            json!({"text": "hola amigo", "richText": null, "visualId": null, "visualType": null}),
+            Some(json!({"audioId": null})),
+            "mcp_update_card_clear.json",
+        )
+        .await;
+        for k in ["richText", "visualId", "visualType"] {
+            assert!(
+                body["face"][k].is_null() && body["face"].get(k).is_some(),
+                "{k}"
+            );
+        }
+        assert!(body["back"]["audioId"].is_null() && body["back"].get("audioId").is_some());
+        assert!(body["face"].get("style").is_none());
+        assert!(body["back"].get("text").is_none());
     }
 }
