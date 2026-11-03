@@ -581,6 +581,101 @@ impl CardContent {
     }
 }
 
+fn double_option<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// Per-key patch of one card side for `PATCH /cards/{id}`. Outer `None` = key omitted (the
+/// stored value is kept); `Some(None)` = explicit `null` (clears the stored value);
+/// `Some(Some(v))` = replace with `v`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CardContentPatch {
+    /// New plain text. Changing it without `richText` drops the stored formatting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Styled spans; `null` clears them.
+    #[serde(
+        rename = "richText",
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rich_text: Option<Option<Vec<RichTextSpan>>>,
+    /// Card-level style; `null` clears it.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub style: Option<Option<CardStyle>>,
+    /// Word translation dictionary; `null` clears it.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dictionary: Option<Option<HashMap<String, String>>>,
+    /// Audio media id from `upload_media`; `null` clears it.
+    #[serde(
+        rename = "audioId",
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub audio_id: Option<Option<String>>,
+    /// Image/video media id; must be set or cleared together with `visualType`.
+    #[serde(
+        rename = "visualId",
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub visual_id: Option<Option<String>>,
+    /// `image` or `video`; must be set or cleared together with `visualId`.
+    #[serde(
+        rename = "visualType",
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub visual_type: Option<Option<VisualType>>,
+    /// Unmodeled keys (e.g. stale or model-invented fields). Checked and cleared by
+    /// `prepare_card_patch`; never forwarded upstream.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schemars(skip)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
+}
+
+impl CardContentPatch {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            ..Self::default()
+        }
+    }
+
+    /// `visual_id` and `visual_type` must be both omitted, both set, or both `null`.
+    pub fn check_visual_pair(&self) -> Result<(), String> {
+        let ok = matches!(
+            (&self.visual_id, &self.visual_type),
+            (None, None) | (Some(Some(_)), Some(Some(_))) | (Some(None), Some(None))
+        );
+        if ok {
+            Ok(())
+        } else {
+            Err(
+                "INVALID_VISUAL: visualId and visualType must be set together, cleared \
+                together (both null), or both omitted"
+                    .to_string(),
+            )
+        }
+    }
+}
+
 // ── Card ──────────────────────────────────────────────────────────────────────
 
 /// A catalog a card belongs to, as returned in `CardDto::catalogs` by `GET /cards/{id}`,
@@ -646,15 +741,17 @@ pub struct CreateCardRequest {
 
 #[derive(Debug, Serialize)]
 pub struct UpdateCardRequest {
-    /// All catalog IDs the card should belong to (replaces existing).
+    /// All catalog IDs the card should belong to (replaces the memberships visible to the caller).
+    /// Never send an empty list: the API moves the card to the default catalog (engramo-mcp#64);
+    /// `tools::cards::parse_catalog_ids` rejects it before this request is built.
     #[serde(rename = "catalogIds")]
     pub catalog_ids: Vec<Uuid>,
     #[serde(rename = "orderNumber")]
     pub order_number: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub face: Option<CardContent>,
+    pub face: Option<CardContentPatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub back: Option<CardContent>,
+    pub back: Option<CardContentPatch>,
     pub version: i32,
 }
 
@@ -985,6 +1082,79 @@ pub struct UsageEntryDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_card_content_patch_omitted_keys_absent_and_null_serialized() {
+        let patch: CardContentPatch = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "audioId": null,
+            "visualId": null,
+            "visualType": null,
+            "dictionary": {"a": "b"}
+        }))
+        .unwrap();
+        let v = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "text": "hi",
+                "audioId": null,
+                "visualId": null,
+                "visualType": null,
+                "dictionary": {"a": "b"}
+            })
+        );
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("richText"));
+        assert!(!obj.contains_key("style"));
+    }
+
+    #[test]
+    fn test_card_content_patch_empty_serializes_to_empty_object() {
+        let patch: CardContentPatch = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(serde_json::to_value(&patch).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_card_content_patch_visual_pair_validation() {
+        let parse =
+            |v: serde_json::Value| -> CardContentPatch { serde_json::from_value(v).unwrap() };
+        let id = "00000000-0000-0000-0000-000000000001";
+        assert!(parse(serde_json::json!({})).check_visual_pair().is_ok());
+        assert!(
+            parse(serde_json::json!({"visualId": id, "visualType": "image"}))
+                .check_visual_pair()
+                .is_ok()
+        );
+        assert!(
+            parse(serde_json::json!({"visualId": null, "visualType": null}))
+                .check_visual_pair()
+                .is_ok()
+        );
+        for bad in [
+            serde_json::json!({"visualId": id}),
+            serde_json::json!({"visualType": "image"}),
+            serde_json::json!({"visualId": null}),
+            serde_json::json!({"visualId": id, "visualType": null}),
+        ] {
+            let err = parse(bad).check_visual_pair().unwrap_err();
+            assert!(err.contains("INVALID_VISUAL"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_card_content_unknown_keys_dropped_on_output() {
+        let raw = serde_json::json!({
+            "text": "t",
+            "extraMedia": [{"id": "x"}],
+            "math": {"a": 1}
+        });
+        let c: CardContent = serde_json::from_value(raw).unwrap();
+        let out = serde_json::to_value(&c).unwrap();
+        assert!(out.get("extraMedia").is_none(), "{out}");
+        assert!(out.get("math").is_none(), "{out}");
+        assert_eq!(out["text"], "t");
+    }
 
     #[test]
     fn test_update_catalog_request_omits_image_id_when_none() {

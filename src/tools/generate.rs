@@ -181,6 +181,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_card_unknown_face_keys_are_stripped() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+        let params: GenerateCardParams = serde_json::from_value(json!({
+            "catalog_id": null,
+            "face": {"text": "a", "extraMedia": [{"id": "x"}], "ownerId": "evil"},
+            "back": {"text": "b"}
+        }))
+        .unwrap();
+        make_server(&server.uri())
+            .generate_card(Parameters(params))
+            .await
+            .unwrap();
+        let body = card_request_body(&server).await;
+        assert_eq!(body["face"]["text"], "a");
+        assert!(body["face"].get("ownerId").is_none(), "{body}");
+        assert!(body["face"].get("extraMedia").is_none(), "{body}");
+    }
+
+    #[tokio::test]
     async fn test_generate_card_strips_tab_from_plain_text() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -205,7 +229,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_card_strips_tab_from_rich_text_span() {
-        use crate::dto::RichTextSpan;
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/cards"))
@@ -216,18 +239,18 @@ mod tests {
         let face = CardContent {
             text: String::new(), // derived from spans
             rich_text: Some(vec![
-                RichTextSpan {
+                crate::dto::RichTextSpan {
                     text: "Ellos \t".to_string(),
                     style: None,
                 },
-                RichTextSpan {
+                crate::dto::RichTextSpan {
                     text: "están viviendo".to_string(),
                     style: Some(crate::dto::RichTextSpanStyle {
                         bold: Some(true),
                         ..Default::default()
                     }),
                 },
-                RichTextSpan {
+                crate::dto::RichTextSpan {
                     text: " en Madrid.".to_string(),
                     style: None,
                 },
@@ -1033,104 +1056,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_card_preserves_audio_id_from_existing_card() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-        let audio_id = "00000000-0000-0000-0000-000000000099";
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(make_existing_card_json(audio_id, json!(null))),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-            .mount(&server)
-            .await;
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: Some(CardContent::plain("Quedo actualizado")), // no audio_id set
-                back: None,
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false));
-
-        // The PATCH body must contain the preserved audioId.
-        let patch_req = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.method == wiremock::http::Method::PATCH)
-            .expect("PATCH request not made");
-        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-        assert_eq!(
-            body["face"]["audioId"].as_str(),
-            Some(audio_id),
-            "audio_id must be preserved from existing card"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_card_preserves_visual_from_existing_card() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-        let visual = "00000000-0000-0000-0000-0000000000bb";
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": card_id, "version": 1,
-                "face": { "text": "Quedo", "visualId": visual, "visualType": "image" },
-                "back": { "text": "Чекаю", "visualId": visual, "visualType": "video" },
-                "orderNumber": 1
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-            .mount(&server)
-            .await;
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: Some(CardContent::plain("Nuevo")),
-                back: Some(CardContent::plain("Новий")),
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false));
-        let patch_req = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.method == wiremock::http::Method::PATCH)
-            .expect("PATCH request not made");
-        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-        assert_eq!(body["face"]["visualId"].as_str(), Some(visual));
-        assert_eq!(body["face"]["visualType"].as_str(), Some("image"));
-        assert_eq!(body["back"]["visualId"].as_str(), Some(visual));
-        assert_eq!(body["back"]["visualType"].as_str(), Some("video"));
-    }
-
-    #[tokio::test]
     async fn test_generate_cards_partial_failure_reports_created_cards() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1175,284 +1100,6 @@ mod tests {
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
         assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_update_card_preserves_dictionary_from_existing_card() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(make_existing_card_json(
-                    "audio-uuid",
-                    json!({ "quedo": "I wait", "mañana": "tomorrow" }),
-                )),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-            .mount(&server)
-            .await;
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: Some(CardContent::plain("Quedo")), // no dictionary set
-                back: None,
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false));
-
-        let patch_req = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.method == wiremock::http::Method::PATCH)
-            .expect("PATCH request not made");
-        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-        assert_eq!(
-            body["face"]["dictionary"]["quedo"].as_str(),
-            Some("I wait"),
-            "dictionary must be preserved from existing card"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_card_preserves_back_dictionary_from_existing_card() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": card_id,
-                "version": 1,
-                "face": { "text": "dog" },
-                "back": { "text": "perro", "dictionary": { "perro": "dog" } },
-                "orderNumber": 1
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-            .mount(&server)
-            .await;
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: None,
-                back: Some(CardContent::plain("perro")), // no dictionary set
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false), "{result:?}");
-
-        let patch_req = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.method == wiremock::http::Method::PATCH)
-            .expect("PATCH request not made");
-        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-        assert_eq!(
-            body["back"]["dictionary"]["perro"].as_str(),
-            Some("dog"),
-            "back dictionary must be preserved from existing card"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_card_does_not_overwrite_explicitly_set_audio_id() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-        let new_audio_id = "00000000-0000-0000-0000-0000000000a1";
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(make_existing_card_json("old-audio-id", json!(null))),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-            .mount(&server)
-            .await;
-
-        let mut face = CardContent::plain("Quedo");
-        face.audio_id = Some(new_audio_id.to_string()); // explicitly set
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: Some(face),
-                back: None,
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false));
-
-        let patch_req = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.method == wiremock::http::Method::PATCH)
-            .expect("PATCH request not made");
-        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-        assert_eq!(
-            body["face"]["audioId"].as_str(),
-            Some(new_audio_id),
-            "explicitly set audio_id must not be overwritten by existing card's value"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_card_preserves_back_audio_id_from_existing_card() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(make_existing_card_json("face-audio", json!(null))),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-            .mount(&server)
-            .await;
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: None,
-                back: Some(CardContent::plain("Nuevo")), // no audio_id set
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false));
-
-        let patch_req = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.method == wiremock::http::Method::PATCH)
-            .expect("PATCH request not made");
-        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-        assert_eq!(
-            body["back"]["audioId"].as_str(),
-            Some("back-audio-id"),
-            "back.audio_id must be preserved from existing card"
-        );
-        assert_eq!(body["back"]["text"].as_str(), Some("Nuevo"));
-    }
-
-    #[tokio::test]
-    async fn test_update_card_does_not_overwrite_explicitly_set_back_audio_id() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(make_existing_card_json("face-audio", json!(null))),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("PATCH"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-            .mount(&server)
-            .await;
-
-        let mut back = CardContent::plain("Nuevo");
-        back.audio_id = Some("00000000-0000-0000-0000-0000000000a2".to_string());
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: None,
-                back: Some(back),
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error.unwrap_or(false));
-
-        let patch_req = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.method == wiremock::http::Method::PATCH)
-            .expect("PATCH request not made");
-        let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-        assert_eq!(
-            body["back"]["audioId"].as_str(),
-            Some("00000000-0000-0000-0000-0000000000a2")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_card_get_card_error_returns_error_result() {
-        use crate::tools::cards::UpdateCardParams;
-        let server = MockServer::start().await;
-        let card_id = mock_id();
-
-        Mock::given(method("GET"))
-            .and(path(format!("/cards/{card_id}")))
-            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
-            .mount(&server)
-            .await;
-
-        let result = make_server(&server.uri())
-            .update_card(Parameters(UpdateCardParams {
-                card_id: card_id.to_string(),
-                face: Some(CardContent::plain("Quedo")),
-                back: None,
-                catalog_ids: vec![mock_id().to_string()],
-                order_number: 1,
-                version: 1,
-            }))
-            .await
-            .unwrap();
-        assert!(result.is_error.unwrap_or(false));
     }
 
     #[tokio::test]
@@ -1525,7 +1172,7 @@ mod tests {
         let result = make_server(&server.uri())
             .update_card(Parameters(UpdateCardParams {
                 card_id: card_id.to_string(),
-                face: Some(CardContent::plain("x")),
+                face: Some(crate::dto::CardContentPatch::text("x")),
                 back: None,
                 catalog_ids: vec!["bad".to_string()],
                 order_number: 1,
@@ -1566,7 +1213,7 @@ mod tests {
         let result = make_server(&server.uri())
             .update_card(Parameters(UpdateCardParams {
                 card_id: card_id.to_string(),
-                face: Some(CardContent::plain("x")),
+                face: Some(crate::dto::CardContentPatch::text("x")),
                 back: None,
                 catalog_ids: vec![mock_id().to_string()],
                 order_number: 1,
@@ -1736,8 +1383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_card_normalizes_rich_text_before_merge() {
-        use crate::dto::RichTextSpan;
+    async fn test_update_card_derives_text_from_rich_text_and_omits_untouched_keys() {
         use crate::tools::cards::UpdateCardParams;
         let server = MockServer::start().await;
         let card_id = mock_id();
@@ -1756,17 +1402,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut face = CardContent::plain(""); // LLM leaves text empty
-        face.rich_text = Some(vec![
-            RichTextSpan {
-                text: "Quedo".to_string(),
-                style: None,
-            },
-            RichTextSpan {
-                text: " actualizado".to_string(),
-                style: None,
-            },
-        ]);
+        let face: crate::dto::CardContentPatch = serde_json::from_value(json!({
+            "richText": [{"text": "Quedo"}, {"text": " actualizado"}]
+        }))
+        .unwrap();
 
         let result = make_server(&server.uri())
             .update_card(Parameters(UpdateCardParams {
@@ -1795,9 +1434,9 @@ mod tests {
             "text must be derived from richText spans"
         );
         assert_eq!(
-            body["face"]["audioId"].as_str(),
-            Some("existing-audio"),
-            "audio_id must be preserved after normalization"
+            body["face"].get("audioId"),
+            None,
+            "untouched keys must stay omitted so the API keeps them"
         );
     }
 
@@ -1894,7 +1533,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_card_outgoing_patch_carries_nested_style() {
-        use crate::dto::{RichTextSpan, RichTextSpanStyle};
         use crate::tools::cards::UpdateCardParams;
         let server = MockServer::start().await;
         let card_id = mock_id();
@@ -1913,21 +1551,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut face = CardContent::plain("");
-        face.rich_text = Some(vec![
-            RichTextSpan {
-                text: "Quedo ".to_string(),
-                style: None,
-            },
-            RichTextSpan {
-                text: "actualizado".to_string(),
-                style: Some(RichTextSpanStyle {
-                    bold: Some(true),
-                    font_color: Some("#27AE60".to_string()),
-                    ..Default::default()
-                }),
-            },
-        ]);
+        let face: crate::dto::CardContentPatch = serde_json::from_value(json!({
+            "richText": [
+                {"text": "Quedo "},
+                {"text": "actualizado", "style": {"bold": true, "fontColor": "#27AE60"}}
+            ]
+        }))
+        .unwrap();
 
         make_server(&server.uri())
             .update_card(Parameters(UpdateCardParams {
@@ -2340,7 +1970,10 @@ mod tests {
                 card_id: mock_id().to_string(),
                 catalog_ids: vec![mock_id().to_string()],
                 face: None,
-                back: Some(bad.clone()),
+                back: Some(
+                    serde_json::from_value(json!({"visualId": "nope", "visualType": "image"}))
+                        .unwrap(),
+                ),
                 order_number: 1,
                 version: 1,
             }))
@@ -2380,67 +2013,6 @@ mod tests {
         assert!(text_of(&r).contains("Invalid visual_id"), "{r:?}");
 
         assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_update_card_does_not_overwrite_explicit_visual() {
-        use crate::tools::cards::UpdateCardParams;
-        let card_id = mock_id();
-        let v_old = "00000000-0000-0000-0000-0000000000bb";
-        let v_new = "00000000-0000-0000-0000-0000000000cc";
-
-        for (face_json, expect_id, expect_type) in [
-            (
-                json!({"text": "Quedo", "visualId": v_new, "visualType": "video"}),
-                Some(v_new),
-                Some("video"),
-            ),
-            (
-                json!({"text": "Quedo", "visualType": "video"}),
-                None,
-                Some("video"),
-            ),
-        ] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path(format!("/cards/{card_id}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "id": card_id, "version": 1,
-                    "face": { "text": "Quedo", "visualId": v_old, "visualType": "image" },
-                    "back": { "text": "Чекаю" },
-                    "orderNumber": 1
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("PATCH"))
-                .and(path(format!("/cards/{card_id}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(card_dto_json()))
-                .mount(&server)
-                .await;
-
-            let result = make_server(&server.uri())
-                .update_card(Parameters(UpdateCardParams {
-                    card_id: card_id.to_string(),
-                    face: Some(serde_json::from_value(face_json).unwrap()),
-                    back: None,
-                    catalog_ids: vec![mock_id().to_string()],
-                    order_number: 1,
-                    version: 1,
-                }))
-                .await
-                .unwrap();
-            assert!(!result.is_error.unwrap_or(false), "{result:?}");
-            let patch_req = server
-                .received_requests()
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|r| r.method == wiremock::http::Method::PATCH)
-                .expect("PATCH request not made");
-            let body: serde_json::Value = serde_json::from_slice(&patch_req.body).unwrap();
-            assert_eq!(body["face"]["visualId"].as_str(), expect_id, "{body}");
-            assert_eq!(body["face"]["visualType"].as_str(), expect_type, "{body}");
-        }
     }
 
     fn svec(v: &[&str]) -> Option<Vec<String>> {
@@ -2758,7 +2330,7 @@ mod tests {
                 tools
                     .update_card(Parameters(UpdateCardParams {
                         card_id: card_id.to_string(),
-                        face: Some(CardContent::plain(SECRET)),
+                        face: Some(crate::dto::CardContentPatch::text(SECRET)),
                         back: None,
                         catalog_ids: vec![mock_id().to_string()],
                         order_number: 1,
@@ -2777,13 +2349,10 @@ mod tests {
             "generate_card: after normalization",
             "generate_cards: after normalization",
             "generate_catalog_with_cards: after normalization",
-            "update_card: normalized",
-            "update_card: fetched existing card for merge",
-            "update_card: merged face.dictionary from existing",
+            "update_card: validated",
             // The counts and flags themselves are logged.
             "face_chars=",
             "updating_face=true",
-            "existing_face_dict_entries=1",
             "card_count=1",
         ] {
             assert!(logs.contains(line), "missing {line:?} in:\n{logs}");
@@ -2792,5 +2361,134 @@ mod tests {
             !logs.contains(SECRET),
             "card text leaked into debug logs:\n{logs}"
         );
+    }
+
+    /// Shared driver for the cross-repo `update_card` goldens: replays `face`/`back` through
+    /// the handler against a mock API, returns the PATCH body and the raw bytes, and either
+    /// regenerates (`UPDATE_GOLDENS=1`) or compares against `tests/fixtures/clients/<golden>`.
+    async fn run_update_card_golden(
+        face: serde_json::Value,
+        back: Option<serde_json::Value>,
+        golden: &str,
+    ) -> (serde_json::Value, String) {
+        use crate::tools::cards::UpdateCardParams;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clients");
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("original_card.json")).unwrap())
+                .unwrap();
+        let card_id = original["id"].as_str().unwrap().to_string();
+        let catalog_ids: Vec<String> = original["catalogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+
+        let server = MockServer::start().await;
+        // update_card is a pure per-key patch: it must never fetch the stored card.
+        Mock::given(method("GET"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&original))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/cards/{card_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&original))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let face: crate::dto::CardContentPatch = serde_json::from_value(face).unwrap();
+        let back: Option<crate::dto::CardContentPatch> =
+            back.map(|b| serde_json::from_value(b).unwrap());
+        let result = make_server(&server.uri())
+            .update_card(Parameters(UpdateCardParams {
+                card_id,
+                face: Some(face),
+                back,
+                catalog_ids,
+                order_number: original["orderNumber"].as_i64().unwrap(),
+                version: i32::try_from(original["version"].as_i64().unwrap()).unwrap(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method == wiremock::http::Method::PATCH)
+            .expect("PATCH request not made");
+        let raw = String::from_utf8_lossy(&patch.body).into_owned();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+
+        let golden_path = dir.join(golden);
+        if std::env::var("UPDATE_GOLDENS").as_deref() == Ok("1") {
+            let mut out = serde_json::to_string_pretty(&body).unwrap();
+            out.push('\n');
+            std::fs::write(&golden_path, out).unwrap();
+            return (body, raw);
+        }
+        let golden_text = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} (regenerate with UPDATE_GOLDENS=1 cargo test)",
+                golden_path.display()
+            )
+        });
+        let golden: serde_json::Value = serde_json::from_str(&golden_text).unwrap();
+        assert_eq!(body, golden);
+        (body, raw)
+    }
+
+    #[tokio::test]
+    async fn test_update_card_golden_matches_cross_repo_fixture() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clients");
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("original_card.json")).unwrap())
+                .unwrap();
+        // A model copying read-only fields from get_card into `face`.
+        let mut face_in = json!({"text": "hola amigo"});
+        for k in ["audioUrl", "visualUrl"] {
+            let v = &original["face"][k];
+            assert!(
+                v.as_str().is_some_and(|s| s.contains("X-Goog-Signature")),
+                "fixture lost face.{k}"
+            );
+            face_in[k] = v.clone();
+        }
+        let created = &original["created_at"];
+        assert!(created.is_string(), "fixture lost created_at");
+        face_in["created_at"] = created.clone();
+
+        let (_, raw) = run_update_card_golden(face_in, None, "mcp_update_card.json").await;
+        assert!(
+            !raw.contains("audioUrl")
+                && !raw.contains("visualUrl")
+                && !raw.contains("X-Goog-Signature")
+                && !raw.contains("created_at"),
+            "unmodelled/signed-URL fields echoed upstream: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_card_clear_golden_matches_cross_repo_fixture() {
+        let (body, _) = run_update_card_golden(
+            json!({"text": "hola amigo", "richText": null, "visualId": null, "visualType": null}),
+            Some(json!({"audioId": null})),
+            "mcp_update_card_clear.json",
+        )
+        .await;
+        for k in ["richText", "visualId", "visualType"] {
+            assert!(
+                body["face"][k].is_null() && body["face"].get(k).is_some(),
+                "{k}"
+            );
+        }
+        assert!(body["back"]["audioId"].is_null() && body["back"].get("audioId").is_some());
+        assert!(body["face"].get("style").is_none());
+        assert!(body["back"].get("text").is_none());
     }
 }

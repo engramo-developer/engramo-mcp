@@ -2,7 +2,7 @@ use rmcp::schemars;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::dto::CardContent;
+use crate::dto::CardContentPatch;
 use crate::tools::catalogs::parse_uuid;
 
 /// `update_card`'s `catalog_ids` is REQUIRED and must be non-empty: the underlying API accepts
@@ -45,12 +45,14 @@ pub struct UpdateCardParams {
     #[schemars(description = "UUID of the card to update")]
     pub card_id: String,
     #[schemars(
-        description = "Updated face content (optional). rich_text styling goes under a nested \
-        `style` object, e.g. {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
+        description = "Face patch (optional). Omitted keys keep the stored value; send null to \
+        clear audioId, visualId+visualType (together), dictionary, richText, or style. \
+        Changing `text` without `richText` drops the stored formatting. richText styling goes \
+        under a nested `style` object, e.g. {\"text\":\"gracias.\",\"style\":{\"bold\":true,\"fontColor\":\"#27AE60\"}}."
     )]
-    pub face: Option<CardContent>,
-    #[schemars(description = "Updated back content (optional). Same rich_text rules as `face`.")]
-    pub back: Option<CardContent>,
+    pub face: Option<CardContentPatch>,
+    #[schemars(description = "Back patch (optional). Same merge rules as `face`.")]
+    pub back: Option<CardContentPatch>,
     #[schemars(
         description = "Catalog UUIDs this card should belong to — REPLACES the memberships you \
         can see. Start from `catalogs[].id` in `get_card`/`list_cards` (which lists only \

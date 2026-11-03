@@ -1851,7 +1851,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_card_success() {
-        use crate::dto::{CardContent, UpdateCardRequest};
+        use crate::dto::{CardContentPatch, UpdateCardRequest};
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path(format!("/cards/{}", mock_id())))
@@ -1865,7 +1865,7 @@ mod tests {
         let req = UpdateCardRequest {
             catalog_ids: vec![mock_id()],
             order_number: 1,
-            face: Some(CardContent::plain("Updated")),
+            face: Some(CardContentPatch::text("Updated")),
             back: None,
             version: 1,
         };
@@ -1882,7 +1882,7 @@ mod tests {
     /// two would be caught.
     #[tokio::test]
     async fn test_update_card_response_maps_catalogs() {
-        use crate::dto::{CardContent, UpdateCardRequest};
+        use crate::dto::{CardContentPatch, UpdateCardRequest};
         let catalog_id = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
@@ -1898,7 +1898,7 @@ mod tests {
         let req = UpdateCardRequest {
             catalog_ids: vec![catalog_id],
             order_number: 1,
-            face: Some(CardContent::plain("Updated")),
+            face: Some(CardContentPatch::text("Updated")),
             back: None,
             version: 1,
         };
@@ -1914,7 +1914,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_card_conflict() {
-        use crate::dto::{CardContent, UpdateCardRequest};
+        use crate::dto::{CardContentPatch, UpdateCardRequest};
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path(format!("/cards/{}", mock_id())))
@@ -1925,7 +1925,7 @@ mod tests {
         let req = UpdateCardRequest {
             catalog_ids: vec![mock_id()],
             order_number: 1,
-            face: Some(CardContent::plain("X")),
+            face: Some(CardContentPatch::text("X")),
             back: None,
             version: 1,
         };
