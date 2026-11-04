@@ -29,6 +29,9 @@ steps:
       - '0'
       - '--concurrency'
       - '80'
+      # MCP sessions live in one instance's memory; without affinity a follow-up request can land
+      # on another instance and get 404 "Session not found". Affinity is best-effort.
+      - '--session-affinity'
       - '--allow-unauthenticated'
       - '--set-env-vars'
       # MCP_ALLOWED_HOSTS also permits this service's own stable *.run.app URL

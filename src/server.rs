@@ -1510,9 +1510,22 @@ impl ServerHandler for EngramoMcpServer {
         params: CallToolRequestParams,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.tool_router
+        let tool_name = params.name.to_string();
+        let result = self
+            .tool_router
             .call(ToolCallContext::new(self, params, ctx))
-            .await
+            .await;
+        // Router-level rejections (bad arguments, unknown tool) never reach a handler, so
+        // `err_result` can't log them. Log code + redacted message only — never `data` or args.
+        if let Err(e) = &result {
+            warn!(
+                tool = %tool_name,
+                code = e.code.0,
+                error = %redact_rejection_message(&e.message),
+                "tool call rejected before handler"
+            );
+        }
+        result
     }
 
     async fn list_resources(
@@ -1693,6 +1706,41 @@ fn strip_span_boundary_markers(spans: &mut [crate::dto::RichTextSpan]) {
                 span.text.truncate(trim_len);
             }
         }
+    }
+}
+
+const MAX_REJECTION_LOG_CHARS: usize = 300;
+
+/// Makes a router rejection message safe to log: serde embeds user-supplied values in
+/// double quotes, so every `"..."` segment (honouring `\"` escapes; an unterminated one runs to
+/// the end) becomes `"…"`. Backtick-quoted field/variant names are kept. Truncated to
+/// `MAX_REJECTION_LOG_CHARS` chars.
+fn redact_rejection_message(message: &str) -> String {
+    let mut out = String::new();
+    let mut chars = message.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            out.push(c);
+            continue;
+        }
+        out.push_str("\"…\"");
+        while let Some(q) = chars.next() {
+            match q {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => break,
+                _ => {}
+            }
+        }
+    }
+    match out.char_indices().nth(MAX_REJECTION_LOG_CHARS) {
+        Some((idx, _)) => {
+            out.truncate(idx);
+            out.push('…');
+            out
+        }
+        None => out,
     }
 }
 
@@ -2121,6 +2169,44 @@ impl EngramoMcpServer {
 mod tests {
     use super::*;
     use crate::dto::{CardContent, RichTextSpan, RichTextSpanStyle};
+
+    // ── Router-rejection log redaction ───────────────────────────────────────
+
+    #[test]
+    fn test_redact_rejection_message_replaces_double_quoted_values() {
+        let msg = r#"invalid type: string "Hola amigo", expected a sequence at line 1 column 42"#;
+        assert_eq!(
+            redact_rejection_message(msg),
+            r#"invalid type: string "…", expected a sequence at line 1 column 42"#
+        );
+    }
+
+    #[test]
+    fn test_redact_rejection_message_handles_escaped_and_unterminated_quotes() {
+        assert_eq!(
+            redact_rejection_message(r#"got "say \"hi\" now" ok and "secret"#),
+            r#"got "…" ok and "…""#
+        );
+    }
+
+    #[test]
+    fn test_redact_rejection_message_keeps_backtick_names_and_plain_text() {
+        let msg = "missing field `face` at line 1 column 2";
+        assert_eq!(redact_rejection_message(msg), msg);
+        assert_eq!(
+            redact_rejection_message(r#"unknown variant "x", expected `a` or `b`"#),
+            r#"unknown variant "…", expected `a` or `b`"#
+        );
+    }
+
+    #[test]
+    fn test_redact_rejection_message_truncates_on_char_boundary() {
+        let out = redact_rejection_message(&"é".repeat(500));
+        assert_eq!(out.chars().count(), MAX_REJECTION_LOG_CHARS + 1);
+        assert!(out.ends_with('…'));
+        let exact = "é".repeat(MAX_REJECTION_LOG_CHARS);
+        assert_eq!(redact_rejection_message(&exact), exact);
+    }
 
     // ── Paid-AI flag gates tool registration ─────────────────────────────────
 
