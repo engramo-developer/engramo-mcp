@@ -1510,18 +1510,25 @@ impl ServerHandler for EngramoMcpServer {
         params: CallToolRequestParams,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let tool_name = params.name.to_string();
+        // Only registered names are logged verbatim; an unknown name is caller-controlled
+        // (bounded only by the body cap), so log its length instead.
+        let tool_name = if self.tool_router.has_route(&params.name) {
+            params.name.to_string()
+        } else {
+            format!("<unknown len={}>", params.name.len())
+        };
         let result = self
             .tool_router
             .call(ToolCallContext::new(self, params, ctx))
             .await;
-        // Router-level rejections (bad arguments, unknown tool) never reach a handler, so
-        // `err_result` can't log them. Log code + redacted message only — never `data` or args.
-        if let Err(e) = &result {
+        // Router-level rejections never reach a handler, so `err_result` can't log them:
+        // an unknown tool is an `Err`, while rmcp turns argument-deserialization failures into
+        // an `Ok` error result. Log code + redacted message only — never `data` or args.
+        if let Some((code, message)) = router_rejection(&result) {
             warn!(
                 tool = %tool_name,
-                code = e.code.0,
-                error = %redact_rejection_message(&e.message),
+                code,
+                error = %redact_rejection_message(message),
                 "tool call rejected before handler"
             );
         }
@@ -1711,37 +1718,55 @@ fn strip_span_boundary_markers(spans: &mut [crate::dto::RichTextSpan]) {
 
 const MAX_REJECTION_LOG_CHARS: usize = 300;
 
-/// Makes a router rejection message safe to log: serde embeds user-supplied values in
-/// double quotes, so every `"..."` segment (honouring `\"` escapes; an unterminated one runs to
-/// the end) becomes `"…"`. Backtick-quoted field/variant names are kept. Truncated to
-/// `MAX_REJECTION_LOG_CHARS` chars.
+/// Prefix rmcp puts on the error result it builds for arguments that fail to deserialize.
+const ARG_DESER_PREFIX: &str = "failed to deserialize parameters:";
+
+/// The (code, message) of a router-level rejection: an `Err`, or rmcp's `Ok` error result for
+/// bad arguments. Handler errors from `err_result` never carry the prefix, so they don't match.
+fn router_rejection(result: &Result<CallToolResponse, ErrorData>) -> Option<(i32, &str)> {
+    match result {
+        Err(e) => Some((e.code.0, e.message.as_ref())),
+        Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) => r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .filter(|m| m.starts_with(ARG_DESER_PREFIX))
+            .map(|m| (rmcp::model::ErrorCode::INVALID_PARAMS.0, m)),
+        _ => None,
+    }
+}
+
+/// Makes a router rejection message safe to log. serde embeds user-supplied values in double
+/// quotes (strings) and in backticks (unknown variant/field names, numbers, chars) without
+/// escaping backticks, and a caller's value may itself contain `, expected `, so nothing after
+/// the first quote is trustworthy: only the static prefix is kept and the quoted part becomes
+/// `"…"` / `` `…` ``. Exception: serde's ``missing field `name` `` names a field from our static
+/// schema, so a plain identifier there is kept. Truncated to `MAX_REJECTION_LOG_CHARS` chars.
 fn redact_rejection_message(message: &str) -> String {
-    let mut out = String::new();
-    let mut chars = message.chars();
-    while let Some(c) = chars.next() {
-        if c != '"' {
-            out.push(c);
-            continue;
-        }
-        out.push_str("\"…\"");
-        while let Some(q) = chars.next() {
-            match q {
-                '\\' => {
-                    chars.next();
+    let mut out = match message.find(['"', '`']) {
+        Some(i) => {
+            let q = &message[i..i + 1];
+            let name = message[i + 1..].split_once('`').map(|(n, _)| n);
+            match name {
+                Some(n)
+                    if q == "`"
+                        && message[..i].ends_with("missing field ")
+                        && (1..=64).contains(&n.len())
+                        && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+                {
+                    format!("{}`{n}`", &message[..i])
                 }
-                '"' => break,
-                _ => {}
+                _ => format!("{}{q}…{q}", &message[..i]),
             }
         }
+        None => message.to_owned(),
+    };
+    if let Some((idx, _)) = out.char_indices().nth(MAX_REJECTION_LOG_CHARS) {
+        out.truncate(idx);
+        out.push('…');
     }
-    match out.char_indices().nth(MAX_REJECTION_LOG_CHARS) {
-        Some((idx, _)) => {
-            out.truncate(idx);
-            out.push('…');
-            out
-        }
-        None => out,
-    }
+    out
 }
 
 const MAX_SPANS_PER_CONTENT: usize = 1_000;
@@ -2175,28 +2200,134 @@ mod tests {
     #[test]
     fn test_redact_rejection_message_replaces_double_quoted_values() {
         let msg = r#"invalid type: string "Hola amigo", expected a sequence at line 1 column 42"#;
+        assert_eq!(redact_rejection_message(msg), r#"invalid type: string "…""#);
+    }
+
+    #[test]
+    fn test_redact_rejection_message_keeps_missing_field_identifier() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct T {
+            face: String,
+        }
+        let err = serde_json::from_value::<T>(serde_json::json!({})).unwrap_err();
+        let msg = format!("failed to deserialize parameters: {err}");
         assert_eq!(
-            redact_rejection_message(msg),
-            r#"invalid type: string "…", expected a sequence at line 1 column 42"#
+            redact_rejection_message(&msg),
+            "failed to deserialize parameters: missing field `face`"
         );
     }
 
     #[test]
-    fn test_redact_rejection_message_handles_escaped_and_unterminated_quotes() {
+    fn test_redact_rejection_message_missing_field_negatives() {
+        assert_eq!(
+            redact_rejection_message("missing field `a b`"),
+            "missing field `…`"
+        );
+        assert_eq!(
+            redact_rejection_message("missing field `secret-text`"),
+            "missing field `…`"
+        );
+        let long = format!("missing field `{}`", "a".repeat(65));
+        assert_eq!(redact_rejection_message(&long), "missing field `…`");
+        assert_eq!(
+            redact_rejection_message("missing field `face"),
+            "missing field `…`"
+        );
+        assert_eq!(
+            redact_rejection_message("unknown field `face`, expected `x`"),
+            "unknown field `…`"
+        );
+    }
+
+    #[test]
+    fn test_redact_rejection_message_drops_everything_after_first_quote() {
         assert_eq!(
             redact_rejection_message(r#"got "say \"hi\" now" ok and "secret"#),
-            r#"got "…" ok and "…""#
+            r#"got "…""#
+        );
+        assert_eq!(
+            redact_rejection_message("missing field `face` at line 1 column 2"),
+            "missing field `face`"
+        );
+        assert_eq!(redact_rejection_message("plain text"), "plain text");
+        assert_eq!(
+            redact_rejection_message("unknown variant `x`, expected `a` or `b`"),
+            "unknown variant `…`"
         );
     }
 
     #[test]
-    fn test_redact_rejection_message_keeps_backtick_names_and_plain_text() {
-        let msg = "missing field `face` at line 1 column 2";
-        assert_eq!(redact_rejection_message(msg), msg);
-        assert_eq!(
-            redact_rejection_message(r#"unknown variant "x", expected `a` or `b`"#),
-            r#"unknown variant "…", expected `a` or `b`"#
-        );
+    fn test_redact_rejection_message_hides_real_serde_user_values() {
+        let err = serde_json::from_value::<crate::dto::CatalogFilter>(serde_json::json!(
+            "secret pasted card text"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("secret"), "serde format changed: {err}");
+        assert!(!redact_rejection_message(&err).contains("secret"));
+
+        let err = serde_json::from_value::<crate::dto::CatalogFilter>(serde_json::json!(424242))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("424242"), "serde format changed: {err}");
+        assert!(!redact_rejection_message(&err).contains("424242"), "{err}");
+    }
+
+    #[test]
+    fn test_redact_rejection_message_survives_expected_and_backtick_in_value() {
+        let err = serde_json::from_value::<crate::dto::CatalogFilter>(serde_json::json!(
+            "x, expected SECRET"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SECRET"), "serde format changed: {err}");
+        assert!(!redact_rejection_message(&err).contains("SECRET"));
+
+        let err =
+            serde_json::from_value::<crate::dto::CatalogFilter>(serde_json::json!("a`SECRET`b"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("SECRET"), "serde format changed: {err}");
+        assert!(!redact_rejection_message(&err).contains("SECRET"));
+
+        let err = serde_json::from_value::<Vec<String>>(serde_json::json!("a, expected SECRET"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SECRET"), "serde format changed: {err}");
+        assert!(!redact_rejection_message(&err).contains("SECRET"));
+    }
+
+    #[test]
+    fn test_redact_rejection_message_trailing_backslash_and_empty() {
+        assert_eq!(redact_rejection_message(r#"bad "abc\"#), r#"bad "…""#);
+        assert_eq!(redact_rejection_message(r#"bad "\"#), r#"bad "…""#);
+        assert_eq!(redact_rejection_message(""), "");
+    }
+
+    #[test]
+    fn test_router_rejection_covers_err_arg_error_and_handler_error() {
+        let err: Result<CallToolResponse, ErrorData> =
+            Err(ErrorData::invalid_params("tool not found", None));
+        assert_eq!(router_rejection(&err).map(|r| r.1), Some("tool not found"));
+
+        let bad_args: Result<CallToolResponse, ErrorData> =
+            Ok(
+                CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                    "{ARG_DESER_PREFIX} boom"
+                ))])
+                .into(),
+            );
+        let (code, msg) = router_rejection(&bad_args).expect("logged");
+        assert_eq!(code, rmcp::model::ErrorCode::INVALID_PARAMS.0);
+        assert!(msg.starts_with(ARG_DESER_PREFIX));
+
+        let handler_err: Result<CallToolResponse, ErrorData> =
+            Ok(CallToolResult::error(vec![rmcp::model::ContentBlock::text("API said no")]).into());
+        assert!(router_rejection(&handler_err).is_none());
+        let ok: Result<CallToolResponse, ErrorData> =
+            Ok(CallToolResult::success(vec![rmcp::model::ContentBlock::text("fine")]).into());
+        assert!(router_rejection(&ok).is_none());
     }
 
     #[test]

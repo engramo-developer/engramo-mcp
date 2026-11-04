@@ -730,6 +730,70 @@ async fn default_log_filter_never_logs_a_session_id() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn router_rejected_tool_call_is_logged_redacted_and_session_survives() {
+    use tokio::io::AsyncReadExt;
+    const SECRET: &str = "Hola-amigo-SECRET-42";
+    let api = MockServer::start().await;
+    mock_me(&api, 200).await;
+    let mut mcp = McpServer::start_capturing_logs(&api, &[]).await;
+    let client = mcp.connect("engramo_alice").await.expect("initialize");
+
+    // `filter` is an enum: serde rejects the value, quoting it in the message. rmcp reports
+    // argument errors as an error tool result, not a protocol error.
+    let params = CallToolRequestParams::new("list_catalogs")
+        .with_arguments(json!({ "filter": SECRET }).as_object().cloned().unwrap());
+    let res = client.call_tool(params).await.expect("tool result");
+    assert_eq!(res.is_error, Some(true));
+    client
+        .list_all_tools()
+        .await
+        .expect("tools/list after rejection");
+
+    // Unknown tool: a protocol error.
+    client
+        .call_tool(CallToolRequestParams::new("no_such_tool"))
+        .await
+        .expect_err("unknown tool must be rejected");
+
+    client.cancel().await.unwrap();
+    assert!(mcp.terminate(Duration::from_secs(9)).await.success());
+    let mut logs = String::new();
+    mcp.child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .await
+        .unwrap();
+    mcp.child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .await
+        .unwrap();
+
+    assert!(
+        logs.lines().any(|l| l.contains("tool call rejected before handler")
+            && l.contains("list_catalogs")),
+        "{logs}"
+    );
+    assert!(
+        logs.lines()
+            .any(|l| l.contains("tool call rejected before handler")
+                && l.contains("<unknown len=12>")),
+        "{logs}"
+    );
+    assert!(
+        !logs.contains(SECRET),
+        "argument value leaked into logs:\n{logs}"
+    );
+    let hits = api.received_requests().await.unwrap();
+    assert!(hits.iter().all(|r| r.url.path() == "/me"), "{hits:?}");
+}
+
 #[tokio::test]
 async fn http_mode_refuses_to_start_without_required_config() {
     let (status, stderr) = run_to_exit(&[("ENGRAMO_API_URL", "http://127.0.0.1:1")]).await;
