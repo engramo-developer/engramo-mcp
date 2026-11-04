@@ -314,9 +314,11 @@ in Claude Desktop and the mobile app.
 - [x] `generate_card_audio` mention removed from `upload_media`'s description (pinned by tests). The `create_language_deck` prompt and `engramo://card-schema` mentions were removed on branch `feat/extended-catalog-filters`.
 
 **Claude listing edit after the deploy (S6):**
-1. Re-sync the tools on the listing's Tools tab (expect 35 tools, 7 resources, 5 prompts, no warnings).
+1. Update the tool names on the listing. The portal has no rescan: on Edit → Tools, paste the names one per line, exactly as the server declares them (35 tools, plus the 5 prompt names).
 2. Submit a listing edit for the tool names and the §2.2 description (a reviewer approves it).
 3. Record the date here. Claude has no resubmission; tool changes reach users by deploying the server.
+
+**Submitted 2026-11-04** (prod on 1.3.2): 35 tool names (adds `get_catalog_filter_options`, `get_subscription_usage`, `list_catalog_shares`, `set_catalog_shadowing`, `share_catalog`, `unshare_catalog`), 5 prompt names, and the §2.2 description. **Approved 2026-11-04.**
 
 ---
 
