@@ -516,10 +516,13 @@ plugin ZIP built from [`chatgpt-plugin/`](chatgpt-plugin/): `plugin.json` holds 
 secret). Build it with:
 
 ```bash
-./chatgpt-plugin/build.sh   # → target/engramo-chatgpt-plugin.zip
+SHARE_TARGET_USER_ID=<uuid> ./chatgpt-plugin/build.sh   # → target/engramo-chatgpt-plugin.zip
 ```
 
-The script copies the icon from `mcpb/` and sets `version` from `Cargo.toml`. Upload a new ZIP (**Plugins →
+The script copies the icon from `mcpb/`, sets `version` from `Cargo.toml`, and fills the share-target account's
+user id into review test case 5 (`{{SHARE_TARGET_USER_ID}}`, kept out of git). `plugin.json` also carries the
+review metadata the portal imports read-only: 5 positive and 3 negative test cases, the demo video URL and the
+release notes (`extensions.com.openai.review` and `.publication`). Upload a new ZIP (**Plugins →
 EngrAmo → Upload new version**) only when the listing metadata changes; tool and server changes are picked up
 by **Rescan**. The domain-verification token served at `/.well-known/openai-apps-challenge` comes from the
 portal and is set as the `_OPENAI_APPS_CHALLENGE` substitution on the prod Cloud Build trigger, not in this repo.

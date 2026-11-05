@@ -12,13 +12,20 @@ out="$root/target/engramo-chatgpt-plugin.zip"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n1)"
 [ -n "$version" ] || { echo "version not found in Cargo.toml" >&2; exit 1; }
 
+# Test case P6 shares a deck with a dedicated review account. Its user id is kept
+# out of git and filled into plugin.json's {{SHARE_TARGET_USER_ID}} at build time.
+share_target="${SHARE_TARGET_USER_ID:-}"
+[[ "$share_target" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+  || { echo "set SHARE_TARGET_USER_ID to the share-target account's user id (UUID)" >&2; exit 1; }
+
 rm -rf "$stage" "$out"
 mkdir -p "$stage/assets"
 cp "$src/mcp.json" "$stage/"
 cp "$root/mcpb/icon.png" "$stage/assets/icon.png"
-VERSION="$version" python3 - "$src/plugin.json" "$stage/plugin.json" <<'PY'
+VERSION="$version" SHARE_TARGET="$share_target" python3 - "$src/plugin.json" "$stage/plugin.json" <<'PY'
 import json, os, sys
-manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+raw = open(sys.argv[1], encoding="utf-8").read()
+manifest = json.loads(raw.replace("{{SHARE_TARGET_USER_ID}}", os.environ["SHARE_TARGET"]))
 manifest["version"] = os.environ["VERSION"]
 with open(sys.argv[2], "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=2, ensure_ascii=False)

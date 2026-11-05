@@ -241,39 +241,32 @@ About 2–3 minutes, recorded on prod with the reviewer account:
 
 ## 5a. ChatGPT submission record
 
-**Submitted 2026-10-17** at platform.openai.com/plugins (EngrAmo org). Portal submission version 1.0.0,
-server v1.2.12. Status: **to be cancelled and resubmitted with the 35-tool set after the 1.2.x deploy** (decision 2026-10-31; OpenAI allows one active review per plugin, so the user cancels it in the portal first). The record below describes the original submission.
+**Resubmitted 2026-11-05** at platform.openai.com/plugins (EngrAmo org), after the 2026-11-02 rejection. Plugin
+ZIP 1.3.3, server v1.3.3, 35 tools. Status: **in review**. The first submission (2026-10-17, ZIP 1.0.0, server
+v1.2.12) was rejected on 2026-11-02 over tool annotations (see §3).
 
 | Step | State |
 |---|---|
 | Domain verification | Verified. Token served at `/.well-known/openai-apps-challenge`, set from the prod Cloud Build trigger substitution `_OPENAI_APPS_CHALLENGE` (never in a repo) |
 | OAuth | Authorized (DCR) with the reviewer account |
-| Tool scan | Clean on v1.2.12. Earlier scan flagged `openWorldHint` on three visibility-setting tools; fixed in engramo-mcp #106 |
-| Countries and translations, reviewer credentials | Filled in the portal (password not recorded here) |
-| Test cases | P1–P5 from §4.1 (original submission; resubmission uses P1, P2, P7, P10, P6) |
-| Negative test cases | C1–C3 from §4.2 (resubmission: C1, C3, C5) |
-| Video | https://youtu.be/Bmlu6QrCkjQ |
+| Tool scan | v1.3.3: no blocking findings. Every tool carries the non-blocking "new tool definition needs further review" finding, explained in the Additional Submission Context note (annotation rule from §3). Earlier: v1.2.12 scan flagged `openWorldHint` on three visibility-setting tools, fixed in engramo-mcp #106 |
+| Countries and translations, reviewer credentials | Filled in the portal: all supported countries, no translations, username and password for `mcp-review@engramo.app` (password not recorded here) |
+| Test cases | P1, P2, P7, P10, P6 from §4.1. Imported read-only from `plugin.json` (`extensions.com.openai.review.test_cases`); P6's share-target user id is filled in by `build.sh` from `SHARE_TARGET_USER_ID`. First submission: P1–P5 |
+| Negative test cases | C1, C3, C5 from §4.2, imported from `plugin.json`. First submission: C1–C3 |
+| Video | https://youtu.be/Bmlu6QrCkjQ (recorded 2026-10-17, reused; covers P1, P2, N1, N2 but not P7, P10, P6). Imported from `review.demo_recording_url` |
+| Additional Submission Context | Note explaining the non-blocking findings, the openWorldHint/destructiveHint rules, no purchases, and the test account |
 | Attestations | All six ticked after checking the Terms (min. age 13, under-18s need guardian consent, obscene content prohibited) and Privacy (not directed to under-13s; OpenAI listed as a processor for the user-initiated ChatGPT integration) |
 
-**Release notes (shown to users):**
+**Release notes (shown to users):** `publication.release_notes` in `chatgpt-plugin/plugin.json`.
 
-> First release of EngrAmo for ChatGPT.
->
-> - Create flashcard decks from any topic, article or notes, written by ChatGPT, with bold or highlighted key phrases and word-by-word dictionaries for language cards.
-> - See which cards are due today and get quizzed on them in the chat.
-> - Search your decks and public decks, edit or move cards, and delete what you no longer need.
-> - Add decks to your learning queue and organise them into learning paths you can activate or pause.
->
-> Sign in with your EngrAmo account. You can disconnect at any time from Settings → Connected apps in the EngrAmo app.
-
-**Resubmission steps (after the release is deployed and `tools/list` returns 35 tools):**
+**Resubmission steps (done 2026-11-05):**
 1. Cancel the active review in the OpenAI portal.
 2. Seed reviewer data and the share-target account (see `docs/directory-resubmission-readiness.md`).
-3. Rebuild the ZIP from `chatgpt-plugin/` (`build.sh`) with the updated description and 20 capabilities.
+3. Rebuild the ZIP from `chatgpt-plugin/` (`SHARE_TARGET_USER_ID=<uuid> build.sh`) with the updated description and 20 capabilities.
 4. Re-run the tool scan, then submit 5 positive (P1, P2, P7, P10, P6) and 3 negative (C1, C3, C5) cases from §4, with per-tool annotation justifications from §3.
 5. Update the release notes to cover filters, sharing, plan usage, shadowing and covers.
 
-**While in review (original submission; no longer applies once cancelled):** keep the reviewer account, its ChatGPT connection and the seeded data intact; don't
+**While in review:** keep the reviewer account, its ChatGPT connection and the seeded data intact; don't
 ship tool name/annotation/description changes to prod; don't upload a new ZIP unless asked.
 
 **Policy gaps — closed 2026-11-03** (engramo-landing PRs #40, #41; both pages "Last updated: November 3, 2026"):
