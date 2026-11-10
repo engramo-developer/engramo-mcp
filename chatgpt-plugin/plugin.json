@@ -57,6 +57,61 @@
         ],
         "logo": "./assets/icon.png",
         "composerIcon": "./assets/icon.png"
+      },
+      "review": {
+        "test_cases": {
+          "positive": [
+            {
+              "description": "Create a new deck from a topic and start learning it. ChatGPT writes the cards itself; the plugin stores them.",
+              "prompt": "Create a flashcard deck with 10 Spanish phrases for ordering food in a restaurant, and add it to my learning.",
+              "tools_triggered": "generate_catalog_with_cards, add_catalog_to_learning",
+              "expected_behavior": "A new catalog with 10 cards (Spanish on the front, English on the back) is created in the reviewer's EngrAmo account and added to learning, so its cards become due. ChatGPT confirms the catalog name and card count."
+            },
+            {
+              "description": "Review due cards in the chat (spaced-repetition review).",
+              "prompt": "Which of my flashcards are due for review today? Quiz me on three of them.",
+              "tools_triggered": "get_due_cards",
+              "expected_behavior": "ChatGPT lists the cards due today from the two seeded Spanish catalogs, then quizzes the reviewer on three of them, one at a time."
+            },
+            {
+              "description": "Discover public decks by language and level.",
+              "prompt": "Find public Spanish catalogs for beginners with English translations.",
+              "tools_triggered": "get_catalog_filter_options, list_catalogs",
+              "expected_behavior": "ChatGPT calls list_catalogs with front_languages [\"es\"], back_languages [\"en\"], levels [\"beginner\"] and filter \"public\", and shows at least one public catalog with its name and card count."
+            },
+            {
+              "description": "Check the current plan, limits and usage.",
+              "prompt": "What plan am I on and how many catalogs can I still create?",
+              "tools_triggered": "get_subscription_usage",
+              "expected_behavior": "ChatGPT reports the plan name, catalogs used and remaining against the limit, and when the limit resets. No purchase or upgrade link is shown; plans are not sold in the app."
+            },
+            {
+              "description": "Share a deck with another EngrAmo user by their user id, then list its collaborators. The target user id belongs to a dedicated review account.",
+              "prompt": "Share my Spanish travel deck with user {{SHARE_TARGET_USER_ID}} as a viewer, then show who it's shared with.",
+              "tools_triggered": "share_catalog, list_catalog_shares",
+              "expected_behavior": "The Spanish travel catalog is shared with that user id as a viewer, and the collaborators list shows the id with the viewer level (user ids only, never emails). To reset, ask ChatGPT to unshare it (unshare_catalog)."
+            }
+          ],
+          "negative": [
+            {
+              "description": "General language-study question with no request to save or review cards. ChatGPT should answer directly.",
+              "prompt": "What's the difference between ser and estar in Spanish? Give me a few examples."
+            },
+            {
+              "description": "Flashcards for a different app (a CSV export for Anki), not an EngrAmo deck. ChatGPT should write the CSV in the chat.",
+              "prompt": "Make me a list of 10 French vocabulary words in CSV format so I can import them into Anki."
+            },
+            {
+              "description": "A question about a ChatGPT plan, not the user's EngrAmo plan. Must not trigger get_subscription_usage.",
+              "prompt": "What's included in ChatGPT Plus?"
+            }
+          ]
+        },
+        "demo_recording_url": "https://youtu.be/Bmlu6QrCkjQ",
+        "commerce": false
+      },
+      "publication": {
+        "release_notes": "EngrAmo for ChatGPT.\n\n- Create flashcard decks from any topic, article or notes, written by ChatGPT, with bold or highlighted key phrases and word-by-word dictionaries for language cards.\n- See which cards are due today and get quizzed on them in the chat.\n- Find decks by language, topic and level, including public decks.\n- Share a deck with other EngrAmo users by their user id.\n- See your plan limits and usage.\n- Turn on shadowing (speaking practice) for a deck and set a deck's cover image.\n- Edit or move cards, organise decks into learning paths, and delete what you no longer need.\n\nSign in with your EngrAmo account. You can disconnect at any time from Settings → Connected apps in the EngrAmo app."
       }
     }
   }
