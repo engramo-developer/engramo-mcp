@@ -22,10 +22,10 @@ on:
         type: string
         required: false
 
-# This workflow holds NPM_TOKEN and publishes signed artifacts, so every job
+# This workflow publishes `@engramo/mcp` and signed artifacts, so every job
 # starts from the minimum and opts in to what it needs. Third-party actions are
-# pinned to a commit SHA: a mutable tag in a job with the publish token is a
-# direct path to a supply-chain compromise of `@engramo/mcp`.
+# pinned to a commit SHA: a mutable tag in a job that can publish is a direct
+# path to a supply-chain compromise of `@engramo/mcp`.
 permissions:
   contents: read
 
@@ -181,7 +181,7 @@ jobs:
   #   server/linux/engramo-mcp-x64, server/linux/engramo-mcp-arm64
   # Runs on macOS for `lipo`, and holds no secrets or write permissions
   # (attestation is a separate job): the packer comes from npm (installed from a committed
-  # lockfile), so it never shares a job with NPM_TOKEN.
+  # lockfile), so it never shares a job that can publish to npm.
   mcpb:
     name: Claude Desktop extension (.mcpb)
     needs: [build, resolve]
@@ -355,15 +355,20 @@ jobs:
             engramo.mcpb
             engramo.mcpb.sha256
 
+  # Publishes via npm trusted publishing (OIDC): there is no npm token. Each
+  # @engramo/mcp* package on npmjs.com trusts this repo, release.yml AND the
+  # `npm` environment. The environment binding matters: mcpb-attest also has
+  # id-token: write, and without it that job's OIDC token would be accepted too.
   npm-publish:
     name: Publish to npm
     needs: [build, resolve, mcpb, mcpb-attest]
     runs-on: ubuntu-latest
+    environment: npm
     permissions:
       contents: read
-      # Required by `npm publish --provenance`: npm exchanges this for a signed
-      # attestation tying each published tarball to this workflow run. Harmless
-      # to keep on a dry run, where --provenance isn't passed.
+      # The publish credential: npm exchanges this OIDC token for a short-lived
+      # publish token (trusted publishing) and for the signed provenance
+      # attestation tying each tarball to this workflow run.
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -383,14 +388,28 @@ jobs:
           done
           ls -l engramo-mcp-linux-x64 engramo-mcp-linux-arm64 engramo-mcp-darwin-arm64 engramo-mcp-darwin-x64 engramo-mcp-win32-x64.exe
 
+      # No registry-url: it would write an .npmrc expecting NODE_AUTH_TOKEN.
+      # Without one npm uses registry.npmjs.org and authenticates via OIDC.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24'
+
+      # Trusted publishing needs npm >= 11.5.1. Node 24 bundles a new enough
+      # npm; fail fast here rather than with an opaque 404/401 mid-publish.
+      - name: Check npm supports trusted publishing
+        run: |
+          npm_version=$(npm --version)
+          echo "npm $npm_version"
+          node -e "
+            const [a, b, c] = '$npm_version'.split('.').map(Number);
+            if (a < 11 || (a === 11 && (b < 5 || (b === 5 && c < 1)))) {
+              console.error('::error::npm $npm_version is too old for trusted publishing (need >= 11.5.1)');
+              process.exit(1);
+            }
+          "
 
       - name: Publish platform packages
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
           DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
         run: |
@@ -440,7 +459,6 @@ jobs:
 
       - name: Publish main package
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
           DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
         run: |
@@ -471,8 +489,8 @@ jobs:
   # release (needs the real .mcpb asset + its checksum) and the npm packages
   # (the registry checks package.json's mcpName against the just-published
   # version) exist. Skipped on dry runs. Its only secret is the DNS-auth
-  # private key in the protected `mcp-registry` environment; NPM_TOKEN is never
-  # exposed here.
+  # private key in the protected `mcp-registry` environment; it can't publish
+  # to npm (no id-token, and npm only trusts the `npm` environment).
   mcp-registry:
     name: Publish to MCP Registry
     needs: [resolve, github-release, npm-publish]

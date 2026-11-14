@@ -24,7 +24,7 @@ Reference: https://github.com/modelcontextprotocol/registry/blob/main/docs/model
 2. Add the printed TXT record on the **apex** of `engramo.app` (not under a selector such as `_mcp-auth`).
    Wait for propagation.
 3. Create the GitHub environment `mcp-registry` (Settings > Environments), restrict deployment to tags
-   (`v*`), and add one secret, `MCP_REGISTRY_PRIVATE_KEY`, holding `$PRIVATE_KEY` (hex). Do not add `NPM_TOKEN`.
+   (`v*`), and add one secret, `MCP_REGISTRY_PRIVATE_KEY`, holding `$PRIVATE_KEY` (hex).
 4. Delete `key.pem` locally or keep it in a password manager.
 
 The workflow logs in with

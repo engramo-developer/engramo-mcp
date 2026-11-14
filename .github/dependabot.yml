@@ -14,7 +14,7 @@ updates:
           - minor
           - patch
 
-  # Actions are pinned to commit SHAs (release.yml holds NPM_TOKEN), so this is
+  # Actions are pinned to commit SHAs (release.yml publishes to npm), so this is
   # the only thing that keeps those pins current — Dependabot rewrites the SHA
   # and updates the trailing version comment. One grouped PR per run keeps the
   # queue from filling with a PR per action.
