@@ -5,10 +5,14 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/engramo-developer/engramo-mcp"
+    "url": "git+https://github.com/engramo-developer/engramo-mcp.git"
   },
-  "os": ["darwin"],
-  "cpu": ["x64"],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "files": [
     "engramo-mcp",
     "THIRD_PARTY_LICENSES"
