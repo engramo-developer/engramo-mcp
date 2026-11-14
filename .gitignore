@@ -3,3 +3,4 @@ target
 npm/platforms/*/engramo-mcp
 .claude/.review-cache/
 mcpb/tools/node_modules/
+.DS_Store
