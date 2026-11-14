@@ -14,9 +14,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/**'
+      - '.github/scripts/**'
       - '.github/dependabot.yml'
       - 'docs/**'
       - 'mcpb/**'
+      - 'npm/**'
       - '**.md'
   pull_request:
     branches: [main]
@@ -26,9 +28,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/**'
+      - '.github/scripts/**'
       - '.github/dependabot.yml'
       - 'docs/**'
       - 'mcpb/**'
+      - 'npm/**'
       - '**.md'
   # Advisories land without anyone pushing, so audit on a timer too.
   schedule:
