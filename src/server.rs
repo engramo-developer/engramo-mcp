@@ -200,7 +200,7 @@ impl EngramoMcpServer {
             open_world_hint = false
         ),
         description = "Get the user's EngrAmo account: their userId, current plan (id, name, \
-        dates, with datesPlanId naming the plan those dates belong to, any pending/lapsed/deactivated plan, unlocked features) and, for every limit, \
+        start/expiry dates when available, unlocked features) and, for every limit, \
         used / limit / remaining, whether it is unlimited or not included in the plan, its window \
         ('absolute' = lifetime, never resets; 'monthly') and when it resets (UTC), plus daily and \
         hourly sub-limits. Call this when the user asks about their plan, limits or usage, and \
@@ -1084,7 +1084,9 @@ impl EngramoMcpServer {
         ),
         description = "Add a catalog to a learning path so its cards become part of the path. \
         Idempotent: adding a catalog that is already in the path succeeds (no error). A missing \
-        path or catalog returns Not found."
+        path or catalog returns Not found. The path must be inactive: if its `isActive` is true the \
+        call fails with a Conflict-style error that retrying will not fix — call \
+        deactivate_learning_path first, then this tool, then activate_learning_path."
     )]
     pub async fn add_catalog_to_learning_path(
         &self,
@@ -1106,7 +1108,8 @@ impl EngramoMcpServer {
             {
                 Ok(()) => ok_text("Catalog added to learning path."),
                 Err(e) => {
-                    err_result(disambiguate_catalog_forbidden(&self.client, catalog_id, e).await)
+                    let e = disambiguate_catalog_forbidden(&self.client, catalog_id, e).await;
+                    err_result(explain_active_path_lock(e, "add_catalog_to_learning_path"))
                 }
             },
         )
@@ -1123,7 +1126,9 @@ impl EngramoMcpServer {
         ),
         description = "Remove a catalog from a learning path. Idempotent: removing a catalog \
         that is not in the path succeeds (with a hint) instead of erroring, so a retried remove \
-        is safe. A missing path returns Not found."
+        is safe. A missing path returns Not found. The path must be inactive: if its `isActive` is \
+        true the call fails with a Conflict-style error that retrying will not fix — call \
+        deactivate_learning_path first, then this tool, then activate_learning_path."
     )]
     pub async fn remove_catalog_from_learning_path(
         &self,
@@ -1164,7 +1169,10 @@ impl EngramoMcpServer {
                         _ => err_result(ApiError::NotFound(msg)),
                     }
                 }
-                Err(e) => err_result(e),
+                Err(e) => err_result(explain_active_path_lock(
+                    e,
+                    "remove_catalog_from_learning_path",
+                )),
             },
         )
     }
@@ -1230,6 +1238,21 @@ async fn disambiguate_catalog_forbidden(
             ApiError::NotFound(format!("catalog {catalog_id} does not exist"))
         }
         _ => original,
+    }
+}
+
+/// The backend answers 409 on the add/remove-catalog routes only when the path's content is
+/// locked by an active subscriber (the owner, for their own active path) — not an optimistic
+/// version conflict, so the generic "fetch the latest version and retry" text would send agents
+/// into a retry loop (#149). Any other error passes through unchanged.
+fn explain_active_path_lock(e: ApiError, tool: &str) -> String {
+    match e {
+        ApiError::Conflict(_) => format!(
+            "Conflict: learning path is active, so its catalogs can't be changed. Call \
+             deactivate_learning_path, then {tool}, then activate_learning_path to restore it. \
+             Do not retry without deactivating first."
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -4395,6 +4418,77 @@ mod tests {
             assert!(
                 !text.contains("Permission denied"),
                 "{probe_status}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_learning_path_catalog_tool_descriptions_require_inactive_path() {
+        let server = EngramoMcpServer::new(EngramoClient::new("http://unused", "t"), false);
+        for name in [
+            "add_catalog_to_learning_path",
+            "remove_catalog_from_learning_path",
+        ] {
+            let tool = server
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(desc.contains("deactivate_learning_path"), "{name}: {desc}");
+            assert!(
+                desc.contains("then activate_learning_path"),
+                "{name}: {desc}"
+            );
+        }
+    }
+
+    /// #149: a 409 on the add/remove-catalog routes means "active path is locked", not a
+    /// version conflict — the message must say so and must not tell agents to retry.
+    #[tokio::test]
+    async fn test_add_remove_catalog_409_explains_active_path_lock() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        for m in ["POST", "DELETE"] {
+            Mock::given(method(m))
+                .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                    "error": "Learning path x has subscribers and its content cannot be modified"
+                })))
+                .mount(&mock_server)
+                .await;
+        }
+        let server =
+            EngramoMcpServer::new(EngramoClient::new(mock_server.uri(), "engramo_test"), false);
+        let id = "00000000-0000-0000-0000-000000000001".to_string();
+
+        let add = server
+            .add_catalog_to_learning_path(Parameters(AddCatalogToLearningPathParams {
+                path_id: id.clone(),
+                catalog_id: id.clone(),
+            }))
+            .await
+            .unwrap();
+        let remove = server
+            .remove_catalog_from_learning_path(Parameters(RemoveCatalogFromLearningPathParams {
+                path_id: id.clone(),
+                catalog_id: id,
+            }))
+            .await
+            .unwrap();
+        for (result, tool) in [
+            (add, "add_catalog_to_learning_path"),
+            (remove, "remove_catalog_from_learning_path"),
+        ] {
+            assert!(result.is_error.unwrap_or(false), "{result:?}");
+            let text = first_text(&result);
+            assert!(text.contains("deactivate_learning_path"), "{text}");
+            assert!(text.contains(tool), "{text}");
+            assert!(
+                !text.contains("Fetch the latest version and retry"),
+                "{text}"
             );
         }
     }
