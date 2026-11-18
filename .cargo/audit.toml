@@ -1,0 +1,8 @@
+# cargo-audit config, read by `cargo audit` in CI (ci.yml) and at release time.
+[advisories]
+ignore = [
+    # chrono is unmaintained (informational, not a vulnerability; no patched release).
+    # It can't be dropped: rmcp and schemars depend on it, not just this crate.
+    # Revisit when they move to jiff/time.
+    "RUSTSEC-2026-0543",
+]
