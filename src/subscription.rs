@@ -86,14 +86,12 @@ pub struct SubscriptionUsageView {
 pub struct PlanView {
     pub id: String,
     pub name: String,
-    /// The plan `startsAt`/`expiresAt` describe: the pending/lapsed/deactivated plan when one
-    /// is set, else the effective plan (`id`).
-    pub dates_plan_id: String,
-    pub starts_at: String,
+    /// Current plan's dates; omitted while a pending/lapsed/deactivated plan is set, because
+    /// the API's dates then describe that other plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
-    pub pending_plan_id: Option<String>,
-    pub lapsed_plan_id: Option<String>,
-    pub deactivated_plan_id: Option<String>,
     pub features: Vec<String>,
 }
 
@@ -178,21 +176,14 @@ impl From<UsageEntryDto> for UsageView {
 
 impl From<UserSubscriptionDto> for PlanView {
     fn from(s: UserSubscriptionDto) -> Self {
-        let dates_plan_id = s
-            .pending_plan_id
-            .clone()
-            .or_else(|| s.lapsed_plan_id.clone())
-            .or_else(|| s.deactivated_plan_id.clone())
-            .unwrap_or_else(|| s.plan_id.clone());
+        let dates_are_ours = s.pending_plan_id.is_none()
+            && s.lapsed_plan_id.is_none()
+            && s.deactivated_plan_id.is_none();
         Self {
-            dates_plan_id,
             id: s.plan_id,
             name: s.plan_name,
-            starts_at: s.starts_at,
-            expires_at: s.expires_at,
-            pending_plan_id: s.pending_plan_id,
-            lapsed_plan_id: s.lapsed_plan_id,
-            deactivated_plan_id: s.deactivated_plan_id,
+            starts_at: dates_are_ours.then_some(s.starts_at),
+            expires_at: s.expires_at.filter(|_| dates_are_ours),
             features: s.features,
         }
     }
@@ -336,9 +327,8 @@ mod tests {
         assert_eq!(
             v["plan"],
             json!({
-                "id": "free", "name": "Free", "datesPlanId": "free",
-                "startsAt": "2026-01-01T00:00:00Z", "expiresAt": null,
-                "pendingPlanId": null, "lapsedPlanId": null, "deactivatedPlanId": null,
+                "id": "free", "name": "Free",
+                "startsAt": "2026-01-01T00:00:00Z",
                 "features": ["api_token_create"]
             })
         );
@@ -483,34 +473,47 @@ mod tests {
         s["deactivatedPlanId"] = "payg".into();
         let dto: UserSubscriptionDto = serde_json::from_value(s).unwrap();
         let p = serde_json::to_value(PlanView::from(dto)).unwrap();
-        assert_eq!(
-            (
-                p["pendingPlanId"].as_str(),
-                p["lapsedPlanId"].as_str(),
-                p["deactivatedPlanId"].as_str()
-            ),
-            (Some("basic"), Some("professional"), Some("payg"))
-        );
         assert_eq!(p["id"], "free");
-        assert_eq!(p["datesPlanId"], "basic", "pending plan owns the dates");
+        for k in [
+            "datesPlanId",
+            "pendingPlanId",
+            "lapsedPlanId",
+            "deactivatedPlanId",
+            "startsAt",
+            "expiresAt",
+        ] {
+            assert!(p.get(k).is_none(), "{k} must be absent");
+        }
     }
 
     #[test]
-    fn test_plan_view_dates_plan_id_precedence() {
+    fn test_plan_view_dates_only_without_alternate_plan() {
         let plan = |pending: Option<&str>, lapsed: Option<&str>, deact: Option<&str>| {
             let mut s = fixtures::subscription();
+            s["expiresAt"] = "2027-01-01T00:00:00Z".into();
             s["pendingPlanId"] = pending.into();
             s["lapsedPlanId"] = lapsed.into();
             s["deactivatedPlanId"] = deact.into();
             let dto: UserSubscriptionDto = serde_json::from_value(s).unwrap();
-            PlanView::from(dto).dates_plan_id
+            serde_json::to_value(PlanView::from(dto)).unwrap()
         };
-        assert_eq!(plan(None, None, None), "free");
-        assert_eq!(plan(None, Some("basic"), Some("payg")), "basic");
-        assert_eq!(plan(None, None, Some("payg")), "payg");
-        assert_eq!(
-            plan(Some("professional"), Some("basic"), None),
-            "professional"
-        );
+        let p = plan(None, None, None);
+        assert_eq!(p["startsAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(p["expiresAt"], "2027-01-01T00:00:00Z");
+        for p in [
+            plan(Some("basic"), None, None),
+            plan(None, Some("basic"), None),
+            plan(None, None, Some("payg")),
+        ] {
+            assert!(p.get("startsAt").is_none() && p.get("expiresAt").is_none());
+            for k in [
+                "datesPlanId",
+                "pendingPlanId",
+                "lapsedPlanId",
+                "deactivatedPlanId",
+            ] {
+                assert!(p.get(k).is_none());
+            }
+        }
     }
 }
