@@ -13,7 +13,9 @@ Registration: your client sends you to the EngrAmo sign-in page, you sign in wit
 and approve — no API token to paste. There is no sign-up on that page, so create your account in the EngrAmo app
 first. EngrAmo is listed in the [Claude Connectors Directory](https://claude.ai/directory/engramo). Setup guides:
 [Claude](#claude-hosted-connector) and [ChatGPT](#use-in-chatgpt-remote-mcp-over-streamable-http);
-the public docs are at <https://engramo.app/connect/>. You can revoke access any time in the EngrAmo app under
+the public docs are at <https://engramo.app/connect/>. Step-by-step guides for non-technical users (Claude,
+ChatGPT, Gemini, and Claude Desktop / Antigravity with card audio) in English, Spanish, Ukrainian and Russian
+are in [docs/setup](docs/setup/README.md). You can revoke access any time in the EngrAmo app under
 Settings → Connected apps.
 
 ## Set up with your AI assistant
