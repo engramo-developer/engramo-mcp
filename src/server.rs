@@ -663,8 +663,9 @@ impl EngramoMcpServer {
         description = "Update an existing flashcard's face, back, or catalog memberships. \
         Requires the current version for optimistic locking — fetch the card first. \
         Each of `face`/`back` is a per-key patch: omitted fields keep their stored value, \
-        `null` clears a field (audioId, visualId+visualType, dictionary, richText, style), \
-        and a value replaces it. Changing `text` without `richText` drops the stored \
+        `null` clears a field (audioId, visualId+visualType, dictionary, richText, style, youtube), \
+        and a value replaces it. `youtube` is a clip {videoId, startMs, endMs} (see \
+        engramo://card-schema); it cannot be combined with visualId. Changing `text` without `richText` drops the stored \
         formatting. visualId and visualType must be sent together (both set, or both null). \
         `catalog_ids` REPLACES the memberships you can see, so build it from the \
         `catalogs[].id` values in `get_card` or `list_cards`'s response (which lists only \
@@ -689,9 +690,11 @@ impl EngramoMcpServer {
             Ok(ids) => ids,
             Err(e) => return Ok(err_result(e)),
         };
-        for patch in [&mut p.face, &mut p.back].into_iter().flatten() {
-            if let Err(e) = prepare_card_patch(patch) {
-                return Ok(err_result(e));
+        for (side, patch) in [("face", &mut p.face), ("back", &mut p.back)] {
+            if let Some(patch) = patch
+                && let Err(e) = prepare_card_patch(patch)
+            {
+                return Ok(err_result(format!("{side}: {e}")));
             }
         }
         debug!(
@@ -1807,6 +1810,7 @@ fn prepare_card_patch(patch: &mut crate::dto::CardContentPatch) -> Result<(), St
     // Unmodeled keys (stale client copies, model-invented fields) are never forwarded upstream.
     patch.unknown.clear();
     patch.check_visual_pair()?;
+    patch.check_youtube()?;
     let spans_sent = matches!(patch.rich_text, Some(Some(_)));
     let spans_sent_empty = matches!(&patch.rich_text, Some(Some(v)) if v.is_empty());
     let style_sent = matches!(patch.style, Some(Some(_)));
@@ -1818,6 +1822,8 @@ fn prepare_card_patch(patch: &mut crate::dto::CardContentPatch) -> Result<(), St
         audio_id: patch.audio_id.clone().flatten(),
         visual_id: patch.visual_id.clone().flatten(),
         visual_type: None,
+        youtube: None,
+        youtube_status: None,
     };
     check_card_content(&content)?;
     normalize_card_content(&mut content);
@@ -1840,6 +1846,21 @@ fn prepare_card_patch(patch: &mut crate::dto::CardContentPatch) -> Result<(), St
     }
     if style_sent {
         patch.style = Some(content.style);
+    }
+    Ok(())
+}
+
+/// Client-side check of a new card's `youtube` clips (the API's rules), naming the card.
+/// `label` is e.g. `cards[3]` (generate_cards / with-cards) or `card` (generate_card).
+fn check_card_youtube(
+    label: &str,
+    face: &crate::dto::CardContent,
+    back: &crate::dto::CardContent,
+) -> Result<(), String> {
+    for (side, content) in [("face", face), ("back", back)] {
+        content
+            .check_youtube()
+            .map_err(|e| format!("{label} {side}: {e}"))?;
     }
     Ok(())
 }
@@ -1919,6 +1940,8 @@ fn sanitize_styles(content: &mut crate::dto::CardContent) {
 }
 
 fn normalize_card_content(content: &mut crate::dto::CardContent) {
+    // `youtubeStatus` is response-only: never forward a client-supplied value on a write.
+    content.youtube_status = None;
     // Save sanitized original text as a validation anchor. An empty anchor means the LLM
     // omitted `text`, so skip validation and derive from spans (backward-compatible path).
     let anchor = sanitize_text(&content.text).trim().to_owned();
@@ -1993,6 +2016,9 @@ impl EngramoMcpServer {
             if let Err(e) = check_card_content(content) {
                 return Ok(err_result(e));
             }
+        }
+        if let Err(e) = check_card_youtube("card", &p.face, &p.back) {
+            return Ok(err_result(e));
         }
         normalize_card_content(&mut p.face);
         normalize_card_content(&mut p.back);
@@ -2074,11 +2100,14 @@ impl EngramoMcpServer {
             Err(e) => return Ok(err_result(e)),
         };
         let has_filters = class.any();
-        for card in &p.cards {
+        for (i, card) in p.cards.iter().enumerate() {
             for content in [&card.face, &card.back] {
                 if let Err(e) = check_card_content(content) {
                     return Ok(err_result(e));
                 }
+            }
+            if let Err(e) = check_card_youtube(&format!("cards[{i}]"), &card.face, &card.back) {
+                return Ok(err_result(e));
             }
         }
         for card in &mut p.cards {
@@ -2156,11 +2185,14 @@ impl EngramoMcpServer {
             Ok(id) => id,
             Err(e) => return Ok(err_result(e)),
         };
-        for card in &p.cards {
+        for (i, card) in p.cards.iter().enumerate() {
             for content in [&card.face, &card.back] {
                 if let Err(e) = check_card_content(content) {
                     return Ok(err_result(e));
                 }
+            }
+            if let Err(e) = check_card_youtube(&format!("cards[{i}]"), &card.face, &card.back) {
+                return Ok(err_result(e));
             }
         }
         for card in &mut p.cards {
@@ -3157,6 +3189,113 @@ mod tests {
         assert!(result.is_error.unwrap_or(false));
         assert!(first_text(&result).contains("INVALID_VISUAL"), "{result:?}");
         assert_eq!(mock_server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_card_patch_youtube_set_null_and_omitted() {
+        let clip = serde_json::json!({"videoId": "M7lc1UVf-VE", "startMs": 1000, "endMs": 4000});
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID, "face": {"youtube": clip},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(body["face"]["youtube"], clip);
+
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID, "face": {"youtube": null},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert!(body["face"].as_object().unwrap().contains_key("youtube"));
+        assert!(body["face"]["youtube"].is_null());
+
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID, "face": {"text": "hola"},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert!(!body["face"].as_object().unwrap().contains_key("youtube"));
+    }
+
+    #[tokio::test]
+    async fn test_update_card_rejects_bad_youtube_patch_without_http_call() {
+        let bad = [
+            serde_json::json!({"videoId": "short", "startMs": 0, "endMs": 1000}),
+            serde_json::json!({"videoId": "M7lc1UVf-VE", "startMs": 2000, "endMs": 2000}),
+            serde_json::json!({"videoId": "M7lc1UVf-VE", "startMs": 0, "endMs": 100}),
+            serde_json::json!({"videoId": "M7lc1UVf-VE", "startMs": 0, "endMs": 30_001}),
+        ];
+        for clip in bad {
+            let (_, is_err, n) = patch_body_for(serde_json::json!({
+                "card_id": CARD_ID, "back": {"youtube": clip},
+                "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+            }))
+            .await;
+            assert!(is_err, "{clip}");
+            assert_eq!(n, 0, "{clip}");
+        }
+        let (_, is_err, n) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {
+                "youtube": {"videoId": "M7lc1UVf-VE", "startMs": 0, "endMs": 1000},
+                "visualId": CARD_ID, "visualType": "image"
+            },
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(is_err);
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_card_youtube_patch_error_prefix_and_visual_branches() {
+        let clip = serde_json::json!({"videoId": "M7lc1UVf-VE", "startMs": 0, "endMs": 1000});
+        // (a) bad clip on back: error text carries the side prefix.
+        {
+            use wiremock::MockServer;
+            let mock_server = MockServer::start().await;
+            let server = mock_server_for(&mock_server.uri());
+            let p: UpdateCardParams = serde_json::from_value(serde_json::json!({
+                "card_id": CARD_ID,
+                "back": {"youtube": {"videoId": "short", "startMs": 0, "endMs": 1000}},
+                "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+            }))
+            .unwrap();
+            let res = server.update_card(Parameters(p)).await.unwrap();
+            assert!(res.is_error.unwrap_or(false));
+            let text = format!("{res:?}");
+            assert!(text.contains("back: youtube.videoId"), "{text}");
+        }
+        // (c) clip plus explicit null visualId/visualType is allowed and forwards both nulls.
+        let (body, is_err, _) = patch_body_for(serde_json::json!({
+            "card_id": CARD_ID,
+            "face": {"youtube": clip, "visualId": null, "visualType": null},
+            "catalog_ids": [CARD_ID], "order_number": 1, "version": 3
+        }))
+        .await;
+        assert!(!is_err);
+        assert_eq!(body["face"]["youtube"], clip);
+        assert!(body["face"]["visualId"].is_null());
+        assert!(body["face"]["visualType"].is_null());
+        assert!(body["face"].as_object().unwrap().contains_key("visualId"));
+        assert!(body["face"].as_object().unwrap().contains_key("visualType"));
+    }
+
+    #[test]
+    fn test_normalize_card_content_clears_youtube_status() {
+        let mut c = CardContent::plain("hola");
+        c.youtube = Some(crate::dto::YoutubeClip {
+            video_id: "M7lc1UVf-VE".into(),
+            start_ms: 0,
+            end_ms: 1000,
+        });
+        c.youtube_status = Some("ok".into());
+        normalize_card_content(&mut c);
+        assert!(c.youtube_status.is_none());
+        assert!(c.youtube.is_some());
     }
 
     #[tokio::test]
@@ -6595,6 +6734,8 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            youtube: None,
+            youtube_status: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me estoy muriendo de ganas de verte pronto.");
@@ -6624,6 +6765,8 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            youtube: None,
+            youtube_status: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -6647,6 +6790,8 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            youtube: None,
+            youtube_status: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Ella está vistiendo a su hija.");
@@ -6664,6 +6809,8 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            youtube: None,
+            youtube_status: None,
         };
         normalize_card_content(&mut content);
         assert_eq!(content.text, "Me gusta el café.");

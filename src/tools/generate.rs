@@ -260,6 +260,8 @@ mod tests {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            youtube: None,
+            youtube_status: None,
         };
 
         make_server(&server.uri())
@@ -370,6 +372,157 @@ mod tests {
             Some("Ellos están")
         );
         assert_eq!(body["cards"][0]["back"]["text"].as_str(), Some("Theyare"));
+    }
+
+    fn yt_face(video_id: &str, start_ms: i64, end_ms: i64) -> CardContent {
+        let mut c = CardContent::plain("¿Me puede traer la cuenta?");
+        c.youtube = Some(crate::dto::YoutubeClip {
+            video_id: video_id.to_string(),
+            start_ms,
+            end_ms,
+        });
+        c
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_sends_face_youtube() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/catalogs/with-cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "catalog": catalog_dto_json(),
+                "cardsCreated": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let mut face = yt_face("M7lc1UVf-VE", 83_200, 86_900);
+        face.youtube_status = Some("ok".to_string());
+        make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(GenerateCatalogWithCardsParams {
+                name: "Clips".to_string(),
+                cards: vec![CardInputParams {
+                    face,
+                    back: CardContent::plain("The bill, please?"),
+                }],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.url.path() == "/catalogs/with-cards")
+            .expect("POST /catalogs/with-cards not called");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(
+            body["cards"][0]["face"]["youtube"],
+            json!({"videoId": "M7lc1UVf-VE", "startMs": 83200, "endMs": 86900})
+        );
+        // youtubeStatus is response-only: never sent on a write.
+        assert!(body["cards"][0]["face"].get("youtubeStatus").is_none());
+        assert!(body["cards"][0]["back"].get("youtube").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generate_catalog_with_cards_rejects_bad_clip_naming_card_and_side_without_http() {
+        let server = MockServer::start().await;
+        let params = |cards| GenerateCatalogWithCardsParams {
+            name: "Clips".to_string(),
+            cards,
+            ..Default::default()
+        };
+        let ok = || CardInputParams {
+            face: yt_face("M7lc1UVf-VE", 0, 1000),
+            back: CardContent::plain("b"),
+        };
+        let mut bad = ok();
+        bad.back = yt_face("tooshort", 0, 1000);
+        let res = make_server(&server.uri())
+            .generate_catalog_with_cards(Parameters(params(vec![ok(), bad])))
+            .await
+            .unwrap();
+        assert!(res.is_error.unwrap_or(false));
+        let text = format!("{res:?}");
+        assert!(text.contains("cards[1] back"), "{text}");
+        assert!(text.contains("videoId"), "{text}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_cards_existing_catalog_rejects_bad_clip_without_http() {
+        let server = MockServer::start().await;
+        let ok = CardInputParams {
+            face: yt_face("M7lc1UVf-VE", 0, 1000),
+            back: CardContent::plain("b"),
+        };
+        let bad = CardInputParams {
+            face: yt_face("M7lc1UVf-VE", 0, 100),
+            back: CardContent::plain("b"),
+        };
+        let res = make_server(&server.uri())
+            .generate_cards(Parameters(GenerateCardsParams {
+                catalog_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string(),
+                cards: vec![ok, bad],
+            }))
+            .await
+            .unwrap();
+        assert!(res.is_error.unwrap_or(false));
+        let text = format!("{res:?}");
+        assert!(text.contains("cards[1] face"), "{text}");
+        assert!(text.contains("length"), "{text}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_sends_face_youtube_without_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cards"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(card_dto_json()))
+            .mount(&server)
+            .await;
+        let mut face = yt_face("M7lc1UVf-VE", 83_200, 86_900);
+        face.youtube_status = Some("ok".to_string());
+        make_server(&server.uri())
+            .generate_card(Parameters(GenerateCardParams {
+                catalog_id: None,
+                face,
+                back: CardContent::plain("The bill, please?"),
+            }))
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.url.path() == "/cards")
+            .expect("POST /cards not called");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(
+            body["face"]["youtube"],
+            json!({"videoId": "M7lc1UVf-VE", "startMs": 83200, "endMs": 86900})
+        );
+        assert!(body["face"].get("youtubeStatus").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generate_card_rejects_clip_with_visual_without_http() {
+        let server = MockServer::start().await;
+        let mut face = yt_face("M7lc1UVf-VE", 0, 1000);
+        face.visual_id = Some("3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string());
+        face.visual_type = Some(crate::dto::VisualType::Image);
+        let res = make_server(&server.uri())
+            .generate_card(Parameters(GenerateCardParams {
+                catalog_id: None,
+                face,
+                back: CardContent::plain("b"),
+            }))
+            .await
+            .unwrap();
+        assert!(res.is_error.unwrap_or(false));
+        assert!(format!("{res:?}").contains("card face"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
     }
 
     #[tokio::test]

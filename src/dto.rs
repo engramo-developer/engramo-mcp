@@ -533,6 +533,59 @@ pub enum VisualType {
     Video,
 }
 
+/// A YouTube clip played on a card side — mirrors `engram-api`'s `YoutubeClip`.
+/// Times come from real captions (e.g. the `parse_youtube_captions` output); never invent them.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, schemars::JsonSchema)]
+pub struct YoutubeClip {
+    /// The 11-character YouTube video id (letters, digits, `_`, `-`), not the full URL.
+    #[serde(rename = "videoId")]
+    pub video_id: String,
+    /// Clip start in milliseconds from the video start (>= 0, less than `endMs`).
+    #[serde(rename = "startMs")]
+    pub start_ms: i64,
+    /// Clip end in milliseconds. The clip length (`endMs - startMs`) must be 500..=30000.
+    #[serde(rename = "endMs")]
+    pub end_ms: i64,
+}
+
+pub const YOUTUBE_CLIP_MIN_MS: i64 = 500;
+pub const YOUTUBE_CLIP_MAX_MS: i64 = 30_000;
+
+impl YoutubeClip {
+    /// Format-only checks mirroring the API's `YoutubeClip::validate`.
+    pub fn validate(&self) -> Result<(), String> {
+        let id_ok = self.video_id.len() == 11
+            && self
+                .video_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !id_ok {
+            let shown = if self.video_id.len() <= 32 {
+                format!("{:?}", self.video_id)
+            } else {
+                format!("a {}-byte string", self.video_id.len())
+            };
+            return Err(format!(
+                "youtube.videoId must be exactly 11 characters of A-Z, a-z, 0-9, '_' or '-' (got {shown})"
+            ));
+        }
+        if self.start_ms < 0 || self.start_ms >= self.end_ms {
+            return Err(format!(
+                "youtube.startMs must be >= 0 and less than endMs (got startMs={}, endMs={})",
+                self.start_ms, self.end_ms
+            ));
+        }
+        let len = self.end_ms - self.start_ms;
+        if !(YOUTUBE_CLIP_MIN_MS..=YOUTUBE_CLIP_MAX_MS).contains(&len) {
+            return Err(format!(
+                "youtube clip length must be between {YOUTUBE_CLIP_MIN_MS} and \
+                 {YOUTUBE_CLIP_MAX_MS} ms (got {len} ms)"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Card face or back content.
 /// LLMs should use `rich_text` spans for visual emphasis (code → monospace, keywords → bold).
 /// If only `text` is provided, default styles are applied.
@@ -565,9 +618,37 @@ pub struct CardContent {
     /// Required alongside `visual_id` — whether that asset is an image or a video.
     #[serde(rename = "visualType", skip_serializing_if = "Option::is_none")]
     pub visual_type: Option<VisualType>,
+    /// Optional YouTube clip played for this side (language cards: set on the face). Times
+    /// must come from real captions, never invented. Cannot be combined with `visualId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube: Option<YoutubeClip>,
+    /// Response-only availability of the clip's video ("ok" | "unavailable"). Never send it:
+    /// the server clears it before any write.
+    #[serde(
+        rename = "youtubeStatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(skip)]
+    pub youtube_status: Option<String>,
 }
 
+const YOUTUBE_WITH_VISUAL: &str = "a side with a youtube clip cannot also have visualId/visualType";
+
 impl CardContent {
+    /// Validates this side's `youtube` clip (if any) and the no-`visualId` rule. The error
+    /// is unprefixed; callers add the card index / side.
+    pub fn check_youtube(&self) -> Result<(), String> {
+        let Some(clip) = &self.youtube else {
+            return Ok(());
+        };
+        clip.validate()?;
+        if self.visual_id.is_some() || self.visual_type.is_some() {
+            return Err(YOUTUBE_WITH_VISUAL.to_string());
+        }
+        Ok(())
+    }
+
     pub fn plain(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -577,6 +658,8 @@ impl CardContent {
             audio_id: None,
             visual_id: None,
             visual_type: None,
+            youtube: None,
+            youtube_status: None,
         }
     }
 }
@@ -643,6 +726,13 @@ pub struct CardContentPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub visual_type: Option<Option<VisualType>>,
+    /// YouTube clip; `null` removes it. Cannot be combined with `visualId`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub youtube: Option<Option<YoutubeClip>>,
     /// Unmodeled keys (e.g. stale or model-invented fields). Checked and cleared by
     /// `prepare_card_patch`; never forwarded upstream.
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -656,6 +746,19 @@ impl CardContentPatch {
             text: Some(text.into()),
             ..Self::default()
         }
+    }
+
+    /// A set `youtube` clip must be well-formed and the same patch must not also set
+    /// `visualId`/`visualType`. (Conflicts with the *stored* side are checked by the API.)
+    pub fn check_youtube(&self) -> Result<(), String> {
+        if let Some(Some(clip)) = &self.youtube {
+            clip.validate()?;
+            if matches!(self.visual_id, Some(Some(_))) || matches!(self.visual_type, Some(Some(_)))
+            {
+                return Err(YOUTUBE_WITH_VISUAL.to_string());
+            }
+        }
+        Ok(())
     }
 
     /// `visual_id` and `visual_type` must be both omitted, both set, or both `null`.
@@ -1115,6 +1218,151 @@ mod tests {
         assert_eq!(serde_json::to_value(&patch).unwrap(), serde_json::json!({}));
     }
 
+    fn clip(id: &str, start_ms: i64, end_ms: i64) -> YoutubeClip {
+        YoutubeClip {
+            video_id: id.to_string(),
+            start_ms,
+            end_ms,
+        }
+    }
+
+    #[test]
+    fn test_youtube_clip_serde_round_trip_uses_camel_case() {
+        let c: CardContent = serde_json::from_value(serde_json::json!({
+            "text": "hola",
+            "youtube": {"videoId": "M7lc1UVf-VE", "startMs": 83200, "endMs": 86900},
+            "youtubeStatus": "unavailable"
+        }))
+        .unwrap();
+        assert_eq!(c.youtube, Some(clip("M7lc1UVf-VE", 83_200, 86_900)));
+        assert_eq!(c.youtube_status.as_deref(), Some("unavailable"));
+        let v = serde_json::to_value(c.youtube.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"videoId": "M7lc1UVf-VE", "startMs": 83200, "endMs": 86900})
+        );
+        // None is skipped entirely.
+        let plain = serde_json::to_value(CardContent::plain("x")).unwrap();
+        assert!(plain.get("youtube").is_none() && plain.get("youtubeStatus").is_none());
+    }
+
+    #[test]
+    fn test_youtube_clip_validation_rules() {
+        assert!(clip("abc_DEF-123", 0, 500).validate().is_ok());
+        assert!(clip("abc_DEF-123", 1000, 31_000).validate().is_ok());
+        for id in ["", "short", "twelve_chars", "bad id 1234", "ñññññññññññ"] {
+            assert!(
+                clip(id, 0, 1000)
+                    .validate()
+                    .unwrap_err()
+                    .contains("videoId")
+            );
+        }
+        assert!(
+            clip("abc_DEF-123", 1000, 1000)
+                .validate()
+                .unwrap_err()
+                .contains("startMs")
+        );
+        assert!(
+            clip("abc_DEF-123", 2000, 1000)
+                .validate()
+                .unwrap_err()
+                .contains("startMs")
+        );
+        assert!(
+            clip("abc_DEF-123", -1, 1000)
+                .validate()
+                .unwrap_err()
+                .contains("startMs")
+        );
+        assert!(
+            clip("abc_DEF-123", 0, 499)
+                .validate()
+                .unwrap_err()
+                .contains("length")
+        );
+        assert!(
+            clip("abc_DEF-123", 0, 30_001)
+                .validate()
+                .unwrap_err()
+                .contains("length")
+        );
+    }
+
+    #[test]
+    fn test_card_content_check_youtube_visual_type_only_and_invalid_clip() {
+        let mut c = CardContent::plain("x");
+        c.youtube = Some(clip("abc_DEF-123", 0, 1000));
+        c.visual_type = Some(VisualType::Video);
+        assert!(
+            c.check_youtube()
+                .unwrap_err()
+                .contains("visualId/visualType")
+        );
+        let mut c = CardContent::plain("x");
+        c.youtube = Some(clip("short", 0, 1000));
+        assert!(c.check_youtube().unwrap_err().contains("videoId"));
+    }
+
+    #[test]
+    fn test_card_content_patch_check_youtube_visual_type_operand() {
+        let p: CardContentPatch = serde_json::from_value(serde_json::json!({
+            "youtube": {"videoId": "M7lc1UVf-VE", "startMs": 0, "endMs": 1000},
+            "visualType": "image"
+        }))
+        .unwrap();
+        assert!(
+            p.check_youtube()
+                .unwrap_err()
+                .contains("visualId/visualType")
+        );
+    }
+
+    #[test]
+    fn test_youtube_clip_validate_truncates_oversized_video_id() {
+        let long = "x".repeat(5000);
+        let e = clip(&long, 0, 1000).validate().unwrap_err();
+        assert!(e.contains("5000-byte string"), "{e}");
+        assert!(e.len() < 300, "{}", e.len());
+    }
+
+    #[test]
+    fn test_card_content_check_youtube_rejects_visual() {
+        let mut c = CardContent::plain("x");
+        assert!(c.check_youtube().is_ok());
+        c.youtube = Some(clip("abc_DEF-123", 0, 1000));
+        assert!(c.check_youtube().is_ok());
+        c.visual_id = Some("00000000-0000-0000-0000-000000000001".into());
+        assert!(c.check_youtube().unwrap_err().contains("visualId"));
+    }
+
+    #[test]
+    fn test_card_content_patch_youtube_null_omitted_set() {
+        let parse =
+            |v: serde_json::Value| -> CardContentPatch { serde_json::from_value(v).unwrap() };
+        let omitted = parse(serde_json::json!({"text": "a"}));
+        assert!(omitted.youtube.is_none());
+        assert!(
+            serde_json::to_value(&omitted)
+                .unwrap()
+                .get("youtube")
+                .is_none()
+        );
+
+        let null = parse(serde_json::json!({"youtube": null}));
+        assert_eq!(null.youtube, Some(None));
+        assert_eq!(
+            serde_json::to_value(&null).unwrap(),
+            serde_json::json!({"youtube": null})
+        );
+
+        let set = parse(
+            serde_json::json!({"youtube": {"videoId": "abc_DEF-123", "startMs": 0, "endMs": 1000}}),
+        );
+        assert_eq!(set.youtube, Some(Some(clip("abc_DEF-123", 0, 1000))));
+    }
+
     #[test]
     fn test_card_content_patch_visual_pair_validation() {
         let parse =
@@ -1293,6 +1541,8 @@ mod tests {
                 audio_id: None,
                 visual_id: None,
                 visual_type: None,
+                youtube: None,
+                youtube_status: None,
             },
             back: CardContent::plain("Every value has one owner."),
             order_number: Some(1),

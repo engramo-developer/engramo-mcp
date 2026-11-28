@@ -419,6 +419,11 @@ fn quota_message(
             msg.push_str(match resource_type {
                 "catalogs_total" => " Deleting catalogs you no longer need frees room.",
                 "cards_total" => " Deleting cards you no longer need frees room.",
+                "youtube_catalogs_total" => {
+                    " Only catalogs that hold at least one YouTube clip count: delete a \
+                     YouTube catalog you no longer need, or remove its clips (update_card with \
+                     face/back {\"youtube\": null} on each clip card), to free a slot."
+                }
                 "cards_per_catalog" => {
                     " The limit applies to each catalog separately: put further cards in \
                      another catalog, or delete cards you no longer need from this one."
@@ -1180,6 +1185,23 @@ mod tests {
         );
         assert!(m.contains("doesn't reset"), "{m}");
         assert!(!m.contains("resets 20"), "{m}");
+        assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
+    }
+
+    #[test]
+    fn test_quota_message_youtube_catalogs_total_hint() {
+        let m = quota(
+            "youtube_catalogs_total",
+            Some(3),
+            Some(3),
+            Some(1),
+            None,
+            Some("absolute"),
+        );
+        assert!(m.contains("YouTube catalogs"), "{m}");
+        assert!(m.contains("at least one YouTube clip"), "{m}");
+        assert!(m.contains("remove its clips"), "{m}");
+        assert!(m.contains("update_card"), "{m}");
         assert!(m.ends_with(PLAN_CHANGE_HINT), "{m}");
     }
 

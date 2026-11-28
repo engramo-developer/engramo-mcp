@@ -17,6 +17,7 @@ pub fn resource_label(resource_type: &str) -> Option<&'static str> {
         "catalogs_total" => "Catalogs",
         "cards_total" => "Cards (total)",
         "cards_per_catalog" => "Cards per catalog",
+        "youtube_catalogs_total" => "YouTube catalogs",
         "ai_agent_messages" => "AI chat messages",
         "tts_generations" => "Text-to-speech generations",
         "premium_tts_generations" => "Premium text-to-speech generations",
@@ -437,9 +438,14 @@ mod tests {
             "translation_chunks",
             "shared_catalogs",
             "collaborators_per_catalog",
+            "youtube_catalogs_total",
         ] {
             assert!(resource_label(rt).is_some(), "{rt}");
         }
+        assert_eq!(
+            resource_label("youtube_catalogs_total"),
+            Some("YouTube catalogs")
+        );
         for f in [
             "catalog_share",
             "tts_generate",

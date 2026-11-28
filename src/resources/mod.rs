@@ -54,9 +54,19 @@ CardContent fields:
   visualId     UUID       Optional. A media_id from `upload_media` for an image/video. Requires
                           `visualType` alongside it. Never fabricate a UUID here.
   visualType   String     Required if `visualId` is set. \"image\" or \"video\".
+  youtube      Clip       Optional. A YouTube clip played for this side (language cards: put it
+                          on the face). Shape: {\"videoId\": \"<11 chars>\", \"startMs\": int,
+                          \"endMs\": int}. Rules: videoId is exactly 11 chars of A-Z a-z 0-9 _ -;
+                          0 <= startMs < endMs; 500 <= endMs - startMs <= 30000 (ms); a side with
+                          `youtube` must NOT also have `visualId`. The times must come from real
+                          captions (the video's SRT/VTT/transcript) - never invent them.
+                          Catalogs holding a clip count against the `youtube_catalogs_total` quota.
+  youtubeStatus String    RESPONSE-ONLY (\"ok\" | \"unavailable\"), returned with a clip by
+                          get_card. Never send it; it is ignored and cleared before any write.
 
 Updating a card (update_card): face/back are per-key patches. Omitted keys keep their stored
-value; `null` clears a key (audioId, visualId+visualType together, dictionary, richText, style);
+value; `null` clears a key (audioId, visualId+visualType together, dictionary, richText, style,
+youtube);
 a value replaces it. Changing `text` without `richText` drops the stored formatting.
 visualId and visualType must be set together or cleared together.
 
@@ -152,7 +162,22 @@ invent a UUID; only use one actually returned by `upload_media`.
     \"audioId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\"
   },
   \"back\": { \"text\": \"Could you bring me a coffee with milk, please?\" }
-}\
+}
+
+=== Example 5: Language card with a YouTube clip ===
+The face plays the 3.7 s clip of the video where this line is spoken. startMs/endMs come from
+the video's captions, never guessed. The clip is on the face only; the back is plain text.
+
+{
+  \"face\": {
+    \"text\": \"¿Me puede traer la cuenta, por favor?\",
+    \"youtube\": { \"videoId\": \"M7lc1UVf-VE\", \"startMs\": 83200, \"endMs\": 86900 },
+    \"dictionary\": { \"cuenta\": \"рахунок\", \"traer\": \"принести\" }
+  },
+  \"back\": { \"text\": \"Could you bring me the bill, please?\" }
+}
+
+To remove a clip later: update_card with face {\"youtube\": null}.\
 ";
 
 // ── Resource list ─────────────────────────────────────────────────────────────
@@ -168,8 +193,9 @@ pub fn list_all() -> ListResourcesResult {
         make_resource(
             URI_CARD_SCHEMA,
             "Card Schema & Examples",
-            "CardContent JSON schema with validation rules and 4 annotated examples \
-             (simple, rich-text styled, language-learning with dictionary, user-supplied audio). \
+            "CardContent JSON schema with validation rules and 5 annotated examples \
+             (simple, rich-text styled, language-learning with dictionary, user-supplied audio, \
+             YouTube clip). \
              Read this before creating cards to avoid richText validation failures.",
             "text/plain",
         ),
@@ -456,6 +482,22 @@ mod tests {
                 "resource {} has wrong mime type",
                 r.uri
             );
+        }
+    }
+
+    #[test]
+    fn test_card_schema_documents_youtube_clip() {
+        for needle in [
+            "youtube",
+            "videoId",
+            "startMs",
+            "endMs",
+            "youtubeStatus",
+            "RESPONSE-ONLY",
+            "never invent",
+            "500 <= endMs - startMs <= 30000",
+        ] {
+            assert!(CARD_SCHEMA_DOC.contains(needle), "missing {needle}");
         }
     }
 
