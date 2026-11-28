@@ -80,7 +80,8 @@ impl EngramoMcpServer {
             + Self::learning_path_tools_router()
             + Self::search_tools_router()
             + Self::media_tools_router()
-            + Self::generate_tools_router();
+            + Self::generate_tools_router()
+            + Self::youtube_tools_router();
         if paid_ai_enabled {
             tool_router += Self::paid_ai_tools_router();
         }
@@ -6584,6 +6585,7 @@ mod tests {
             assert!(names.contains(&"list_catalogs".to_string()));
             assert!(names.contains(&"generate_card".to_string()));
             assert!(names.contains(&"get_server_version".to_string()));
+            assert!(names.contains(&"parse_youtube_captions".to_string()));
         }
     }
 
@@ -7520,7 +7522,7 @@ mod tests {
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, true).with_tts(fake_tts_engine());
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 42, "35 core + 5 paid AI + 2 local TTS");
+        assert_eq!(tools.len(), 43, "36 core + 5 paid AI + 2 local TTS");
         for t in &tools {
             let n = &t.name;
             assert!(t.title.is_some(), "{n}: missing title");
@@ -7615,7 +7617,7 @@ mod tests {
             false,
         );
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 35, "http-mode tool count");
+        assert_eq!(tools.len(), 36, "http-mode tool count");
         for t in &tools {
             let n = &t.name;
             let a = t

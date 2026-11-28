@@ -13,3 +13,4 @@ pub mod tools;
 pub mod tts;
 pub mod version;
 pub mod well_known;
+pub mod youtube;

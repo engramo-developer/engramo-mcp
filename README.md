@@ -552,7 +552,7 @@ storage quotas, and needs no paid EngrAmo plan.
 
 ## Available tools
 
-35 tools are always available, and two more appear with [text-to-speech](#text-to-speech-bring-your-own-key)
+36 tools are always available, and two more appear with [text-to-speech](#text-to-speech-bring-your-own-key)
 (local `stdio` only).
 For ready-to-paste prompts that use them, see [docs/prompt-examples.md](docs/prompt-examples.md).
 
@@ -624,6 +624,11 @@ Reviews are graded in the EngrAmo app; there is no tool for submitting a review.
 | `generate_card` | Create a flashcard — the calling model does any translation/wording itself |
 | `generate_catalog_with_cards` | Create a catalog with cards in one call, optionally with a cover image (`image_id`) and classification (`front_languages`, `back_languages`, `topics`, `levels`) — same bring-your-own-AI model. To add or replace the cover of an existing catalog, use `update_catalog` |
 | `generate_cards` | Add multiple cards to an existing catalog — same bring-your-own-AI model |
+
+### YouTube captions
+| Tool | Description |
+|---|---|
+| `parse_youtube_captions` | Turn pasted captions (SRT, VTT or YouTube transcript-panel text) plus a video URL/id into numbered, timed clips (`startMs`/`endMs`). Pure and offline: never fetches YouTube, no API call. Optional `format`, `split`, `from`/`to`. Show the numbered clips to the user and let them pick before creating cards |
 
 ### Text-to-speech (stdio, opt-in)
 Only present when `ENGRAMO_TTS_GEMINI_API_KEYS` is set (`stdio` mode only) — see

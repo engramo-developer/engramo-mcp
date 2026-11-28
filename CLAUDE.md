@@ -53,6 +53,8 @@ src/
 │   ├── ai.rs        — feature-flagged paid-AI tools (TTS, translate, dictionary, AI-agent chat,
 │   │                   translate_batch_import) — own `#[tool_router(router = paid_ai_tools_router)]`
 │   │                   impl block on `EngramoMcpServer`, only registered when ENGRAMO_ENABLE_PAID_AI is on
+│   ├── youtube.rs   — `parse_youtube_captions` (pure/offline, always on in stdio + http): params,
+│   │                   own `#[tool_router(router = youtube_tools_router)]` impl block; never fetches YouTube
 │   └── tts.rs       — local, bring-your-own-key TTS tools (list_tts_voices, generate_card_audio);
 │                       own `#[tool_router(router = local_tts_tools_router)]` impl block, only
 │                       registered by `EngramoMcpServer::with_tts()` — stdio only, see `tts/` below
@@ -63,6 +65,9 @@ src/
 │   │                   per-key error classification, upstream-text scrubbing
 │   └── mp3.rs       — AudioEncoder seam + pcm16_mono_to_mp3 (statically linked LAME, LGPL-2.0 —
 │                       see THIRD_PARTY_LICENSES)
+├── youtube/         — pure helpers for `parse_youtube_captions`: `mod.rs` (video id from URL/bare id, time
+│   │                   strings), `segmenter.rs` (faithful port of the web app's youtube-segmenter.ts; no regex crate)
+│   └── segmenter_tests.rs — port of the web spec + fixtures
 ├── resources/
 │   └── mod.rs       — MCP Resources: engramo://catalogs, due, stats, learning-paths, subscription, card-schema, catalog-filters
 └── prompts/

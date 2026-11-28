@@ -7,3 +7,4 @@ pub mod learning_paths;
 pub mod media;
 pub mod search;
 pub mod tts;
+pub mod youtube;
