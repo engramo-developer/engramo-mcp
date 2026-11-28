@@ -552,7 +552,7 @@ storage quotas, and needs no paid EngrAmo plan.
 
 ## Available tools
 
-36 tools are always available, and two more appear with [text-to-speech](#text-to-speech-bring-your-own-key)
+37 tools are always available, and two more appear with [text-to-speech](#text-to-speech-bring-your-own-key)
 (local `stdio` only).
 For ready-to-paste prompts that use them, see [docs/prompt-examples.md](docs/prompt-examples.md).
 
@@ -629,6 +629,7 @@ Reviews are graded in the EngrAmo app; there is no tool for submitting a review.
 | Tool | Description |
 |---|---|
 | `parse_youtube_captions` | Turn pasted captions (SRT, VTT or YouTube transcript-panel text) plus a video URL/id into numbered, timed clips (`startMs`/`endMs`). Pure and offline: never fetches YouTube, no API call. Optional `format`, `split`, `from`/`to`. Show the numbered clips to the user and let them pick before creating cards |
+| `generate_youtube_catalog` | Create a new private language catalog from selected YouTube clips (`start_ms`/`end_ms` from `parse_youtube_captions`, plus your `text`, `translation` and optional `dictionary`); max 200 clips per call. Wrapper over `generate_catalog_with_cards`; follow the `create_youtube_deck` prompt |
 
 ### Text-to-speech (stdio, opt-in)
 Only present when `ENGRAMO_TTS_GEMINI_API_KEYS` is set (`stdio` mode only) — see
@@ -742,6 +743,7 @@ And **MCP Prompts** (guided workflows):
 | `review_session` | Start a guided spaced-repetition review session |
 | `create_flashcard` | Create a high-quality flashcard for a topic |
 | `create_language_deck` | Create a styled, translated, dictionary-annotated language-learning deck — see [`docs/prompt-examples.md`](docs/prompt-examples.md) |
+| `create_youtube_deck` | Turn a YouTube video into a deck of playable clip cards: captions, pick the lines to keep, translate, create |
 | `explain_card` | Explain a flashcard in depth with examples |
 | `study_plan` | Build a structured study plan from your catalogs |
 

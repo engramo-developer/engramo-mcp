@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 
-use crate::server::EngramoMcpServer;
+use crate::dto::{CardContent, YoutubeClip as CardYoutubeClip};
+use crate::server::{EngramoMcpServer, check_card_youtube};
 use crate::tools::catalogs::{err_result, ok_json};
+use crate::tools::generate::{CardInputParams, GenerateCatalogWithCardsParams, MAX_BATCH_CARDS};
 use crate::youtube::segmenter::{
     CaptionFormat, MAX_INPUT_CHARS, SegmentOptions, SegmentWarning, SplitBy, segment_captions,
 };
@@ -81,6 +83,114 @@ pub struct ParseYoutubeCaptionsParams {
         is kept only if it lies fully inside [from, to]. Must be greater than from."
     )]
     pub to: Option<String>,
+}
+
+/// One clip of `generate_youtube_catalog`: times from `parse_youtube_captions`, text in the
+/// video's language, translation in the learner's language.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct YoutubeCatalogClipParams {
+    #[schemars(
+        description = "Clip start in ms, exactly as returned by parse_youtube_captions (startMs)."
+    )]
+    pub start_ms: i64,
+    #[schemars(
+        description = "Clip end in ms, exactly as returned by parse_youtube_captions (endMs). \
+        endMs - startMs must be 500..=30000."
+    )]
+    pub end_ms: i64,
+    #[schemars(
+        description = "The spoken line, in the video's language (the clip's caption text)."
+    )]
+    pub text: String,
+    #[schemars(description = "Your translation of text into back_language. Required, not blank.")]
+    pub translation: String,
+    #[schemars(
+        description = "Optional word-level dictionary for the line (lowercased source word -> \
+        translation); see engramo://card-schema."
+    )]
+    pub dictionary: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GenerateYoutubeCatalogParams {
+    #[schemars(description = "Catalog name")]
+    pub name: String,
+    #[schemars(description = "YouTube video URL or bare 11-character video id.")]
+    pub video: String,
+    #[schemars(
+        description = "Language of the video / card fronts (the language being learned), ISO 639-1 code, e.g. 'es'."
+    )]
+    pub front_language: String,
+    #[schemars(
+        description = "Language of the translations / card backs, ISO 639-1 code, e.g. 'en'."
+    )]
+    pub back_language: String,
+    #[schemars(
+        description = "1 to 200 clips (one card each), taken from parse_youtube_captions output. Only the clips the user selected."
+    )]
+    pub clips: Vec<YoutubeCatalogClipParams>,
+    #[schemars(description = "Optional description")]
+    pub description: Option<String>,
+    #[schemars(description = "Optional list of tags")]
+    pub tags: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional. CEFR levels A1-C2, or 'beginner' (A1,A2), 'intermediate' (B1,B2), 'advanced' (C1,C2)."
+    )]
+    pub levels: Option<Vec<crate::catalog_filters::LevelParam>>,
+}
+
+/// Validates a `generate_youtube_catalog` request (no I/O) and builds the equivalent
+/// `generate_catalog_with_cards` params. Errors name clips as `clips[i]`.
+pub fn build_youtube_catalog_params(
+    p: GenerateYoutubeCatalogParams,
+) -> Result<GenerateCatalogWithCardsParams, String> {
+    let video_id = extract_video_id(&p.video)?;
+    if p.clips.is_empty() {
+        return Err(
+            "clips is empty: pass at least one clip from parse_youtube_captions".to_owned(),
+        );
+    }
+    if p.clips.len() > MAX_BATCH_CARDS {
+        return Err(format!(
+            "Too many clips: {} (max {MAX_BATCH_CARDS} per call); create the catalog with the \
+             first {MAX_BATCH_CARDS} clips, then add the rest with generate_cards using the same \
+             face/back shape (face: text + youtube {{videoId, startMs, endMs}} + dictionary; back: text)",
+            p.clips.len()
+        ));
+    }
+    let mut cards = Vec::with_capacity(p.clips.len());
+    for (i, c) in p.clips.into_iter().enumerate() {
+        if c.text.trim().is_empty() {
+            return Err(format!("clips[{i}]: text must not be blank"));
+        }
+        if c.translation.trim().is_empty() {
+            return Err(format!("clips[{i}]: translation must not be blank"));
+        }
+        let mut face = CardContent::plain(c.text);
+        face.youtube = Some(CardYoutubeClip {
+            video_id: video_id.clone(),
+            start_ms: c.start_ms,
+            end_ms: c.end_ms,
+        });
+        face.dictionary = c.dictionary;
+        let back = CardContent::plain(c.translation);
+        check_card_youtube(&format!("clips[{i}]"), &face, &back)?;
+        cards.push(CardInputParams { face, back });
+    }
+    Ok(GenerateCatalogWithCardsParams {
+        name: p.name,
+        description: p.description,
+        image_id: None,
+        tags: p.tags,
+        visibility: Some("private".to_owned()),
+        front_languages: Some(vec![p.front_language]),
+        back_languages: Some(vec![p.back_language]),
+        // No `topics`: the shared classification rules reserve the `language` key (it is
+        // implied by front_languages), so passing it would be rejected.
+        topics: None,
+        levels: p.levels,
+        cards,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -199,7 +309,8 @@ impl EngramoMcpServer {
         numbers/ranges, a time range, or a wish) before translating or creating cards. Optional \
         from/to keep only clips fully inside that range; clip numbers do not change when \
         filtering. At most 200 clips are returned per call (after the from/to filter): on long \
-        videos use from/to to reach later parts."
+        videos use from/to to reach later parts. Next step after the user picks clips: \
+        generate_youtube_catalog."
     )]
     pub async fn parse_youtube_captions(
         &self,
@@ -222,6 +333,35 @@ impl EngramoMcpServer {
                 Err(_) => err_result("failed to parse captions"),
             },
         )
+    }
+
+    #[tool(
+        title = "Create YouTube catalog",
+        annotations(
+            title = "Create YouTube catalog",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        description = "Create a NEW private language catalog where each card plays a clip of a YouTube \
+        video (face: the spoken line + clip, back: your translation). Wrapper over \
+        generate_catalog_with_cards. Clips must come from parse_youtube_captions: never invent or \
+        edit times. Include ONLY the clips the user selected. You write each translation (and an \
+        optional word dictionary, see engramo://card-schema) yourself: no paid AI is used. Set \
+        front_language (the video's language) and back_language as ISO 639-1 codes. Clip length \
+        must be 500..=30000 ms. At most 200 clips per call; for more, create the catalog with the \
+        first 200 and add the rest with generate_cards (same face/back shape). Follow the \
+        create_youtube_deck prompt."
+    )]
+    pub async fn generate_youtube_catalog(
+        &self,
+        Parameters(p): Parameters<GenerateYoutubeCatalogParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match build_youtube_catalog_params(p) {
+            Ok(req) => self.generate_catalog_with_cards(Parameters(req)).await,
+            Err(e) => Ok(err_result(e)),
+        }
     }
 }
 
@@ -490,5 +630,220 @@ mod tests {
         assert!(!out.clips.is_empty());
         assert!(out.clips[0].index > MAX_CLIPS);
         assert!(!out.warnings.contains(&"truncated_to_max_clips"));
+    }
+
+    // ── generate_youtube_catalog ──────────────────────────────────────────────
+
+    mod catalog {
+        use super::*;
+        use crate::client::EngramoClient;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn server(uri: &str) -> EngramoMcpServer {
+            EngramoMcpServer::new(EngramoClient::new(uri, "engramo_test"), false)
+        }
+
+        fn clip(start_ms: i64, end_ms: i64) -> YoutubeCatalogClipParams {
+            YoutubeCatalogClipParams {
+                start_ms,
+                end_ms,
+                text: "Hola, ¿cómo estás?".to_owned(),
+                translation: "Hi, how are you?".to_owned(),
+                dictionary: None,
+            }
+        }
+
+        fn req(clips: Vec<YoutubeCatalogClipParams>) -> GenerateYoutubeCatalogParams {
+            GenerateYoutubeCatalogParams {
+                name: "La Camisa Negra".to_owned(),
+                video: "https://youtu.be/dQw4w9WgXcQ?t=5".to_owned(),
+                front_language: "es".to_owned(),
+                back_language: "en".to_owned(),
+                clips,
+                description: None,
+                tags: None,
+                levels: None,
+            }
+        }
+
+        fn text_of(r: &CallToolResult) -> String {
+            r.content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap_or_default()
+        }
+
+        async fn run(p: GenerateYoutubeCatalogParams) -> (CallToolResult, MockServer) {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/catalogs/with-cards"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                    "catalog": {"id": "00000000-0000-0000-0000-000000000001",
+                                "name": "x", "version": 1},
+                    "cardsCreated": 2
+                })))
+                .mount(&mock)
+                .await;
+            let r = server(&mock.uri())
+                .generate_youtube_catalog(Parameters(p))
+                .await
+                .unwrap();
+            (r, mock)
+        }
+
+        async fn assert_rejected(p: GenerateYoutubeCatalogParams, needle: &str) {
+            let (r, mock) = run(p).await;
+            assert!(r.is_error.unwrap_or(false));
+            let t = text_of(&r);
+            assert!(t.contains(needle), "{t}");
+            assert!(mock.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_sends_expected_with_cards_body() {
+            let mut c0 = clip(1_000, 3_000);
+            c0.dictionary = Some([("hola".to_owned(), "hi".to_owned())].into());
+            let p = req(vec![c0, clip(3_200, 5_500)]);
+            let (r, mock) = run(p).await;
+            assert!(!r.is_error.unwrap_or(false), "{}", text_of(&r));
+            assert!(text_of(&r).contains("\"cardCount\": 2"), "{}", text_of(&r));
+            let requests = mock.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let b: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(b["name"], "La Camisa Negra");
+            assert_eq!(b["visibility"], "private");
+            assert_eq!(b["cards"].as_array().unwrap().len(), 2);
+            let f = &b["cards"][0]["face"];
+            assert_eq!(f["text"], "Hola, ¿cómo estás?");
+            assert_eq!(
+                f["youtube"],
+                json!({"videoId": "dQw4w9WgXcQ", "startMs": 1000, "endMs": 3000})
+            );
+            assert_eq!(f["dictionary"], json!({"hola": "hi"}));
+            assert!(f.get("visualId").is_none());
+            assert_eq!(b["cards"][0]["back"]["text"], "Hi, how are you?");
+            assert!(b["cards"][0]["back"].get("youtube").is_none());
+            assert!(b["cards"][1]["face"].get("dictionary").is_none());
+            assert_eq!(b["learn"], json!(["lang:es"]));
+            assert_eq!(b["speakLangs"], json!(["en"]));
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_rejects_bad_video_without_http() {
+            let mut p = req(vec![clip(1_000, 3_000)]);
+            p.video = "https://example.com/watch?v=dQw4w9WgXcQ".to_owned();
+            assert_rejected(p, "video must be").await;
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_rejects_empty_clips_without_http() {
+            assert_rejected(req(vec![]), "clips is empty").await;
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_rejects_201_clips_without_http() {
+            let clips = (0..201)
+                .map(|i| clip(i * 4_000, i * 4_000 + 2_000))
+                .collect();
+            assert_rejected(req(clips), "generate_cards").await;
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_rejects_blank_translation_and_text_naming_clip() {
+            let mut bad = clip(5_000, 7_000);
+            bad.translation = "  ".to_owned();
+            assert_rejected(req(vec![clip(1_000, 3_000), bad]), "clips[1]: translation").await;
+            let mut bad = clip(5_000, 7_000);
+            bad.text = String::new();
+            assert_rejected(req(vec![bad]), "clips[0]: text").await;
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_rejects_bad_clip_length_naming_clip() {
+            assert_rejected(
+                req(vec![clip(1_000, 3_000), clip(5_000, 5_100)]),
+                "clips[1] face",
+            )
+            .await;
+            assert_rejected(req(vec![clip(0, 31_000)]), "clips[0] face").await;
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_quota_error_passes_through() {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/catalogs/with-cards"))
+                .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+                    "error": "quota_exceeded",
+                    "resource_type": "youtube_catalogs_total",
+                    "used": 1,
+                    "limit": 1
+                })))
+                .mount(&mock)
+                .await;
+            let r = server(&mock.uri())
+                .generate_youtube_catalog(Parameters(req(vec![clip(1_000, 3_000)])))
+                .await
+                .unwrap();
+            assert!(r.is_error.unwrap_or(false));
+            let t = text_of(&r);
+            assert!(
+                t.contains("youtube_catalogs_total") && t.starts_with("Quota exceeded"),
+                "{t}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_forwards_description_tags_and_levels() {
+            let mut p = req(vec![clip(1_000, 3_000)]);
+            p.description = Some("Song clips".to_owned());
+            p.tags = Some(vec!["music".to_owned()]);
+            p.levels = Some(vec![crate::catalog_filters::LevelParam::Advanced]);
+            let (r, mock) = run(p).await;
+            assert!(!r.is_error.unwrap_or(false), "{}", text_of(&r));
+            let requests = mock.received_requests().await.unwrap();
+            let b: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(b["description"], "Song clips");
+            assert_eq!(b["tags"], json!(["music"]));
+            assert_eq!(b["levels"], json!(["C1", "C2"]));
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_accepts_exactly_max_clips() {
+            let clips = (0..200)
+                .map(|i| clip(i * 4_000, i * 4_000 + 2_000))
+                .collect();
+            let (r, mock) = run(req(clips)).await;
+            assert!(!r.is_error.unwrap_or(false), "{}", text_of(&r));
+            let requests = mock.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let b: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(b["cards"].as_array().unwrap().len(), 200);
+        }
+
+        #[tokio::test]
+        async fn test_generate_youtube_catalog_upstream_errors_return_is_error_not_err() {
+            for status in [401u16, 500] {
+                let mock = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/catalogs/with-cards"))
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&mock)
+                    .await;
+                let r = server(&mock.uri())
+                    .generate_youtube_catalog(Parameters(req(vec![clip(1_000, 3_000)])))
+                    .await
+                    .unwrap();
+                assert!(r.is_error.unwrap_or(false), "status {status}");
+            }
+            let r = server("http://127.0.0.1:1")
+                .generate_youtube_catalog(Parameters(req(vec![clip(1_000, 3_000)])))
+                .await
+                .unwrap();
+            assert!(r.is_error.unwrap_or(false));
+        }
     }
 }

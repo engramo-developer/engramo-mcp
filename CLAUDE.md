@@ -53,7 +53,8 @@ src/
 │   ├── ai.rs        — feature-flagged paid-AI tools (TTS, translate, dictionary, AI-agent chat,
 │   │                   translate_batch_import) — own `#[tool_router(router = paid_ai_tools_router)]`
 │   │                   impl block on `EngramoMcpServer`, only registered when ENGRAMO_ENABLE_PAID_AI is on
-│   ├── youtube.rs   — `parse_youtube_captions` (pure/offline, always on in stdio + http): params,
+│   ├── youtube.rs   — `parse_youtube_captions` (pure/offline) + `generate_youtube_catalog` (thin wrapper that
+│   │                   builds a `generate_catalog_with_cards` request of clip cards), both always on in stdio + http: params,
 │   │                   own `#[tool_router(router = youtube_tools_router)]` impl block; never fetches YouTube
 │   └── tts.rs       — local, bring-your-own-key TTS tools (list_tts_voices, generate_card_audio);
 │                       own `#[tool_router(router = local_tts_tools_router)]` impl block, only
@@ -71,7 +72,7 @@ src/
 ├── resources/
 │   └── mod.rs       — MCP Resources: engramo://catalogs, due, stats, learning-paths, subscription, card-schema, catalog-filters
 └── prompts/
-    └── mod.rs       — MCP Prompts: review_session, create_flashcard, explain_card, study_plan
+    └── mod.rs       — MCP Prompts: review_session, create_flashcard, create_language_deck, create_youtube_deck, explain_card, study_plan
 ```
 
 ---

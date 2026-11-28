@@ -1853,7 +1853,7 @@ fn prepare_card_patch(patch: &mut crate::dto::CardContentPatch) -> Result<(), St
 
 /// Client-side check of a new card's `youtube` clips (the API's rules), naming the card.
 /// `label` is e.g. `cards[3]` (generate_cards / with-cards) or `card` (generate_card).
-fn check_card_youtube(
+pub(crate) fn check_card_youtube(
     label: &str,
     face: &crate::dto::CardContent,
     back: &crate::dto::CardContent,
@@ -7522,7 +7522,7 @@ mod tests {
         let client = EngramoClient::new("http://localhost", "engramo_test");
         let server = EngramoMcpServer::new(client, true).with_tts(fake_tts_engine());
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 43, "36 core + 5 paid AI + 2 local TTS");
+        assert_eq!(tools.len(), 44, "37 core + 5 paid AI + 2 local TTS");
         for t in &tools {
             let n = &t.name;
             assert!(t.title.is_some(), "{n}: missing title");
@@ -7597,6 +7597,7 @@ mod tests {
             "generate_card",
             "generate_cards",
             "generate_catalog_with_cards",
+            "generate_youtube_catalog",
             "update_card",
             "delete_card",
             "update_catalog",
@@ -7617,7 +7618,7 @@ mod tests {
             false,
         );
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 36, "http-mode tool count");
+        assert_eq!(tools.len(), 37, "http-mode tool count");
         for t in &tools {
             let n = &t.name;
             let a = t

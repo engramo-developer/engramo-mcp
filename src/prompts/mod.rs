@@ -4,9 +4,11 @@
 //!   review_session      — guided spaced-repetition review (show card → wait → reveal → grade)
 //!   create_flashcard    — generate a high-quality flashcard for a topic
 //!   create_language_deck — generate a styled, translated, dictionary-annotated language deck
+//!   create_youtube_deck — turn a YouTube video's captions into a deck of playable clip cards
 //!   explain_card        — explain a specific card in depth
 //!   study_plan          — build a structured study plan from available catalogs
 
+use crate::tools::generate::MAX_BATCH_CARDS;
 use rmcp::model::{
     ErrorData, GetPromptRequestParams, GetPromptResult, ListPromptsResult, Prompt, PromptArgument,
     PromptMessage, Role,
@@ -17,6 +19,7 @@ use rmcp::model::{
 pub const PROMPT_REVIEW_SESSION: &str = "review_session";
 pub const PROMPT_CREATE_FLASHCARD: &str = "create_flashcard";
 pub const PROMPT_CREATE_LANGUAGE_DECK: &str = "create_language_deck";
+pub const PROMPT_CREATE_YOUTUBE_DECK: &str = "create_youtube_deck";
 pub const PROMPT_EXPLAIN_CARD: &str = "explain_card";
 pub const PROMPT_STUDY_PLAN: &str = "study_plan";
 
@@ -66,6 +69,29 @@ pub fn list_all() -> ListPromptsResult {
                     .with_required(false),
                 PromptArgument::new("catalog_id")
                     .with_description("UUID of an existing catalog to add the cards to (optional — creates a new catalog if omitted)")
+                    .with_required(false),
+            ]),
+        ),
+        Prompt::new(
+            PROMPT_CREATE_YOUTUBE_DECK,
+            Some("Turn a YouTube video into a deck of language-learning clip cards: get timed captions, \
+                  let the user pick which lines to keep, translate them yourself, and create a private \
+                  catalog where each card plays its clip. No paid AI; times are never invented."),
+            Some(vec![
+                PromptArgument::new("video")
+                    .with_description("YouTube video URL or 11-character video id")
+                    .with_required(true),
+                PromptArgument::new("from")
+                    .with_description("Optional start of the range to use, e.g. '1:30'")
+                    .with_required(false),
+                PromptArgument::new("to")
+                    .with_description("Optional end of the range to use, e.g. '4:00'")
+                    .with_required(false),
+                PromptArgument::new("front_language")
+                    .with_description("Language spoken in the video, e.g. 'Spanish' (optional; ask if unknown)")
+                    .with_required(false),
+                PromptArgument::new("back_language")
+                    .with_description("Language to translate into, e.g. 'English' (optional; ask if unknown)")
                     .with_required(false),
             ]),
         ),
@@ -120,6 +146,16 @@ pub fn get(params: GetPromptRequestParams) -> Result<GetPromptResult, ErrorData>
                 &target_lang,
                 &count,
                 catalog_id.as_deref(),
+            ))
+        }
+        PROMPT_CREATE_YOUTUBE_DECK => {
+            let video = get_arg("video").unwrap_or_else(|| "<video>".to_string());
+            Ok(create_youtube_deck(
+                &video,
+                get_arg("from").as_deref(),
+                get_arg("to").as_deref(),
+                get_arg("front_language").as_deref(),
+                get_arg("back_language").as_deref(),
             ))
         }
         PROMPT_EXPLAIN_CARD => {
@@ -250,6 +286,70 @@ fn create_language_deck(
     ))])
 }
 
+fn create_youtube_deck(
+    video: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    front_language: Option<&str>,
+    back_language: Option<&str>,
+) -> GetPromptResult {
+    let front = front_language.unwrap_or("the video's language (ask the user if unclear)");
+    let back = back_language.unwrap_or("the user's language (ask if unclear)");
+    let range = match (from, to) {
+        (None, None) => "No time range was given: use the whole video.".to_owned(),
+        (f, t) => format!(
+            "The user wants only this range: from {} to {}. Pass it as `from`/`to` to \
+             `parse_youtube_captions`.",
+            f.unwrap_or("the start"),
+            t.unwrap_or("the end")
+        ),
+    };
+    GetPromptResult::new(vec![user_msg(format!(
+        "Create a language-learning deck from a YouTube video; every card plays its own clip.\n\
+         \n\
+         **Video:** {video}\n\
+         **Video language (card fronts):** {front}\n\
+         **Translate into (card backs):** {back}\n\
+         {range}\n\
+         \n\
+         Follow these steps in order:\n\
+         \n\
+         1. **Captions.** If you can watch this YouTube video yourself, write SRT captions for it \
+            following these rules: they must match the AUDIO exactly and timing accuracy matters \
+            most (they will be cut into clips). (a) Transcribe exactly what is sung/spoken, word for \
+            word, in the video's language, with correct spelling, accents and punctuation; do not \
+            translate, summarise or correct. (b) One cue = one short line or phrase (about 2-6 \
+            seconds, max 10 words), split at natural pauses, never mid-word. (c) Cue start = when the \
+            first word becomes audible; cue end = when the last word finishes (including a held final \
+            note), not when the next line begins. (d) Cues never overlap; leave gaps for silence or \
+            instrumental parts. (e) No cues for instrumental parts, applause, audience talk or sound \
+            tags like [Music]. (f) Millisecond precision `HH:MM:SS,mmm --> HH:MM:SS,mmm`; re-listen to \
+            any line you are unsure about. (g) Cover the whole video, start to end. \
+            Otherwise, ask the user to paste captions (SRT, VTT, or text copied from YouTube's \
+            'Show transcript' panel). Never invent captions or times.\n\
+         2. **Parse.** Call `parse_youtube_captions` with the video and the captions (pass \
+            `from`/`to` if the user named a range). Clip times come only from this tool.\n\
+         3. **Select (always, before translating).** Show the clips as `#index  m:ss-m:ss  text`; \
+            for long lists, page them or group by minute. Ask which to keep: \"all\", numbers or \
+            ranges (\"1-12, 20, 31-40\"), a time range, or a wish (then propose a selection and \
+            let the user confirm). Only the selected clips go forward.\n\
+         4. **Translate.** For each selected clip, translate its text into {back} yourself and write \
+            a word-level dictionary (lowercased source word -> translation; see the \
+            `engramo://card-schema` resource for the dictionary shape). For long selections work in \
+            chunks.\n\
+         5. **Create.** Call `generate_youtube_catalog` with the video, a short catalog name, \
+            `front_language` / `back_language` as ISO 639-1 codes, and the selected clips \
+            (`start_ms`, `end_ms`, `text`, `translation`, `dictionary`). At most {MAX_BATCH_CARDS} clips per call; \
+            for more, create the catalog with the first {MAX_BATCH_CARDS}, then call `generate_cards` on the new \
+            catalog with the same face/back shape (face: text + youtube {{videoId, startMs, endMs}} + \
+            dictionary; back: text).\n\
+         6. **Report** the catalog's short id and card count, and suggest opening it in the app.\n\
+         \n\
+         No paid AI is used anywhere in this flow: you do the captions (if you can watch the video), \
+         translation and dictionary yourself."
+    ))])
+}
+
 fn explain_card(face: &str, back: &str) -> GetPromptResult {
     GetPromptResult::new(vec![user_msg(format!(
         "Please explain the following flashcard in depth.\n\
@@ -301,13 +401,14 @@ mod tests {
     }
 
     #[test]
-    fn test_list_all_returns_five_prompts() {
+    fn test_list_all_returns_six_prompts() {
         let result = list_all();
-        assert_eq!(result.prompts.len(), 5);
+        assert_eq!(result.prompts.len(), 6);
         let names: Vec<&str> = result.prompts.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&PROMPT_REVIEW_SESSION));
         assert!(names.contains(&PROMPT_CREATE_FLASHCARD));
         assert!(names.contains(&PROMPT_CREATE_LANGUAGE_DECK));
+        assert!(names.contains(&PROMPT_CREATE_YOUTUBE_DECK));
         assert!(names.contains(&PROMPT_EXPLAIN_CARD));
         assert!(names.contains(&PROMPT_STUDY_PLAN));
     }
@@ -538,6 +639,76 @@ mod tests {
         } else {
             panic!("expected text content");
         }
+    }
+
+    fn youtube_deck_text(pairs: &[(&str, &str)]) -> String {
+        let params =
+            GetPromptRequestParams::new(PROMPT_CREATE_YOUTUBE_DECK).with_arguments(args(pairs));
+        let result = get(params).unwrap();
+        match &result.messages[0].content {
+            ContentBlock::Text(TextContent { text, .. }) => text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn test_create_youtube_deck_has_steps_rules_and_tools() {
+        let text = youtube_deck_text(&[("video", "dQw4w9WgXcQ")]);
+        assert!(text.contains("dQw4w9WgXcQ"), "{text}");
+        assert!(text.contains("write SRT captions"), "{text}");
+        assert!(text.contains("Never invent captions or times"), "{text}");
+        assert!(
+            text.contains("Select (always, before translating)"),
+            "{text}"
+        );
+        assert!(text.contains("parse_youtube_captions"), "{text}");
+        assert!(text.contains("generate_youtube_catalog"), "{text}");
+        assert!(text.contains("generate_cards"), "{text}");
+        assert!(text.contains("engramo://card-schema"), "{text}");
+        assert!(text.contains("use the whole video"), "{text}");
+    }
+
+    #[test]
+    fn test_create_youtube_deck_range_and_languages() {
+        let text = youtube_deck_text(&[
+            ("video", "dQw4w9WgXcQ"),
+            ("from", "1:30"),
+            ("to", "4:00"),
+            ("front_language", "Spanish"),
+            ("back_language", "English"),
+        ]);
+        assert!(text.contains("from 1:30 to 4:00"), "{text}");
+        assert!(
+            text.contains("Spanish") && text.contains("English"),
+            "{text}"
+        );
+        assert!(!text.contains("use the whole video"), "{text}");
+    }
+
+    #[test]
+    fn test_create_youtube_deck_one_sided_ranges() {
+        let text = youtube_deck_text(&[("video", "dQw4w9WgXcQ"), ("from", "1:30")]);
+        assert!(text.contains("from 1:30 to the end"), "{text}");
+        assert!(!text.contains("use the whole video"), "{text}");
+
+        let text = youtube_deck_text(&[("video", "dQw4w9WgXcQ"), ("to", "4:00")]);
+        assert!(text.contains("from the start to 4:00"), "{text}");
+        assert!(!text.contains("use the whole video"), "{text}");
+    }
+
+    #[test]
+    fn test_create_youtube_deck_defaults_without_args() {
+        let text = youtube_deck_text(&[]);
+        assert!(text.contains("**Video:** <video>"), "{text}");
+        assert!(
+            text.contains("the video's language (ask the user if unclear)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the user's language (ask if unclear)"),
+            "{text}"
+        );
+        assert!(text.contains("use the whole video"), "{text}");
     }
 
     #[test]
